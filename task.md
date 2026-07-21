@@ -225,15 +225,21 @@ listed was independently verified by reading the actual code (not assumed).
   data, log injection, denial of service, and supply-chain risk.
   Evidence: `docs/threat-model.md` §1-§2 (assets, actors/trust boundaries)
   and §6-§7 (DoS, supply chain). Two genuine, previously-undocumented gaps
-  surfaced by this exercise and recorded honestly rather than fixed as an
-  unplanned side effect: (1) tokens are flat global roles with no
-  token-to-tenant binding — a single leaked operator token can control
-  every tenant's breaker, not just one (§4 of the threat model); (2) the
-  webhook has no replay/timestamp-skew window, so a valid webhook token
-  can force unlimited trips via attacker-chosen `(fingerprint, startsAt)`
-  pairs (§3). Both are assessed as low severity at the current
-  single-tenant demo scale (a trip is fail-safe, not data-exposing) and
-  tracked as open follow-up work, not silently accepted forever.
+  were surfaced by this exercise: (1) tokens were flat global roles with no
+  token-to-tenant binding — a single leaked operator token could control
+  every tenant's breaker, not just one (§4 of the threat model) — **fixed**
+  in a follow-up slice: tokens can now optionally be bound to a single
+  tenant (`tenant:token` config format, ADR-004), enforced in
+  `services/control-plane/src/auth.ts`'s `requireBearerAuth` and proven
+  against a real Postgres-backed store in `app.integration.test.ts`
+  ("control-plane tenant-scoped tokens: closing the cross-tenant blast
+  radius"); opt-in, so an unscoped/wildcard token remains exactly as
+  exposed as before, by informed choice. (2) The webhook has no
+  replay/timestamp-skew window, so a valid webhook token can force
+  unlimited trips via attacker-chosen `(fingerprint, startsAt)` pairs
+  (§3) — still open, assessed as low severity (a trip is fail-safe, not
+  data-exposing), tracked as follow-up work, not silently accepted
+  forever.
 - [x] Define webhook authentication/signature verification, timestamp skew,
   replay prevention, key rotation, and least-privilege secret storage.
   Evidence: `docs/threat-model.md` §3 — documents the actual bearer-token
@@ -1369,9 +1375,11 @@ Add dated entries here rather than leaving important context only in chat.
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
   automatically the moment either is supplied — no code changes needed.
   The complete mock path is built and verified in the meantime.
-- `docs/threat-model.md` (§1.2) surfaced two open security gaps that are
-  genuinely unresolved, not just undocumented: no token-to-tenant binding
-  (a leaked operator token controls every tenant's breaker) and no webhook
-  replay/timestamp-skew window. Both are assessed low-severity at the
-  current single-tenant demo scale but should be fixed before any real
-  multi-tenant deployment.
+- `docs/threat-model.md` (§1.2) surfaced two security gaps. The token-to-
+  tenant binding gap is fixed (ADR-004) — opt-in, so a deployment that
+  never migrates to `tenant:token` config entries remains exactly as
+  exposed as before, by informed choice. The webhook replay/timestamp-skew
+  gap remains open, assessed low-severity at the current single-tenant
+  demo scale (a trip is fail-safe, not data-exposing) but should be fixed
+  before relying on the webhook against a real, internet-reachable SigNoz
+  deployment.
