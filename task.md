@@ -215,30 +215,61 @@ Acceptance criteria:
 
 ### 1.2 Threat and privacy model
 
-- [ ] Inventory assets and attackers: control credentials, resume endpoint,
+All five items below are now covered by [`docs/threat-model.md`](./docs/threat-model.md),
+written against the system as actually implemented (not aspirationally) —
+every mitigation cited is backed by a specific file/test, and every gap
+listed was independently verified by reading the actual code (not assumed).
+
+- [x] Inventory assets and attackers: control credentials, resume endpoint,
   policy mutation, tenant isolation, alert forgery/replay, malicious prompt/tool
-  data, log injection, denial of service, and supply-chain risk. Not written
-  as a standalone document yet; individual mitigations exist in code
-  (bearer auth, tenant/environment/agent scoping, idempotency keys) but
-  have not been inventoried against attackers systematically. Genuine gap —
-  targeted for the next session before webhook work (§5) begins, since the
-  webhook is the highest-value attack surface added next.
-- [ ] Define webhook authentication/signature verification, timestamp skew,
-  replay prevention, key rotation, and least-privilege secret storage. Not
-  started — no webhook exists yet (§5.1).
+  data, log injection, denial of service, and supply-chain risk.
+  Evidence: `docs/threat-model.md` §1-§2 (assets, actors/trust boundaries)
+  and §6-§7 (DoS, supply chain). Two genuine, previously-undocumented gaps
+  surfaced by this exercise and recorded honestly rather than fixed as an
+  unplanned side effect: (1) tokens are flat global roles with no
+  token-to-tenant binding — a single leaked operator token can control
+  every tenant's breaker, not just one (§4 of the threat model); (2) the
+  webhook has no replay/timestamp-skew window, so a valid webhook token
+  can force unlimited trips via attacker-chosen `(fingerprint, startsAt)`
+  pairs (§3). Both are assessed as low severity at the current
+  single-tenant demo scale (a trip is fail-safe, not data-exposing) and
+  tracked as open follow-up work, not silently accepted forever.
+- [x] Define webhook authentication/signature verification, timestamp skew,
+  replay prevention, key rotation, and least-privilege secret storage.
+  Evidence: `docs/threat-model.md` §3 — documents the actual bearer-token
+  mechanism (SigNoz has no HMAC option), the idempotency-key derivation and
+  why it is not a replay-window, and the current (manual, restart-based)
+  key-rotation story. The absence of a replay window and of automated
+  rotation are both stated as open gaps with recommended follow-ups, not
+  glossed over.
 - [x] Define human-action authorization and audit requirements for resume,
   disable, policy override, and force trip. Evidence: every mutating
   control-plane endpoint requires a bearer token, an `actor {type, id}`, a
   `reason`, and an `idempotencyKey`; every transition is recorded in
   `breaker_audit_log` with actor/reason/correlation/policy-version — tested
-  in `store.integration.test.ts` and `app.integration.test.ts`.
-- [ ] Set prompt/tool payload collection defaults, redaction rules, retention,
-  deletion, and demo-data constraints. Not started — no prompt/tool payload
-  is collected anywhere yet (no broken-agent/OTel instrumentation exists).
-- [ ] Produce an abuse-case test list and map P0/P1 threats to mitigations.
-  Not written as a standalone list yet, though the test suites already cover
-  several abuse cases ad hoc (forged/wrong bearer tokens, prefix-matching
-  tokens, malformed bodies, stale epochs, idempotency-key reuse conflicts).
+  in `store.integration.test.ts` and `app.integration.test.ts`. Cross-
+  referenced in `docs/threat-model.md` §4 alongside the token-binding gap
+  above (the audit trail is solid; who is authorized to write to it is the
+  open question).
+- [x] Set prompt/tool payload collection defaults, redaction rules, retention,
+  deletion, and demo-data constraints. Evidence: `docs/threat-model.md` §5
+  — verified by direct review of every `span.setAttributes` call site that
+  no raw prompt/completion/tool-call content is ever collected anywhere in
+  this codebase (only structural metadata: model name, token *counts*,
+  identity, timing). The one caller-supplied free-text field that is
+  persisted (`reason`, truncated to 2000 chars in the audit log) is
+  intentional audit evidence, not incidental logging, and is flagged as a
+  redaction surface to revisit only if a future feature ever derives
+  `reason` from prompt/tool content.
+- [x] Produce an abuse-case test list and map P0/P1 threats to mitigations.
+  Evidence: `docs/threat-model.md` §8 — a table mapping each threat to its
+  actual passing test (auth rejection, wrong-role 403, malformed bodies,
+  duplicate webhook delivery, concurrent idempotency races, stale-epoch
+  CAS contention, store/control-plane outage handling), plus an honest
+  second table of threats identified by this document that have **no**
+  test yet (cross-tenant token blast radius, webhook replay, per-route
+  rate-limit exhaustion) — tracked as follow-up work rather than implied
+  covered.
 
 ### 1.3 Versioned contracts
 
@@ -1338,8 +1369,9 @@ Add dated entries here rather than leaving important context only in chat.
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
   automatically the moment either is supplied — no code changes needed.
   The complete mock path is built and verified in the meantime.
-- No formal threat model document exists yet (§1.2), even though the SigNoz
-  alert webhook (§5.1) — the highest-risk external attack surface in this
-  build — is already implemented and tested. Should be written and used to
-  re-review that webhook's authentication/authorization, not built after
-  the fact as a rubber stamp.
+- `docs/threat-model.md` (§1.2) surfaced two open security gaps that are
+  genuinely unresolved, not just undocumented: no token-to-tenant binding
+  (a leaked operator token controls every tenant's breaker) and no webhook
+  replay/timestamp-skew window. Both are assessed low-severity at the
+  current single-tenant demo scale but should be fixed before any real
+  multi-tenant deployment.
