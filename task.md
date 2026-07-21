@@ -107,14 +107,17 @@ Demo success measures:
   (all `dist/`/`.tsbuildinfo` removed) across all 6 workspace packages as
   of commit `7e91c1a`; `pnpm run test:coverage` verified working after
   fixing a missing `@vitest/coverage-v8` dependency (commit `02aaa2c`).
-- [~] Add `.editorconfig`, `.gitignore`, `.env.example`, license,
+- [x] Add `.editorconfig`, `.gitignore`, `.env.example`, license,
   contribution guide, code owners, and a concise initial README.
-  Done: `.editorconfig`, `.gitignore`, `.env.example`, `LICENSE`
-  (Apache-2.0). Not yet done: `CONTRIBUTING.md`, `CODEOWNERS`, root
-  `README.md` — deferred until closer to demo/release polish (§11.2), but
-  genuinely missing right now, which fails this section's own acceptance
-  criterion ("a new contributor can clone... from documented commands").
-  This is the most important near-term gap to close next.
+  Evidence: `.editorconfig`, `.gitignore`, `.env.example`, `LICENSE`
+  (Apache-2.0) already existed; added `README.md` (repo layout table,
+  prerequisites, clone/configure/start/test/reset/stop commands, SigNoz
+  and real-provider status, documentation map), `CONTRIBUTING.md` (the
+  work cycle from `AGENTS.md` restated as a contributor-facing workflow,
+  ADR process, commit/push conventions, code style), and
+  `.github/CODEOWNERS` (single owner, `@Vedant817`, matching the current
+  single-maintainer reality). `pnpm run format`/`pnpm run lint` both pass
+  clean with these files present.
 - [ ] Add secret scanning, dependency audit, and license checks. Not started.
 - [ ] Add CI for clean install, format/lint/type check, tests, build, security
   checks, and artifact retention; protect secrets on forked pull requests.
@@ -124,17 +127,28 @@ Demo success measures:
   image versions for SigNoz and the selected state dependencies.
   Done: `infra/docker-compose.yml` pins `postgres:16-alpine` with a
   healthcheck. Not done: SigNoz itself is not yet stood up locally.
-- [~] Add deterministic seed/reset scripts and document supported host
-  prerequisites. Done: `infra/reset.sh` deterministically drops/re-migrates
-  the Postgres schema. Not done: host prerequisites are not documented
-  anywhere yet (blocked on the missing README above).
+- [x] Add deterministic seed/reset scripts and document supported host
+  prerequisites. Evidence: `infra/reset.sh` deterministically drops/
+  re-migrates the Postgres schema; host prerequisites (Node >=24, pnpm
+  >=11, Docker) and the reset/stop commands are now documented in
+  `README.md`.
 
 Acceptance criteria:
 
-- a new contributor can clone, configure, start, test, reset, and stop the
-  project from documented commands;
-- CI performs the same checks as local development;
-- no secret or machine-specific path is committed.
+- [x] a new contributor can clone, configure, start, test, reset, and stop
+  the project from documented commands — all six steps are now written
+  out verbatim in `README.md`'s "Getting started" and "Common commands"
+  sections (clone is implicit; configure via `.env.example`; start via
+  `docker compose ... up` + `pnpm --filter @fuse/control-plane run dev`;
+  test via `pnpm run test`/`test:integration`; reset via
+  `infra/reset.sh`; stop via `docker compose ... down`).
+- [ ] CI performs the same checks as local development — still not started;
+  no CI workflow file exists and there is still no remote to host it
+  against (see §12 open blockers).
+- [x] no secret or machine-specific path is committed — `.env` is
+  gitignored, `.env.example` holds only placeholders, and this was
+  re-checked via `git status`/diff review before every commit this
+  session.
 
 ## 1. Architecture, threat model, and contracts
 
@@ -1324,9 +1338,8 @@ Add dated entries here rather than leaving important context only in chat.
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
   automatically the moment either is supplied — no code changes needed.
   The complete mock path is built and verified in the meantime.
-- No root `README.md`, `CONTRIBUTING.md`, or `CODEOWNERS` exist yet, so the
-  §0.2 "a new contributor can clone... from documented commands" acceptance
-  criterion is not yet met. Highest-priority near-term gap.
-- No formal threat model document exists yet (§1.2); the webhook (§5.1),
-  the next planned P0 slice, is the highest-risk new attack surface and
-  should not be built without one.
+- No formal threat model document exists yet (§1.2), even though the SigNoz
+  alert webhook (§5.1) — the highest-risk external attack surface in this
+  build — is already implemented and tested. Should be written and used to
+  re-review that webhook's authentication/authorization, not built after
+  the fact as a rubber stamp.
