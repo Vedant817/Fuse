@@ -70,4 +70,10 @@ export interface RunConfig extends SafetyCeilingsConfig {
   model?: Model;
   iterationDelayMs?: number;
   correlationIdPrefix?: string;
+  /** gen_ai.provider.name / gen_ai.request.model attribute values for the
+   * emitted spans/metrics. Default to a clearly-fake identifier so mock
+   * runs are never mistaken for real provider telemetry. Override these
+   * when substituting a real provider adapter for `model`. */
+  providerName?: string;
+  requestModel?: string;
 }

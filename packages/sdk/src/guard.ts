@@ -52,6 +52,13 @@ export class FuseGuard {
     };
   }
 
+  /** The scope this guard was constructed with — useful for callers (e.g.
+   * OTel instrumentation) that need to tag telemetry with the same
+   * tenant/environment/agentId without duplicating it in their own config. */
+  get scope(): Scope {
+    return this.options.scope;
+  }
+
   /**
    * Checks a permit immediately before invoking `dispatch`. If the permit
    * is denied, `dispatch` is never called and a `BreakerTrippedError` is
