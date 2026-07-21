@@ -234,20 +234,32 @@ listed was independently verified by reading the actual code (not assumed).
   against a real Postgres-backed store in `app.integration.test.ts`
   ("control-plane tenant-scoped tokens: closing the cross-tenant blast
   radius"); opt-in, so an unscoped/wildcard token remains exactly as
-  exposed as before, by informed choice. (2) The webhook has no
-  replay/timestamp-skew window, so a valid webhook token can force
-  unlimited trips via attacker-chosen `(fingerprint, startsAt)` pairs
-  (§3) — still open, assessed as low severity (a trip is fail-safe, not
-  data-exposing), tracked as follow-up work, not silently accepted
-  forever.
+  exposed as before, by informed choice. (2) The webhook had no
+  replay/timestamp-skew window, so a stale captured alert could be
+  replayed to force a trip long after it stopped being relevant — **fixed**
+  in the same follow-up slice: `isStaleAlert` now rejects alerts with a
+  stale, future-skewed, or unparseable `startsAt` (§3). Honestly scoped: a
+  *fresh* forgery from a genuinely valid webhook token remains possible
+  (SigNoz has no payload signing), assessed as low severity (a trip is
+  fail-safe, not data-exposing) and tracked as further follow-up work
+  (recommended fix: a per-webhook-token trip-rate limit), not silently
+  accepted as fully resolved.
 - [x] Define webhook authentication/signature verification, timestamp skew,
   replay prevention, key rotation, and least-privilege secret storage.
   Evidence: `docs/threat-model.md` §3 — documents the actual bearer-token
-  mechanism (SigNoz has no HMAC option), the idempotency-key derivation and
-  why it is not a replay-window, and the current (manual, restart-based)
-  key-rotation story. The absence of a replay window and of automated
-  rotation are both stated as open gaps with recommended follow-ups, not
-  glossed over.
+  mechanism (SigNoz has no HMAC option) and the idempotency-key derivation.
+  Timestamp-skew/replay prevention is now implemented, not just documented:
+  `isStaleAlert` (`services/control-plane/src/routes/webhook.ts`) rejects
+  any alert whose `startsAt` is older than `webhookMaxAlertAgeMs` (default
+  10 min) or too far in the future (`webhookMaxClockSkewAheadMs`, default
+  1 min), fail-closed on an unparseable timestamp — proven in 4 new
+  `webhook.integration.test.ts` cases (stale, future-skewed, unparseable,
+  and still-fresh-and-tripping). Honestly scoped: this defends against
+  replaying a captured/stale request, not against a valid webhook-token
+  holder forging a brand-new fresh alert (SigNoz has no payload signing,
+  so that residual gap is unchanged and tracked in the threat model's risk
+  register as needing a per-webhook-token rate limit). Key rotation
+  remains manual/restart-based, stated as an open gap, not glossed over.
 - [x] Define human-action authorization and audit requirements for resume,
   disable, policy override, and force trip. Evidence: every mutating
   control-plane endpoint requires a bearer token, an `actor {type, id}`, a
@@ -1375,11 +1387,13 @@ Add dated entries here rather than leaving important context only in chat.
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
   automatically the moment either is supplied — no code changes needed.
   The complete mock path is built and verified in the meantime.
-- `docs/threat-model.md` (§1.2) surfaced two security gaps. The token-to-
-  tenant binding gap is fixed (ADR-004) — opt-in, so a deployment that
-  never migrates to `tenant:token` config entries remains exactly as
-  exposed as before, by informed choice. The webhook replay/timestamp-skew
-  gap remains open, assessed low-severity at the current single-tenant
-  demo scale (a trip is fail-safe, not data-exposing) but should be fixed
-  before relying on the webhook against a real, internet-reachable SigNoz
-  deployment.
+- `docs/threat-model.md` (§1.2) surfaced two security gaps, both now fixed:
+  token-to-tenant binding (ADR-004 — opt-in, so a deployment that never
+  migrates to `tenant:token` config entries remains exactly as exposed as
+  before, by informed choice) and the webhook replay/timestamp-skew window
+  (`isStaleAlert`). The one residual, still-open piece: a genuinely valid
+  webhook token can still force a trip with a freshly-forged
+  `(fingerprint, startsAt)` pair, since SigNoz has no payload-signing
+  option — assessed low-severity (a trip is fail-safe, not data-exposing);
+  recommended fix is a per-webhook-token trip-rate limit, tracked as
+  follow-up work.
