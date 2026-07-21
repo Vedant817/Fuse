@@ -8,12 +8,13 @@ import { buildFuseResource, type FuseResourceOptions } from './resource.js';
 
 export interface BootstrapOtelOptions extends FuseResourceOptions {
   /**
-   * Explicit OTLP base endpoint (e.g. `http://localhost:4318` or a SigNoz
-   * Cloud ingestion URL) — signal-specific paths (`/v1/traces`,
+   * Explicit OTLP base endpoint (e.g. the self-hosted SigNoz collector at
+   * `http://localhost:4318`, per ADR-005/`infra/signoz-up.sh`, or any other
+   * OTLP-compatible endpoint) — signal-specific paths (`/v1/traces`,
    * `/v1/metrics`, `/v1/logs`) are appended automatically. Omit to fall
    * back to the standard `OTEL_EXPORTER_OTLP_*` environment variables,
-   * which is the production default and works identically whether they
-   * point at a local collector or SigNoz Cloud.
+   * which is the production default and works identically regardless of
+   * which OTLP-compatible backend they point at.
    */
   otlpEndpoint?: string;
   otlpHeaders?: Record<string, string>;

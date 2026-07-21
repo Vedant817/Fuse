@@ -34,7 +34,7 @@ pnpm workspaces, one package/service per concern:
 | `services/control-plane` | Fastify HTTP API: breaker operations, Preflight report/status, SigNoz alert webhook                                             |
 | `services/broken-agent`  | A generic, invented Analyzer↔Verifier agent fixture used to exercise every detector/breaker/Preflight path in integration tests |
 | `docs/adr/`              | Accepted architecture decision records                                                                                          |
-| `infra/`                 | Local Postgres via Docker Compose, plus a deterministic reset script                                                            |
+| `infra/`                 | Local Postgres via Docker Compose, a deterministic reset script, and a self-hosted SigNoz stack (Foundry)                       |
 
 ## Prerequisites
 
@@ -79,14 +79,38 @@ at all. Set `GROQ_API_KEY`/`NVIDIA_API_KEY` in `.env` to additionally run the
 live-optional provider tests (`pnpm --filter @fuse/sdk run test:live`), which
 self-skip when the corresponding key is absent.
 
-### SigNoz
+### SigNoz (self-hosted)
 
-Fuse is built to run against SigNoz Cloud for real telemetry ingestion and
-alerting. As of this writing that live-ingestion path is not yet verified end
-to end (no SigNoz Cloud credentials have been supplied to this build) — see
-task.md for the exact, current status of that gap. Every detector, the
-breaker, and Preflight are fully built and tested against real Postgres and
-real HTTP without requiring SigNoz itself to be running.
+Fuse runs against a **self-hosted** SigNoz instance (ADR-005 — reversed
+from an earlier SigNoz Cloud decision specifically so no external
+account/ingestion key is needed). Bring it up with:
+
+```bash
+infra/signoz-up.sh
+```
+
+This installs [Foundry](https://github.com/SigNoz/foundry) (`foundryctl`)
+if it isn't already on your `PATH`, deploys the stack described by
+`infra/signoz/casting.yaml` (SigNoz backend+UI, ClickHouse, the SigNoz OTel
+Collector), and completes SigNoz's one-time first-run admin/org setup
+non-interactively. Idempotent — safe to re-run. Once it's up:
+
+- UI: <http://localhost:8080> (login: `SIGNOZ_ADMIN_EMAIL`/
+  `SIGNOZ_ADMIN_PASSWORD` from `.env.example` — local dev credentials only,
+  never expose this deployment beyond localhost)
+- OTLP endpoint: `http://localhost:4318` — already the `.env.example`
+  default for `OTEL_EXPORTER_OTLP_ENDPOINT`, which `packages/otel`'s
+  `bootstrapOtel` picks up automatically with zero code changes
+
+Verified end-to-end (not just "containers are up"): a real span emitted by
+`@fuse/otel` was confirmed present in this stack's own ClickHouse store by
+direct query — see `docs/adr/005-self-hosted-signoz.md` for the exact
+verification steps and a real deployment bug (a missing first-run
+org/admin bootstrap) found and fixed along the way. Every detector, the
+breaker, and Preflight are also fully built and tested against real
+Postgres and real HTTP without requiring SigNoz to be running at all.
+
+Tear the stack down with `docker compose -f infra/signoz/pours/deployment/compose.yaml down -v`.
 
 ## Common commands
 
@@ -117,7 +141,8 @@ Scope any of these to one package with pnpm's `--filter`, e.g.
   backed by a command or test that was actually run; deferred work is recorded
   honestly rather than silently dropped.
 - [`docs/adr/`](./docs/adr) — accepted architecture decisions (language/
-  runtime choice, system boundaries and state store, provider adapters).
+  runtime choice, system boundaries and state store, provider adapters,
+  tenant-scoped tokens, self-hosted SigNoz).
 - [`docs/threat-model.md`](./docs/threat-model.md) — assets, actors, webhook
   auth/replay analysis, and an honest risk register (what's mitigated, what
   isn't yet).

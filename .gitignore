@@ -9,3 +9,5 @@ coverage/
 *.log
 .pnpm-store/
 infra/data/
+infra/signoz/pours/
+infra/signoz/casting.yaml.lock

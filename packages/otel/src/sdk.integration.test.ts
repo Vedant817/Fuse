@@ -54,8 +54,11 @@ async function startCapturingServer(): Promise<{
  * paths, with the configured header attached. Attribute-level correctness
  * is covered by gen-ai-span.test.ts's in-memory exporter assertions —
  * this test is specifically the "does telemetry actually leave the
- * process over the wire" proof, standing in for SigNoz Cloud until real
- * ingestion credentials are supplied (task.md §3.3/§12).
+ * process over the wire" proof, kept lightweight (no Docker/SigNoz
+ * required) so it runs in every workspace test pass. Real end-to-end
+ * ingestion against an actual self-hosted SigNoz backend (ADR-005) is
+ * verified separately, ClickHouse-query-confirmed — see
+ * docs/adr/005-self-hosted-signoz.md and task.md §3.3.
  */
 describe('bootstrapOtel: real OTLP HTTP delivery to a local receiver', () => {
   let receiver: Awaited<ReturnType<typeof startCapturingServer>>;

@@ -12,9 +12,12 @@ import {
  * OTel resource-attribute naming) and underscored (`fuse_tenant`,
  * matching typical Prometheus/SigNoz label-name constraints) label key
  * variants, since which form SigNoz's query/alert-rule label propagation
- * actually preserves has not been verified against a live instance yet
- * (task.md §3.3/§4.5, blocked on SigNoz Cloud access) — this tolerance is
- * a deliberate hedge, not a guess presented as fact.
+ * actually preserves has not been verified yet (task.md §3.3/§4.5) — this
+ * tolerance is a deliberate hedge, not a guess presented as fact. A real
+ * self-hosted SigNoz instance is now available locally (ADR-005) with no
+ * credential blocker, making this genuinely checkable; not yet done, since
+ * it requires configuring a real alert rule through the UI, not just
+ * ingesting spans — tracked as an actionable follow-up, not a dropped gap.
  */
 export function mapSignozAlertToNormalizedEvent(
   alert: SignozAlertmanagerAlert,
