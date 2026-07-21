@@ -15,7 +15,7 @@ const VALID_TOKEN = 'a'.repeat(32);
 const CONFIG: ControlPlaneConfig = {
   port: 0,
   host: '127.0.0.1',
-  logLevel: 'silent' as ControlPlaneConfig['logLevel'],
+  logLevel: 'silent',
   databaseUrl: '',
   storeOutageMode: 'fail-closed',
   apiTokens: [VALID_TOKEN],

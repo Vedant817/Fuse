@@ -4,7 +4,9 @@ import { OutageModeSchema } from '@fuse/contracts';
 const ConfigSchema = z.object({
   port: z.coerce.number().int().positive().default(8080),
   host: z.string().min(1).default('0.0.0.0'),
-  logLevel: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  logLevel: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+    .default('info'),
   databaseUrl: z.string().min(1),
   /** Behavior for the /permit fast path only, when the store cannot be
    * reached. Mutating endpoints (trip/resume/disable/enable) always fail
