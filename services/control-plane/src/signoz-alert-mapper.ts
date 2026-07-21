@@ -11,13 +11,22 @@ import {
  * something anyway." Tolerant of both dotted (`fuse.tenant`, matching
  * OTel resource-attribute naming) and underscored (`fuse_tenant`,
  * matching typical Prometheus/SigNoz label-name constraints) label key
- * variants, since which form SigNoz's query/alert-rule label propagation
- * actually preserves has not been verified yet (task.md §3.3/§4.5) — this
- * tolerance is a deliberate hedge, not a guess presented as fact. A real
- * self-hosted SigNoz instance is now available locally (ADR-005) with no
- * credential blocker, making this genuinely checkable; not yet done, since
- * it requires configuring a real alert rule through the UI, not just
- * ingesting spans — tracked as an actionable follow-up, not a dropped gap.
+ * variants. Checked directly against a real self-hosted instance
+ * (ADR-005): querying `signoz_metrics.distributed_time_series_v4`'s
+ * `labels` column for spans/metrics emitted by `@fuse/otel` shows SigNoz
+ * stores OTel resource attributes verbatim, dots and all
+ * (`deployment.environment.name`, `service.name`, `gen_ai.request.model`
+ * all appear with dots, never converted to underscores) — unlike a
+ * vanilla Prometheus/OTel-Prometheus-bridge, which would sanitize dots to
+ * underscores since Prometheus label names disallow them. Since alert
+ * rules are built from these same stored labels, the dotted form
+ * (`fuse.tenant`) is very likely the one that actually reaches a webhook
+ * in practice, not the underscored one this comment previously assumed
+ * was equally or more likely. Both forms are still accepted defensively
+ * — this is real evidence at the label-storage layer, not a live
+ * end-to-end "watched a real Alertmanager payload arrive" proof (creating
+ * an alert rule requires the SigNoz UI's session-based auth, which was
+ * not reverse-engineered — a further, optional step, not done here).
  */
 export function mapSignozAlertToNormalizedEvent(
   alert: SignozAlertmanagerAlert,

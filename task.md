@@ -762,11 +762,20 @@ Acceptance criteria:
   tenant/environment/agent scope. Evidence:
   `services/control-plane/src/signoz-alert-mapper.ts`'s
   `mapSignozAlertToNormalizedEvent` — tolerant of dotted/underscored label
-  key variants (which form SigNoz's alert-rule label propagation actually
-  uses is still unverified — no longer blocked on credentials now that
-  self-hosted SigNoz is available (ADR-005), but not yet checked against
-  a real alert rule, so both forms are still accepted defensively);
-  returns `undefined` for unresolvable scope, and the webhook route reports
+  key variants. Checked against the real self-hosted instance (ADR-005):
+  `signoz_metrics.distributed_time_series_v4`'s stored `labels` for
+  `@fuse/otel`-emitted data show SigNoz preserves OTel attribute names
+  verbatim (dots intact — `deployment.environment.name`, `service.name`),
+  not sanitized to underscores the way a vanilla Prometheus/OTel-bridge
+  would. Since alert rules are built from these same stored labels, the
+  dotted form (`fuse.tenant`) is very likely what actually reaches a
+  webhook — already the first-checked form in `findLabel`'s lookup order,
+  so no code change was needed, just confirmation. Both forms are still
+  accepted defensively; this is real evidence at the label-storage layer,
+  not a live "watched a real alert payload arrive" end-to-end proof
+  (creating an alert rule needs the SigNoz UI's session-based auth, which
+  was not reverse-engineered — a further, optional step, not done here).
+  Returns `undefined` for unresolvable scope, and the webhook route reports
   `unknown-scope` per-alert rather than trip anything. 8 mapper unit tests
   + a dedicated integration test.
 - [x] Make duplicate delivery return the original outcome and prevent duplicate
@@ -1416,11 +1425,16 @@ Add dated entries here rather than leaving important context only in chat.
 - **Resolved**: the SigNoz-Cloud-credential blocker no longer applies — the
   deployment target was reversed to self-hosted SigNoz via Foundry
   (ADR-005/2026-07-21), which needs no external account or key. Real
-  ingestion is now verified (§3.3). Still genuinely open, now that the
-  blocker is gone: §4.5's SigNoz alert-rule-as-code installation, and
-  `signoz-alert-mapper.ts`'s label-propagation-format question — both are
-  actionable against the local self-hosted instance but not yet done. MCP
-  capabilities and Slack workspace remain unselected.
+  ingestion (traces + metrics + correlated logs, §3.3) is now verified.
+  `signoz-alert-mapper.ts`'s label-propagation-format question has real
+  evidence at the label-storage layer (dotted form confirmed preserved,
+  §3.2 evidence above) though not a live end-to-end alert-fire proof.
+  Still genuinely open: §4.5's SigNoz alert-rule-as-code installation, and
+  the SigNoz UI's session-based auth API was not reverse-engineered (tried
+  `/api/v1/login` and `/api/v2/sessions`, both fell through to the SPA
+  route — only `/api/v1/register` was confirmed reachable), so no alert
+  rule was actually created through it. MCP capabilities and Slack
+  workspace remain unselected.
 - No real LLM provider credentials (`GROQ_API_KEY`/`NVIDIA_API_KEY`) are
   available in this environment; the live-optional provider tests
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
