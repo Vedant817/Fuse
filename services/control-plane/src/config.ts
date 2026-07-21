@@ -31,6 +31,11 @@ const ConfigSchema = z.object({
   logLevel: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
+  /** OTel resource attribute (`deployment.environment.name`) for this
+   * control-plane process's own traces/metrics — distinct from a request's
+   * per-scope `environment` (breaker-store/contracts `Scope`), which
+   * identifies the AGENT's environment, not the control plane's own. */
+  deploymentEnvironment: z.string().min(1).default('development'),
   databaseUrl: z.string().min(1),
   /** Behavior for the /permit fast path only, when the store cannot be
    * reached. Mutating endpoints (trip/resume/disable/enable) always fail
@@ -118,6 +123,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     port: env['CONTROL_PLANE_PORT'],
     host: env['CONTROL_PLANE_HOST'],
     logLevel: env['LOG_LEVEL'],
+    deploymentEnvironment: env['CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT'],
     databaseUrl: env['DATABASE_URL'],
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,

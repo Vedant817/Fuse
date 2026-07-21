@@ -49,6 +49,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
         port: 0,
         host: '127.0.0.1',
         logLevel: 'silent',
+        deploymentEnvironment: 'test',
         databaseUrl: pgContainer.getConnectionUri(),
         storeOutageMode: 'fail-closed',
         apiTokens: [API_TOKEN],

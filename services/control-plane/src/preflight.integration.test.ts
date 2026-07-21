@@ -17,6 +17,7 @@ const CONFIG: ControlPlaneConfig = {
   port: 0,
   host: '127.0.0.1',
   logLevel: 'silent',
+  deploymentEnvironment: 'test',
   databaseUrl: '',
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],

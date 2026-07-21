@@ -43,7 +43,10 @@ export function getOperationDurationHistogram(): Histogram {
 /** Bounded cardinality by design: tenant/environment/agent_id is a finite,
  * pre-registered set in any real deployment (unlike a session or
  * correlation id), which is exactly the dimension the breaker
- * trip/deny/resume history dashboard (task.md §8) needs. */
+ * trip/deny/resume history dashboard (task.md §8) needs. Recorded
+ * server-side in `services/control-plane/src/routes/permit.ts` — the one
+ * place a permit decision is actually authoritative, network-wide across
+ * every SDK/agent caller — not client-side per `FuseGuard` instance. */
 export function getBreakerDecisionCounter(): Counter {
   breakerDecisionCounter ??= meter().createCounter('fuse.breaker.permit.decisions', {
     unit: '{decision}',

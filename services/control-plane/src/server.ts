@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { BreakerStore, PreflightStore } from '@fuse/breaker-store';
+import { bootstrapOtel, type FuseOtelHandle } from '@fuse/otel';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 
@@ -17,6 +18,17 @@ async function assertSchemaReady(pool: pg.Pool): Promise<void> {
 
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  // Must happen exactly once, before anything else touches OTel's global
+  // tracer/meter providers (registration is a one-shot no-op on repeat) —
+  // and only here in the real entrypoint, never inside buildApp(), which
+  // every integration test also calls, often many times per process.
+  const otel: FuseOtelHandle = bootstrapOtel({
+    serviceName: 'fuse-control-plane',
+    serviceVersion: process.env['npm_package_version'] ?? '0.0.0',
+    deploymentEnvironment: config.deploymentEnvironment,
+  });
+
   const pool = new pg.Pool({ connectionString: config.databaseUrl });
   await assertSchemaReady(pool);
 
@@ -28,6 +40,7 @@ async function main(): Promise<void> {
     app.log.info({ signal }, 'shutting down');
     await app.close();
     await pool.end();
+    await otel.shutdown();
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));

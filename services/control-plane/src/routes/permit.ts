@@ -1,10 +1,32 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { FuseHttpError, PermitRequestSchema, type OutageMode } from '@fuse/contracts';
+import {
+  FuseHttpError,
+  PermitRequestSchema,
+  type OutageMode,
+  type PermitResponse,
+  type Scope,
+} from '@fuse/contracts';
 import { StoreUnavailableError, type BreakerStore } from '@fuse/breaker-store';
+import { getBreakerDecisionCounter } from '@fuse/otel';
 
 function correlationIdOf(request: FastifyRequest): string {
   const header = request.headers['x-correlation-id'];
   return typeof header === 'string' && header.length > 0 ? header : request.id;
+}
+
+/** Every real permit decision, network-wide across every SDK/agent caller
+ * — the actual dimension `fuse.breaker.permit.decisions`'s own doc comment
+ * (packages/otel/src/metrics.ts) promises, recorded where the decision is
+ * actually authoritative (this route), not client-side per SDK instance. */
+function recordDecision(scope: Scope, result: PermitResponse): void {
+  getBreakerDecisionCounter().add(1, {
+    'fuse.tenant': scope.tenant,
+    'fuse.environment': scope.environment,
+    'fuse.agent_id': scope.agentId,
+    'fuse.breaker.state': result.state,
+    'fuse.breaker.allowed': result.allowed,
+    'fuse.breaker.degraded': result.degraded,
+  });
 }
 
 export function registerPermitRoute(
@@ -27,6 +49,7 @@ export function registerPermitRoute(
 
     try {
       const result = await store.permit(parsed.data.scope, parsed.data.correlationId);
+      recordDecision(parsed.data.scope, result);
       return reply.code(200).send(result);
     } catch (err) {
       if (err instanceof StoreUnavailableError) {
@@ -35,14 +58,16 @@ export function registerPermitRoute(
           'store unavailable during permit check',
         );
         const allowed = storeOutageMode === 'fail-open';
-        return reply.code(200).send({
+        const degradedResult: PermitResponse = {
           allowed,
           state: 'unknown',
           reason: `store unavailable: applying configured outage mode (${storeOutageMode})`,
           epoch: -1,
           degraded: true,
           correlationId: parsed.data.correlationId,
-        });
+        };
+        recordDecision(parsed.data.scope, degradedResult);
+        return reply.code(200).send(degradedResult);
       }
       throw err;
     }
