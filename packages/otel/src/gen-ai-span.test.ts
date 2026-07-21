@@ -16,7 +16,11 @@ import {
   ATTR_FUSE_OUTCOME,
   ATTR_FUSE_STEP_INDEX,
 } from './attributes.js';
-import { withGenAiSpan, type GenAiSpanContext } from './gen-ai-span.js';
+import {
+  withGenAiSpan,
+  type GenAiSpanContext,
+  type SpanTelemetryObservation,
+} from './gen-ai-span.js';
 
 const BASE_CTX: Omit<GenAiSpanContext, 'stepIndex'> = {
   operationName: 'chat',
@@ -133,5 +137,85 @@ describe('withGenAiSpan', () => {
     expect(spans).toHaveLength(1);
     expect(spans[0]!.status.code).toBe(2); // SpanStatusCode.ERROR
     expect(spans[0]!.events.some((e) => e.name === 'exception')).toBe(true);
+  });
+
+  it('reports a healthy root-span telemetry observation on success', async () => {
+    const observations: SpanTelemetryObservation[] = [];
+    await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        stepIndex: -1,
+        onTelemetryObserved: (obs) => observations.push(obs),
+      },
+      async () => ({
+        result: 'ok',
+        outcome: { inputTokens: 10, outputTokens: 5, outcome: 'success' },
+      }),
+    );
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      hasRequestModel: true,
+      hasInputTokens: true,
+      hasOutputTokens: true,
+      hasScopedIdentity: true,
+      hasValidTimestamps: true,
+      isRootSpan: true,
+      hasParent: false,
+    });
+    expect(observations[0]!.timestampMs).toBeGreaterThan(0);
+  });
+
+  it('reports hasParent/isRootSpan correctly for a nested (child) span', async () => {
+    const observations: SpanTelemetryObservation[] = [];
+    await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        stepIndex: -1,
+        onTelemetryObserved: (obs) => observations.push(obs),
+      },
+      async () => {
+        await withGenAiSpan(
+          {
+            ...BASE_CTX,
+            stepIndex: 0,
+            onTelemetryObserved: (obs) => observations.push(obs),
+          },
+          async () => ({
+            result: 'inner',
+            outcome: { inputTokens: 1, outputTokens: 1, outcome: 'success' },
+          }),
+        );
+        return {
+          result: 'outer',
+          outcome: { inputTokens: 1, outputTokens: 1, outcome: 'success' },
+        };
+      },
+    );
+    expect(observations).toHaveLength(2);
+    const [child, parent] = observations;
+    expect(child).toMatchObject({ isRootSpan: false, hasParent: true });
+    expect(parent).toMatchObject({ isRootSpan: true, hasParent: false });
+  });
+
+  it('reports missing token-count observations (not a thrown error) when fn throws', async () => {
+    const observations: SpanTelemetryObservation[] = [];
+    await expect(
+      withGenAiSpan(
+        {
+          ...BASE_CTX,
+          stepIndex: 0,
+          onTelemetryObserved: (obs) => observations.push(obs),
+        },
+        async () => {
+          throw new Error('provider exploded');
+        },
+      ),
+    ).rejects.toThrow('provider exploded');
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      hasInputTokens: false,
+      hasOutputTokens: false,
+      hasRequestModel: true,
+    });
   });
 });

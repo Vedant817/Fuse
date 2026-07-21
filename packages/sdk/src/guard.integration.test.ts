@@ -236,4 +236,36 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     const result = await guard.guard(() => callFakeProvider(fakeProvider.url));
     expect(result).toMatchObject({ ok: true });
   });
+
+  it('recordSpanTelemetry + flush makes this scope visible as protected via the real Preflight API', async () => {
+    const scope = scopeFor('preflight-live-wiring');
+    const guard = guardFor(scope);
+
+    const statusBefore = await fetch(
+      `${controlPlaneUrl}/v1/preflight/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      { headers: { authorization: `Bearer ${API_TOKEN}` } },
+    );
+    expect(statusBefore.status).toBe(404); // never reported yet
+
+    guard.recordSpanTelemetry({
+      timestampMs: Date.now(),
+      hasRequestModel: true,
+      hasInputTokens: true,
+      hasOutputTokens: true,
+      hasScopedIdentity: true,
+      hasValidTimestamps: true,
+      isRootSpan: true,
+      hasParent: false,
+    });
+    await guard.flushPreflightTelemetry();
+
+    const statusAfter = await fetch(
+      `${controlPlaneUrl}/v1/preflight/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      { headers: { authorization: `Bearer ${API_TOKEN}` } },
+    );
+    expect(statusAfter.status).toBe(200);
+    const body = (await statusAfter.json()) as { result: { state: string } };
+    expect(body.result.state).toBe('protected');
+    guard.stopPreflightReporting();
+  });
 });

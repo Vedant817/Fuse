@@ -1,4 +1,4 @@
-import { SpanKind, SpanStatusCode, trace, type Span } from '@opentelemetry/api';
+import { context, SpanKind, SpanStatusCode, trace, type Span } from '@opentelemetry/api';
 import {
   ATTR_GEN_AI_CONVERSATION_ID,
   ATTR_GEN_AI_OPERATION_NAME,
@@ -44,6 +44,10 @@ export interface GenAiSpanContext {
   scenario?: string;
   conversationId?: string;
   correlationId: string;
+  /** Fired once, after the span ends (success or error), with a
+   * structural observation of what this span actually recorded — the
+   * live-wiring path Preflight reporting hangs off of (task.md §6.2). */
+  onTelemetryObserved?: (observation: SpanTelemetryObservation) => void;
 }
 
 export interface GenAiSpanOutcome {
@@ -52,6 +56,25 @@ export interface GenAiSpanOutcome {
   outputTokens: number;
   finishReasons?: string[];
   outcome: 'success' | 'denied' | 'error';
+}
+
+/**
+ * A structural observation of one completed span's telemetry health,
+ * shaped to match `@fuse/contracts`' `SpanTelemetrySampleWire` field for
+ * field. Kept as a locally-owned type (not imported from `@fuse/contracts`)
+ * so this package stays free of a dependency on the wire-contract layer —
+ * callers that DO depend on contracts (e.g. `@fuse/sdk`) can pass this
+ * straight through to the Preflight report request body.
+ */
+export interface SpanTelemetryObservation {
+  timestampMs: number;
+  hasRequestModel: boolean;
+  hasInputTokens: boolean;
+  hasOutputTokens: boolean;
+  hasScopedIdentity: boolean;
+  hasValidTimestamps: boolean;
+  isRootSpan: boolean;
+  hasParent: boolean;
 }
 
 /**
@@ -69,11 +92,17 @@ export async function withGenAiSpan<T>(
   fn: (span: Span) => Promise<{ result: T; outcome: GenAiSpanOutcome }>,
 ): Promise<T> {
   const tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
+  // Captured before `startActiveSpan` enters its own context — inside the
+  // callback, `context.active()` refers to the new span itself, not its
+  // parent, so the parent check must happen out here.
+  const hasParent = trace.getSpan(context.active()) !== undefined;
   return tracer.startActiveSpan(
     `${ctx.operationName} ${ctx.requestModel}`,
     { kind: SpanKind.CLIENT },
     async (span) => {
       const startMillis = performance.now();
+      const observedAtMs = Date.now();
+      let observedOutcome: GenAiSpanOutcome | undefined;
       span.setAttributes({
         [ATTR_GEN_AI_OPERATION_NAME]: ctx.operationName,
         [ATTR_GEN_AI_PROVIDER_NAME]: ctx.providerName,
@@ -93,6 +122,7 @@ export async function withGenAiSpan<T>(
 
       try {
         const { result, outcome } = await fn(span);
+        observedOutcome = outcome;
         const durationSeconds = (performance.now() - startMillis) / 1000;
 
         span.setAttributes({
@@ -141,6 +171,22 @@ export async function withGenAiSpan<T>(
         span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
         throw err;
       } finally {
+        const durationMs = performance.now() - startMillis;
+        ctx.onTelemetryObserved?.({
+          timestampMs: observedAtMs,
+          hasRequestModel: ctx.requestModel.length > 0,
+          hasInputTokens:
+            typeof observedOutcome?.inputTokens === 'number' &&
+            Number.isFinite(observedOutcome.inputTokens),
+          hasOutputTokens:
+            typeof observedOutcome?.outputTokens === 'number' &&
+            Number.isFinite(observedOutcome.outputTokens),
+          hasScopedIdentity:
+            ctx.tenant.length > 0 && ctx.environment.length > 0 && ctx.agentId.length > 0,
+          hasValidTimestamps: Number.isFinite(durationMs) && durationMs >= 0,
+          isRootSpan: !hasParent,
+          hasParent,
+        });
         span.end();
       }
     },

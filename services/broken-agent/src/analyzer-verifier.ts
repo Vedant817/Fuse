@@ -49,6 +49,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
       stepIndex: -1, // root run span, not a per-round step
       correlationId: correlationPrefix,
       conversationId: sessionId,
+      onTelemetryObserved: (obs) => config.guard.recordSpanTelemetry(obs),
     },
     async () => {
       const start = Date.now();
@@ -95,6 +96,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
                   stepIndex: i,
                   correlationId: `${correlationPrefix}-${i}`,
                   conversationId: sessionId,
+                  onTelemetryObserved: (obs) => config.guard.recordSpanTelemetry(obs),
                 },
                 async () => {
                   const r = await model.call({

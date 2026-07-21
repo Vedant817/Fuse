@@ -133,4 +133,26 @@ describe('runAnalyzerVerifier against a real control plane: breaker trip mid-run
     expect(result.totalCalls).toBe(3); // the 3rd call is the one that triggered the trip
     expect(modelSpy).toHaveBeenCalledTimes(3); // no 4th dispatch after the trip committed
   });
+
+  it('a normal run reports its own real span telemetry to Preflight, with no extra wiring by the caller', async () => {
+    const scope = scopeFor('preflight-live-wiring');
+    const guard = new FuseGuard({
+      scope,
+      controlPlaneUrl,
+      apiToken: API_TOKEN,
+      timeoutMs: 2000,
+    });
+
+    await runAnalyzerVerifier({ scenario: 'normal', seed: 1, guard });
+    await guard.flushPreflightTelemetry();
+    guard.stopPreflightReporting();
+
+    const statusRes = await fetch(
+      `${controlPlaneUrl}/v1/preflight/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      { headers: { authorization: `Bearer ${API_TOKEN}` } },
+    );
+    expect(statusRes.status).toBe(200);
+    const body = (await statusRes.json()) as { result: { state: string } };
+    expect(body.result.state).toBe('protected');
+  });
 });

@@ -12,6 +12,7 @@ export type {
   GenAiOperationName,
   GenAiSpanContext,
   GenAiSpanOutcome,
+  SpanTelemetryObservation,
 } from './gen-ai-span.js';
 export { bootstrapOtel } from './sdk.js';
 export type { BootstrapOtelOptions, FuseOtelHandle } from './sdk.js';

@@ -1,9 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Scope } from '@fuse/contracts';
+import type { Scope, SpanTelemetrySampleWire } from '@fuse/contracts';
 import { BreakerTrippedError } from './errors.js';
 import { FuseGuard, type PermitDecisionTelemetry } from './guard.js';
 
 const SCOPE: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-1' };
+
+function healthySample(): SpanTelemetrySampleWire {
+  return {
+    timestampMs: Date.now(),
+    hasRequestModel: true,
+    hasInputTokens: true,
+    hasOutputTokens: true,
+    hasScopedIdentity: true,
+    hasValidTimestamps: true,
+    isRootSpan: true,
+    hasParent: false,
+  };
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -225,5 +238,68 @@ describe('FuseGuard', () => {
         headers: expect.objectContaining({ authorization: 'Bearer secret-token' }),
       }),
     );
+  });
+
+  it('never reports Preflight telemetry (and never touches fetch for it) unless recordSpanTelemetry is called', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse({
+        allowed: true,
+        state: 'armed',
+        reason: 'armed',
+        epoch: 0,
+        degraded: false,
+        correlationId: 'c1',
+      }),
+    );
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    await guard.guard(() => Promise.resolve('x'), 'c1');
+    // Only the one permit-check call — no background Preflight timer was
+    // ever started, since recordSpanTelemetry was never invoked.
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    guard.stopPreflightReporting();
+  });
+
+  it('recordSpanTelemetry forwards samples to POST /v1/preflight/report on flush', async () => {
+    const fetchImpl = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith('/v1/preflight/report'))
+        return new Response(null, { status: 200 });
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp.internal',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    guard.recordSpanTelemetry(healthySample());
+    await guard.flushPreflightTelemetry();
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://cp.internal/v1/preflight/report',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const [, init] = fetchImpl.mock.calls[0]!;
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.scope).toEqual(SCOPE);
+    expect(body.spans).toHaveLength(1);
+    guard.stopPreflightReporting();
+  });
+
+  it('does not report Preflight telemetry when reportPreflightTelemetry is false', async () => {
+    const fetchImpl = vi.fn();
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+      reportPreflightTelemetry: false,
+    });
+    guard.recordSpanTelemetry(healthySample());
+    await guard.flushPreflightTelemetry();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

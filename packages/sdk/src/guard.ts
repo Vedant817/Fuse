@@ -4,8 +4,10 @@ import {
   type OutageMode,
   type PermitResponse,
   type Scope,
+  type SpanTelemetrySampleWire,
 } from '@fuse/contracts';
 import { BreakerTrippedError } from './errors.js';
+import { PreflightReporter } from './preflight-reporter.js';
 
 export interface PermitDecisionTelemetry {
   scope: Scope;
@@ -31,14 +33,25 @@ export interface FuseGuardOptions {
   outageMode?: OutageMode;
   fetchImpl?: typeof fetch;
   onDecision?: (event: PermitDecisionTelemetry) => void;
+  /** Whether span telemetry passed to `recordSpanTelemetry` is reported to
+   * Preflight. Defaults to true; set false to opt out entirely (e.g. a
+   * caller that manages its own reporting path). */
+  reportPreflightTelemetry?: boolean;
+  preflightFlushIntervalMs?: number;
+  preflightMaxBatchSize?: number;
+  onPreflightReportError?: (err: unknown) => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 300;
 
 export class FuseGuard {
-  private readonly options: Required<Omit<FuseGuardOptions, 'onDecision'>> & {
+  private readonly options: Required<
+    Omit<FuseGuardOptions, 'onDecision' | 'onPreflightReportError'>
+  > & {
     onDecision: FuseGuardOptions['onDecision'];
+    onPreflightReportError: FuseGuardOptions['onPreflightReportError'];
   };
+  private preflightReporter: PreflightReporter | undefined;
 
   constructor(options: FuseGuardOptions) {
     this.options = {
@@ -49,6 +62,10 @@ export class FuseGuard {
       outageMode: options.outageMode ?? 'fail-closed',
       fetchImpl: options.fetchImpl ?? fetch,
       onDecision: options.onDecision,
+      reportPreflightTelemetry: options.reportPreflightTelemetry ?? true,
+      preflightFlushIntervalMs: options.preflightFlushIntervalMs ?? 5_000,
+      preflightMaxBatchSize: options.preflightMaxBatchSize ?? 200,
+      onPreflightReportError: options.onPreflightReportError,
     };
   }
 
@@ -57,6 +74,45 @@ export class FuseGuard {
    * tenant/environment/agentId without duplicating it in their own config. */
   get scope(): Scope {
     return this.options.scope;
+  }
+
+  /**
+   * Feeds one span's telemetry observation into this guard's Preflight
+   * reporter — the live-wiring path for task.md §6.2, so a scope's
+   * Preflight state reflects the same real telemetry the breaker itself
+   * would see, without extra integration work by the caller. No-ops if
+   * `reportPreflightTelemetry` was set to false. The reporter is created
+   * lazily (on first call) so a `FuseGuard` that never records telemetry
+   * never starts a background timer.
+   */
+  recordSpanTelemetry(sample: SpanTelemetrySampleWire): void {
+    if (!this.options.reportPreflightTelemetry) return;
+    if (!this.preflightReporter) {
+      this.preflightReporter = new PreflightReporter({
+        scope: this.options.scope,
+        controlPlaneUrl: this.options.controlPlaneUrl,
+        apiToken: this.options.apiToken,
+        fetchImpl: this.options.fetchImpl,
+        flushIntervalMs: this.options.preflightFlushIntervalMs,
+        maxBatchSize: this.options.preflightMaxBatchSize,
+        onFlushError: this.options.onPreflightReportError,
+      });
+      this.preflightReporter.start();
+    }
+    this.preflightReporter.record(sample);
+  }
+
+  /** Forces an immediate flush of any buffered telemetry — useful at
+   * graceful shutdown or in tests, where waiting for the background
+   * timer isn't desirable. No-ops if nothing has been recorded yet. */
+  async flushPreflightTelemetry(): Promise<void> {
+    await this.preflightReporter?.flush();
+  }
+
+  /** Stops the background flush timer. Safe to call even if telemetry
+   * reporting was never started. */
+  stopPreflightReporting(): void {
+    this.preflightReporter?.stop();
   }
 
   /**
