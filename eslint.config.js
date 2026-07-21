@@ -24,6 +24,11 @@ export default [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
+      // tsc already checks undefined globals/types with full type
+      // information (ambient types like NodeJS.ProcessEnv); no-undef
+      // duplicates that poorly without type awareness and false-positives
+      // on ambient globals.
+      'no-undef': 'off',
     },
   },
   prettierConfig,

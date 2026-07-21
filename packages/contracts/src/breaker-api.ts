@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ScopeSchema } from './scope.js';
-import { ActorSchema, BreakerRecordSchema, BreakerStateSchema } from './breaker-state.js';
+import { ActorSchema, BreakerRecordSchema } from './breaker-state.js';
 import { BreakerAuditEventSchema } from './audit.js';
 
 const IdempotencyKeySchema = z.string().min(1).max(200);
@@ -11,11 +11,19 @@ export const PermitRequestSchema = z.object({
 });
 export type PermitRequest = z.infer<typeof PermitRequestSchema>;
 
+/** Distinct from `BreakerStateSchema`: this is what a permit *response* may
+ * report, which includes `unknown` for the honest case where the store was
+ * unreachable and the real state could not be read. `BreakerStateSchema`
+ * (used for stored/transitioned records) never has an `unknown` value —
+ * every persisted record has a definite state. */
+export const PermitStateSchema = z.enum(['armed', 'tripped', 'disabled', 'unknown']);
+export type PermitState = z.infer<typeof PermitStateSchema>;
+
 export const PermitResponseSchema = z.object({
   allowed: z.boolean(),
-  state: BreakerStateSchema,
+  state: PermitStateSchema,
   reason: z.string().max(2000),
-  epoch: z.number().int().nonnegative(),
+  epoch: z.number().int(),
   /** Set when the decision was made under a degraded control-plane/store
    * condition rather than a clean read of current state. Never omitted
    * silently — the SDK and any dashboard must be able to show this. */
