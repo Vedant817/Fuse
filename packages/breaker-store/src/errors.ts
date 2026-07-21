@@ -20,3 +20,15 @@ export class IdempotencyConflictError extends Error {
     this.name = 'IdempotencyConflictError';
   }
 }
+
+/** Thrown when the CAS retry loop exhausts its bounded attempt count under
+ * sustained write contention on one scope. Distinct from
+ * `StoreUnavailableError` — the store is reachable, just heavily contended
+ * — so callers can surface a specific "retry later" response instead of a
+ * generic internal error. */
+export class CasContentionExhaustedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CasContentionExhaustedError';
+  }
+}

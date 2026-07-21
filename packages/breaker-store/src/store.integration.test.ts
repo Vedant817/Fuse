@@ -259,6 +259,46 @@ describe('BreakerStore (Postgres integration)', () => {
     expect(finalRecord?.epoch).toBe(1); // never double-incremented despite 10 concurrent callers
   });
 
+  it('N truly concurrent requests sharing the SAME idempotency key produce exactly one audit row', async () => {
+    // Regression test for a real race found in adversarial review: without
+    // serializing same-key requests, every CAS-loser that recomputed a
+    // no-op outcome before discovering (via the idempotency insert's
+    // ON CONFLICT) that it should have replayed the winner's response would
+    // still commit its own audit_log row first — fabricating phantom
+    // "duplicate observed" audit entries for what was actually one event.
+    const scope = scopeFor('same-key-concurrent');
+    await store.permit(scope, 'corr-0');
+    const idempotencyKey = `idem-samekey-${randomUUID()}`;
+    const req = {
+      scope,
+      reason: 'loop detected',
+      policyVersion: 'v1',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-1',
+      idempotencyKey,
+    };
+    const N = 8;
+    const results = await Promise.all(Array.from({ length: N }, () => store.trip(req)));
+
+    // Every caller observes an identical response.
+    const first = results[0];
+    for (const r of results) expect(r).toEqual(first);
+
+    // Exactly one real state transition occurred.
+    const record = await store.getRecord(scope);
+    expect(record?.epoch).toBe(1);
+
+    // The load-bearing assertion: exactly one audit row, not one-per-racer.
+    const auditRows = await pool.query(
+      `SELECT noop FROM breaker_audit_log
+       WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    expect(auditRows.rows).toHaveLength(1);
+    expect(auditRows.rows[0].noop).toBe(false);
+  });
+
   it('restart recovery: a new BreakerStore instance against the same database sees the persisted state', async () => {
     const scope = scopeFor('restart-recovery');
     await store.trip({

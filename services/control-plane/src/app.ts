@@ -38,9 +38,18 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
 
   registerHealthRoutes(app, deps.pool);
 
+  const operatorTokens = deps.config.apiTokens;
+  const allKnownTokens = [...deps.config.apiTokens, ...deps.config.agentApiTokens];
+
   app.addHook('preHandler', async (request, reply) => {
-    if (request.url.startsWith('/v1/')) {
-      await requireBearerAuth(deps.config.apiTokens)(request, reply);
+    if (request.url.startsWith('/v1/permit')) {
+      // Any known token (operator or agent-scoped) may check a permit.
+      await requireBearerAuth(allKnownTokens, allKnownTokens)(request, reply);
+    } else if (request.url.startsWith('/v1/breaker/')) {
+      // Force-trip/resume/disable/enable/status require an operator token;
+      // an agent-scoped token is a valid credential but gets 403, not a
+      // silent pass — see auth.ts for why that distinction matters.
+      await requireBearerAuth(operatorTokens, allKnownTokens)(request, reply);
     }
   });
 

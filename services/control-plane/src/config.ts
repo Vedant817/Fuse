@@ -13,18 +13,32 @@ const ConfigSchema = z.object({
    * with 503 on store outage regardless of this setting — a control
    * mutation cannot be honestly "applied" if it cannot be persisted. */
   storeOutageMode: OutageModeSchema.default('fail-closed'),
-  /** Shared bearer tokens accepted for every authenticated endpoint
-   * (permit + operational API). Comma-separated in CONTROL_PLANE_API_TOKENS. */
+  /** Operator tokens: full access, including the force-trip/resume/
+   * disable/enable operational API. Comma-separated in
+   * CONTROL_PLANE_API_TOKENS. Least-privilege boundary: only these tokens
+   * may override a cooldown via a manual-actor resume, disable
+   * enforcement, or force a trip — never an agent-scoped token. */
   apiTokens: z.array(z.string().min(16)).min(1),
+  /** Agent tokens: permit-check only. Meant for the SDK embedded in a
+   * customer/agent process — a lower-trust caller that must be able to ask
+   * "am I allowed to make this call?" without also being able to resume,
+   * disable, or force-trip any breaker. Comma-separated in
+   * CONTROL_PLANE_AGENT_API_TOKENS; optional — if empty, only operator
+   * tokens can call /v1/permit (still secure, just no separate role). */
+  agentApiTokens: z.array(z.string().min(16)).default([]),
 });
 export type ControlPlaneConfig = z.infer<typeof ConfigSchema>;
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
-  const rawTokens = env['CONTROL_PLANE_API_TOKENS'] ?? '';
-  const apiTokens = rawTokens
+function parseTokenList(raw: string | undefined): string[] {
+  return (raw ?? '')
     .split(',')
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
+  const apiTokens = parseTokenList(env['CONTROL_PLANE_API_TOKENS']);
+  const agentApiTokens = parseTokenList(env['CONTROL_PLANE_AGENT_API_TOKENS']);
 
   const parsed = ConfigSchema.safeParse({
     port: env['CONTROL_PLANE_PORT'],
@@ -33,6 +47,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     databaseUrl: env['DATABASE_URL'],
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,
+    agentApiTokens,
   });
   if (!parsed.success) {
     throw new Error(`invalid control-plane configuration: ${parsed.error.message}`);

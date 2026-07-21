@@ -20,7 +20,20 @@ function tokenMatches(candidate: string, validTokens: readonly string[]): boolea
   return matched;
 }
 
-export function requireBearerAuth(apiTokens: readonly string[]) {
+/**
+ * `allowedTokens` gates this route; `allKnownTokens` is every token
+ * configured anywhere (operator + agent). A credential that matches
+ * `allKnownTokens` but not `allowedTokens` is a real, valid token that
+ * simply lacks privilege for this route — that is a 403 `unauthorized`,
+ * distinct from a 401 `unauthenticated` for a token nobody issued. This
+ * distinction is what lets an agent-scoped token call `/v1/permit` while
+ * being rejected (not silently accepted) on `/v1/breaker/*` — least
+ * privilege for resume/disable/force-trip, per AGENTS.md.
+ */
+export function requireBearerAuth(
+  allowedTokens: readonly string[],
+  allKnownTokens: readonly string[] = allowedTokens,
+) {
   return async function authPreHandler(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -39,7 +52,7 @@ export function requireBearerAuth(apiTokens: readonly string[]) {
       return;
     }
     const token = header.slice('Bearer '.length).trim();
-    if (token.length === 0 || !tokenMatches(token, apiTokens)) {
+    if (token.length === 0) {
       const err = new FuseHttpError(
         'unauthenticated',
         'invalid bearer token',
@@ -49,5 +62,25 @@ export function requireBearerAuth(apiTokens: readonly string[]) {
       await reply.code(err.httpStatus).send(err.toBody());
       return;
     }
+    if (tokenMatches(token, allowedTokens)) {
+      return;
+    }
+    if (tokenMatches(token, allKnownTokens)) {
+      const err = new FuseHttpError(
+        'unauthorized',
+        'this token is valid but not authorized for this operation',
+        403,
+        correlationId,
+      );
+      await reply.code(err.httpStatus).send(err.toBody());
+      return;
+    }
+    const err = new FuseHttpError(
+      'unauthenticated',
+      'invalid bearer token',
+      401,
+      correlationId,
+    );
+    await reply.code(err.httpStatus).send(err.toBody());
   };
 }

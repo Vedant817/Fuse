@@ -19,6 +19,7 @@ const CONFIG: ControlPlaneConfig = {
   databaseUrl: '',
   storeOutageMode: 'fail-closed',
   apiTokens: [VALID_TOKEN],
+  agentApiTokens: [],
 };
 
 function scopeFor(name: string): Scope {
@@ -238,5 +239,116 @@ describe('control-plane HTTP API (Postgres integration)', () => {
       payload,
     });
     expect(first.json()).toEqual(second.json());
+  });
+});
+
+describe('control-plane token scoping: agent tokens cannot resume/trip/disable/enable', () => {
+  const OPERATOR_TOKEN = 'operator-'.padEnd(32, '0');
+  const AGENT_TOKEN = 'agent-'.padEnd(32, '0');
+  let container: StartedPostgreSqlContainer;
+  let pool: pg.Pool;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer('postgres:16-alpine')
+      .withDatabase('fuse')
+      .withUsername('fuse')
+      .withPassword('fuse')
+      .start();
+    pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    await runMigrations(pool);
+    const store = new BreakerStore(pool);
+    app = await buildApp({
+      store,
+      pool,
+      config: {
+        port: 0,
+        host: '127.0.0.1',
+        logLevel: 'silent',
+        databaseUrl: container.getConnectionUri(),
+        storeOutageMode: 'fail-closed',
+        apiTokens: [OPERATOR_TOKEN],
+        agentApiTokens: [AGENT_TOKEN],
+      },
+    });
+    await app.ready();
+  }, 120_000);
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end();
+    await container.stop();
+  });
+
+  it('an agent token can call /v1/permit', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: scopeFor('agent-permit-ok'), correlationId: 'c1' },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('an agent token gets 403 unauthorized on /v1/breaker/trip, not a silent pass', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: {
+        scope: scopeFor('agent-cannot-trip'),
+        reason: 'attempted by an agent-scoped token',
+        policyVersion: 'v1',
+        cooldownSeconds: 60,
+        actor: { type: 'manual', id: 'someone' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+  });
+
+  it('an agent token gets 403 on /v1/breaker/resume — cannot self-assert a manual-actor cooldown override', async () => {
+    const scope = scopeFor('agent-cannot-resume');
+    // Operator trips it first.
+    await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+      payload: {
+        scope,
+        reason: 'loop',
+        policyVersion: 'v1',
+        cooldownSeconds: 3600,
+        actor: { type: 'system', id: 'system:detector' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    // An agent-scoped token cannot resume it, even by claiming actor:manual.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/resume',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: {
+        scope,
+        reason: 'trying to self-override',
+        actor: { type: 'manual', id: 'not-really-a-human' },
+        correlationId: 'c2',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+  });
+
+  it('an operator token retains full access to /v1/breaker/*', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=nonexistent-${randomUUID()}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(res.statusCode).toBe(404); // unknown_scope, not 401/403 — auth passed
   });
 });

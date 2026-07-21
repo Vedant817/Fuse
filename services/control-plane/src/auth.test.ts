@@ -79,3 +79,57 @@ describe('requireBearerAuth', () => {
     await app.close();
   });
 });
+
+describe('requireBearerAuth with a scoped (allowed vs. known) token set', () => {
+  const OPERATOR_TOKEN = 'operator-token-'.padEnd(32, '0');
+  const AGENT_TOKEN = 'agent-token-'.padEnd(32, '0');
+  const UNKNOWN_TOKEN = 'unknown-token-'.padEnd(32, '0');
+
+  async function buildScopedApp() {
+    const app = Fastify();
+    // Only OPERATOR_TOKEN is "allowed" here; AGENT_TOKEN is a real,
+    // configured credential but not for this route.
+    app.addHook(
+      'preHandler',
+      requireBearerAuth([OPERATOR_TOKEN], [OPERATOR_TOKEN, AGENT_TOKEN]),
+    );
+    app.get('/operator-only', async () => ({ ok: true }));
+    await app.ready();
+    return app;
+  }
+
+  it('accepts the allowed (operator) token', async () => {
+    const app = await buildScopedApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator-only',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('rejects a valid-but-lower-privilege (agent) token with 403 unauthorized, not 401', async () => {
+    const app = await buildScopedApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator-only',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+    await app.close();
+  });
+
+  it('rejects a token that is not configured anywhere with 401 unauthenticated', async () => {
+    const app = await buildScopedApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator-only',
+      headers: { authorization: `Bearer ${UNKNOWN_TOKEN}` },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error).toBe('unauthenticated');
+    await app.close();
+  });
+});

@@ -18,7 +18,7 @@ import type {
   Scope,
   TripRequest,
 } from '@fuse/contracts';
-import { IdempotencyConflictError } from './errors.js';
+import { CasContentionExhaustedError, IdempotencyConflictError } from './errors.js';
 import { withStoreErrors } from './pool.js';
 import {
   type BreakerAuditRow,
@@ -135,161 +135,57 @@ export class BreakerStore {
     });
   }
 
+  /**
+   * Every mutating operation for a given idempotency key is serialized
+   * through a single Postgres session-level advisory lock keyed by
+   * `hashtext(tenant/environment/agentId/idempotencyKey)`, held for the
+   * entire method (idempotency check through final commit) on one
+   * checked-out client. This is deliberate, not incidental: without it, two
+   * truly concurrent requests carrying the *same* idempotency key can both
+   * observe "key not found," both compute and commit a transition (one real,
+   * one no-op), and both write their own `breaker_audit_log` row before
+   * either discovers — via `ON CONFLICT DO NOTHING` on the idempotency
+   * insert — that only one of them should have run at all. Clients still
+   * get an identical, correct response either way (the loser replays the
+   * winner's snapshot), but the audit trail would gain a phantom "duplicate
+   * observed" row that never corresponds to a second real event — exactly
+   * the kind of alert-forgery-shaped noise AGENTS.md requires this trail to
+   * be free of. Holding the lock for the key's full lifetime means the
+   * second caller simply blocks until the first commits, then finds the
+   * idempotency row already populated and returns early without ever
+   * computing an outcome or touching the audit log.
+   *
+   * Different idempotency keys (including concurrent trip/resume/etc. for
+   * the same scope with distinct keys) use distinct lock hashes and do not
+   * contend with each other — only the epoch-CAS loop below governs that
+   * case, unchanged.
+   */
   private async executeTransition(
     args: ExecuteTransitionArgs,
   ): Promise<TransitionResult> {
     return withStoreErrors(async () => {
       const requestHash = hashRequest(args.requestForHash);
+      const lockKey = `${args.scope.tenant}/${args.scope.environment}/${args.scope.agentId}/${args.idempotencyKey}`;
 
-      const existing = await this.pool.query<{
-        request_hash: string;
-        response_snapshot: TransitionResult;
-      }>(
-        `SELECT request_hash, response_snapshot FROM idempotency_keys
-         WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4`,
-        [
-          args.scope.tenant,
-          args.scope.environment,
-          args.scope.agentId,
-          args.idempotencyKey,
-        ],
-      );
-      if (existing.rows.length > 0) {
-        const row = existing.rows[0]!;
-        if (row.request_hash !== requestHash) {
-          throw new IdempotencyConflictError(
-            `idempotency key ${args.idempotencyKey} was already used with a different request`,
-          );
-        }
-        return row.response_snapshot;
-      }
-
-      for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-        const client = await this.pool.connect();
+      const client = await this.pool.connect();
+      try {
+        await client.query('SELECT pg_advisory_lock(hashtext($1)::bigint)', [lockKey]);
         try {
-          await client.query('BEGIN');
-          await this.ensureRecordExists(
-            client,
-            args.scope,
-            args.policyVersionForInit,
-            SYSTEM_INIT_ACTOR,
-            args.now,
-          );
-          const currentRes = await client.query<BreakerStateRow>(
-            `SELECT * FROM breaker_state WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
-            [args.scope.tenant, args.scope.environment, args.scope.agentId],
-          );
-          const current = rowToRecord(currentRes.rows[0]!);
-
-          if (args.expectedEpoch !== undefined && args.expectedEpoch !== current.epoch) {
-            await client.query('ROLLBACK');
-            return {
-              kind: 'rejected',
-              code: 'stale_epoch',
-              message: `expected epoch ${args.expectedEpoch}, current epoch is ${current.epoch}`,
-            };
-          }
-
-          const outcome = args.computeOutcome(current);
-          if (!outcome.ok) {
-            await client.query('ROLLBACK');
-            return { kind: 'rejected', code: outcome.code, message: outcome.message };
-          }
-
-          let finalRecord = outcome.record;
-          if (!outcome.noop) {
-            const updateRes = await client.query<BreakerStateRow>(
-              `UPDATE breaker_state
-                 SET state=$1, epoch=$2, reason=$3, policy_version=$4, cooldown_until=$5,
-                     updated_at=$6, updated_by_type=$7, updated_by_id=$8
-               WHERE tenant=$9 AND environment=$10 AND agent_id=$11 AND epoch=$12
-               RETURNING *`,
-              [
-                outcome.record.state,
-                outcome.record.epoch,
-                outcome.record.reason,
-                outcome.record.policyVersion,
-                outcome.record.cooldownUntil,
-                outcome.record.updatedAt,
-                outcome.record.updatedBy.type,
-                outcome.record.updatedBy.id,
-                args.scope.tenant,
-                args.scope.environment,
-                args.scope.agentId,
-                current.epoch,
-              ],
-            );
-            if (updateRes.rows.length === 0) {
-              // Lost the CAS race to a concurrent writer; retry with a fresh read.
-              await client.query('ROLLBACK');
-              continue;
-            }
-            finalRecord = rowToRecord(updateRes.rows[0]!);
-          }
-
-          const auditRes = await client.query<BreakerAuditRow>(
-            `INSERT INTO breaker_audit_log
-               (id, tenant, environment, agent_id, from_state, to_state, epoch_before, epoch_after,
-                actor_type, actor_id, reason, correlation_id, policy_version, noop)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             RETURNING *`,
-            [
-              randomUUID(),
-              args.scope.tenant,
-              args.scope.environment,
-              args.scope.agentId,
-              current.state,
-              finalRecord.state,
-              current.epoch,
-              finalRecord.epoch,
-              finalRecord.updatedBy.type,
-              finalRecord.updatedBy.id,
-              finalRecord.reason,
-              args.correlationId,
-              finalRecord.policyVersion,
-              outcome.noop,
-            ],
-          );
-          const result: TransitionResult = {
-            kind: 'applied',
-            record: finalRecord,
-            auditEvent: rowToAuditEvent(auditRes.rows[0]!),
-            noop: outcome.noop,
-          };
-
-          const idemRes = await client.query<{ key: string }>(
-            `INSERT INTO idempotency_keys (tenant, environment, agent_id, key, request_hash, response_snapshot, expires_at)
-             VALUES ($1,$2,$3,$4,$5,$6, now() + ${IDEMPOTENCY_TTL_INTERVAL})
-             ON CONFLICT (tenant, environment, agent_id, key) DO NOTHING
-             RETURNING key`,
+          const existing = await client.query<{
+            request_hash: string;
+            response_snapshot: TransitionResult;
+          }>(
+            `SELECT request_hash, response_snapshot FROM idempotency_keys
+             WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4`,
             [
               args.scope.tenant,
               args.scope.environment,
               args.scope.agentId,
               args.idempotencyKey,
-              requestHash,
-              JSON.stringify(result),
             ],
           );
-          await client.query('COMMIT');
-
-          if (idemRes.rows.length === 0) {
-            // A concurrent duplicate request committed under this key first;
-            // replay its response so both callers observe the same outcome.
-            const replay = await this.pool.query<{
-              request_hash: string;
-              response_snapshot: TransitionResult;
-            }>(
-              `SELECT request_hash, response_snapshot FROM idempotency_keys
-               WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4`,
-              [
-                args.scope.tenant,
-                args.scope.environment,
-                args.scope.agentId,
-                args.idempotencyKey,
-              ],
-            );
-            const row = replay.rows[0]!;
+          if (existing.rows.length > 0) {
+            const row = existing.rows[0]!;
             if (row.request_hash !== requestHash) {
               throw new IdempotencyConflictError(
                 `idempotency key ${args.idempotencyKey} was already used with a different request`,
@@ -298,17 +194,162 @@ export class BreakerStore {
             return row.response_snapshot;
           }
 
-          return result;
-        } catch (err) {
-          await client.query('ROLLBACK').catch(() => {});
-          throw err;
+          for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+            try {
+              await client.query('BEGIN');
+              await this.ensureRecordExists(
+                client,
+                args.scope,
+                args.policyVersionForInit,
+                SYSTEM_INIT_ACTOR,
+                args.now,
+              );
+              const currentRes = await client.query<BreakerStateRow>(
+                `SELECT * FROM breaker_state WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+                [args.scope.tenant, args.scope.environment, args.scope.agentId],
+              );
+              const current = rowToRecord(currentRes.rows[0]!);
+
+              if (
+                args.expectedEpoch !== undefined &&
+                args.expectedEpoch !== current.epoch
+              ) {
+                await client.query('ROLLBACK');
+                return {
+                  kind: 'rejected',
+                  code: 'stale_epoch',
+                  message: `expected epoch ${args.expectedEpoch}, current epoch is ${current.epoch}`,
+                };
+              }
+
+              const outcome = args.computeOutcome(current);
+              if (!outcome.ok) {
+                await client.query('ROLLBACK');
+                return { kind: 'rejected', code: outcome.code, message: outcome.message };
+              }
+
+              let finalRecord = outcome.record;
+              if (!outcome.noop) {
+                const updateRes = await client.query<BreakerStateRow>(
+                  `UPDATE breaker_state
+                     SET state=$1, epoch=$2, reason=$3, policy_version=$4, cooldown_until=$5,
+                         updated_at=$6, updated_by_type=$7, updated_by_id=$8
+                   WHERE tenant=$9 AND environment=$10 AND agent_id=$11 AND epoch=$12
+                   RETURNING *`,
+                  [
+                    outcome.record.state,
+                    outcome.record.epoch,
+                    outcome.record.reason,
+                    outcome.record.policyVersion,
+                    outcome.record.cooldownUntil,
+                    outcome.record.updatedAt,
+                    outcome.record.updatedBy.type,
+                    outcome.record.updatedBy.id,
+                    args.scope.tenant,
+                    args.scope.environment,
+                    args.scope.agentId,
+                    current.epoch,
+                  ],
+                );
+                if (updateRes.rows.length === 0) {
+                  // Lost the CAS race to a writer using a *different*
+                  // idempotency key on this scope; retry with a fresh read.
+                  await client.query('ROLLBACK');
+                  continue;
+                }
+                finalRecord = rowToRecord(updateRes.rows[0]!);
+              }
+
+              const auditRes = await client.query<BreakerAuditRow>(
+                `INSERT INTO breaker_audit_log
+                   (id, tenant, environment, agent_id, from_state, to_state, epoch_before, epoch_after,
+                    actor_type, actor_id, reason, correlation_id, policy_version, noop)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 RETURNING *`,
+                [
+                  randomUUID(),
+                  args.scope.tenant,
+                  args.scope.environment,
+                  args.scope.agentId,
+                  current.state,
+                  finalRecord.state,
+                  current.epoch,
+                  finalRecord.epoch,
+                  finalRecord.updatedBy.type,
+                  finalRecord.updatedBy.id,
+                  finalRecord.reason,
+                  args.correlationId,
+                  finalRecord.policyVersion,
+                  outcome.noop,
+                ],
+              );
+              const result: TransitionResult = {
+                kind: 'applied',
+                record: finalRecord,
+                auditEvent: rowToAuditEvent(auditRes.rows[0]!),
+                noop: outcome.noop,
+              };
+
+              // Under the advisory lock held since the top of this method,
+              // no other writer can have inserted this exact key: the
+              // ON CONFLICT branch below is unreachable in normal operation
+              // and exists only as a defensive backstop.
+              const idemRes = await client.query<{ key: string }>(
+                `INSERT INTO idempotency_keys (tenant, environment, agent_id, key, request_hash, response_snapshot, expires_at)
+                 VALUES ($1,$2,$3,$4,$5,$6, now() + ${IDEMPOTENCY_TTL_INTERVAL})
+                 ON CONFLICT (tenant, environment, agent_id, key) DO NOTHING
+                 RETURNING key`,
+                [
+                  args.scope.tenant,
+                  args.scope.environment,
+                  args.scope.agentId,
+                  args.idempotencyKey,
+                  requestHash,
+                  JSON.stringify(result),
+                ],
+              );
+              await client.query('COMMIT');
+
+              if (idemRes.rows.length === 0) {
+                const replay = await client.query<{
+                  request_hash: string;
+                  response_snapshot: TransitionResult;
+                }>(
+                  `SELECT request_hash, response_snapshot FROM idempotency_keys
+                   WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4`,
+                  [
+                    args.scope.tenant,
+                    args.scope.environment,
+                    args.scope.agentId,
+                    args.idempotencyKey,
+                  ],
+                );
+                const row = replay.rows[0]!;
+                if (row.request_hash !== requestHash) {
+                  throw new IdempotencyConflictError(
+                    `idempotency key ${args.idempotencyKey} was already used with a different request`,
+                  );
+                }
+                return row.response_snapshot;
+              }
+
+              return result;
+            } catch (err) {
+              await client.query('ROLLBACK').catch(() => {});
+              throw err;
+            }
+          }
+          throw new CasContentionExhaustedError(
+            `exceeded ${MAX_CAS_ATTEMPTS} retry attempts for ${args.scope.tenant}/${args.scope.environment}/${args.scope.agentId} due to CAS contention; retry the request`,
+          );
         } finally {
-          client.release();
+          await client.query('SELECT pg_advisory_unlock(hashtext($1)::bigint)', [
+            lockKey,
+          ]);
         }
+      } finally {
+        client.release();
       }
-      throw new Error(
-        `exceeded ${MAX_CAS_ATTEMPTS} retry attempts for ${args.scope.tenant}/${args.scope.environment}/${args.scope.agentId} due to CAS contention`,
-      );
     });
   }
 

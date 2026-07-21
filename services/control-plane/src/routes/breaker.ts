@@ -9,6 +9,7 @@ import {
   type FuseErrorCode,
 } from '@fuse/contracts';
 import {
+  CasContentionExhaustedError,
   IdempotencyConflictError,
   StoreUnavailableError,
   type BreakerStore,
@@ -67,6 +68,18 @@ async function respondWithTransition(
         correlationId,
       );
       return reply.code(httpErr.httpStatus).send(httpErr.toBody());
+    }
+    if (err instanceof CasContentionExhaustedError) {
+      const httpErr = new FuseHttpError(
+        'contention_exhausted',
+        err.message,
+        409,
+        correlationId,
+      );
+      return reply
+        .header('retry-after', '1')
+        .code(httpErr.httpStatus)
+        .send(httpErr.toBody());
     }
     throw err;
   }
