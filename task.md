@@ -62,39 +62,72 @@ Demo success measures:
 - [x] Create this feature/subtask tracker.
 - [x] Initialize Git and set repository-local author to
   `Vedant817 <vedantmahajan271@gmail.com>`.
-- [ ] Connect a remote owned by `Vedant817`, verify personal-account
+- [!] Connect a remote owned by `Vedant817`, verify personal-account
   authentication, push the initial branch, and record repository URL here.
-- [ ] Decide protected default branch and short-lived branch strategy; document
-  whether hackathon speed permits direct pushes or requires reviewed PRs.
+  Blocked: `gh` CLI is not installed on this machine and no remote is
+  configured (`git remote -v` empty). Unblock action: install/authenticate
+  `gh` as `Vedant817` (or supply an existing remote URL owned by
+  `Vedant817`), then push branch `main`. All work in the meantime proceeds
+  as local, verified commits per AGENTS.md's explicit allowance for this
+  case.
+- [x] Decide protected default branch and short-lived branch strategy.
+  Decision (2026-07-21): solo hackathon-speed build, direct commits to
+  `main` with no PR review gate; every commit must still pass the full
+  local `pnpm run check` + `pnpm run test:integration` before being made.
+  Branch protection/PR-required review is deferred until a remote exists
+  and/or a second contributor joins — tracked as a deferred item, not
+  forgotten.
 - [ ] Add issue/PR templates that require acceptance criteria, verification,
-  risk, screenshots/telemetry evidence, and rollback notes.
+  risk, screenshots/telemetry evidence, and rollback notes. Deferred: no
+  remote yet to host templates against; low risk while solo.
 
 ### 0.2 Project structure and tooling
 
-- [ ] Write ADR-001 selecting the language/runtime and justify it for OTel,
+- [x] Write ADR-001 selecting the language/runtime and justify it for OTel,
   middleware portability, SigNoz integration, and demo speed.
-- [ ] Write ADR-002 for the system boundaries and state-store choice.
-- [ ] Scaffold the chosen workspace with clear boundaries for:
-  - breaker middleware/SDK;
-  - control plane and alert webhook;
-  - detectors and policy engine;
-  - Preflight service;
-  - broken demo agent;
-  - diagnosis/notification worker;
-  - shared contracts and OTel instrumentation;
-  - SigNoz dashboards, alerts, and local infrastructure.
-- [ ] Pin runtime and package-manager versions and commit the lockfile.
-- [ ] Add formatter, linter, strict type checking, unit/integration test runners,
-  coverage output, build command, and one aggregate `check` command.
-- [ ] Add `.editorconfig`, `.gitignore`, `.env.example`, license, contribution
-  guide, code owners, and a concise initial README.
-- [ ] Add secret scanning, dependency audit, and license checks.
+  Evidence: `docs/adr/001-language-and-runtime.md` (commit `9a296a6`) —
+  TypeScript/Node 24/pnpm workspaces.
+- [x] Write ADR-002 for the system boundaries and state-store choice.
+  Evidence: `docs/adr/002-system-boundaries-and-state-store.md` (commit
+  `9a296a6`) — component boundaries + Postgres with epoch-based CAS.
+- [~] Scaffold the chosen workspace with clear boundaries. Done so far:
+  breaker middleware/SDK (`packages/sdk`), control plane (`services/
+  control-plane`, webhook not yet built), shared contracts
+  (`packages/contracts`). Not yet started: detectors/policy engine,
+  Preflight service, broken demo agent, diagnosis/notification worker,
+  OTel instrumentation, SigNoz dashboards/alerts/local infra. Tracked as
+  the remaining critical-path work in §3-§8 below.
+- [x] Pin runtime and package-manager versions and commit the lockfile.
+  Evidence: `package.json` `engines`/`packageManager`, `pnpm-lock.yaml`
+  committed (commit `b3b4c8e`).
+- [x] Add formatter, linter, strict type checking, unit/integration test
+  runners, coverage output, build command, and one aggregate `check`
+  command. Evidence: `pnpm run check` (format+lint+build+typecheck+test)
+  and `pnpm run test:integration` both pass from a fully clean state
+  (all `dist/`/`.tsbuildinfo` removed) across all 6 workspace packages as
+  of commit `7e91c1a`; `pnpm run test:coverage` verified working after
+  fixing a missing `@vitest/coverage-v8` dependency (commit `02aaa2c`).
+- [~] Add `.editorconfig`, `.gitignore`, `.env.example`, license,
+  contribution guide, code owners, and a concise initial README.
+  Done: `.editorconfig`, `.gitignore`, `.env.example`, `LICENSE`
+  (Apache-2.0). Not yet done: `CONTRIBUTING.md`, `CODEOWNERS`, root
+  `README.md` — deferred until closer to demo/release polish (§11.2), but
+  genuinely missing right now, which fails this section's own acceptance
+  criterion ("a new contributor can clone... from documented commands").
+  This is the most important near-term gap to close next.
+- [ ] Add secret scanning, dependency audit, and license checks. Not started.
 - [ ] Add CI for clean install, format/lint/type check, tests, build, security
   checks, and artifact retention; protect secrets on forked pull requests.
-- [ ] Add reproducible local infrastructure with health checks and pinned image
-  versions for SigNoz and the selected state dependencies.
-- [ ] Add deterministic seed/reset scripts and document supported host
-  prerequisites.
+  Not started — no remote to host CI against yet, but the workflow file
+  can and should be written locally regardless.
+- [~] Add reproducible local infrastructure with health checks and pinned
+  image versions for SigNoz and the selected state dependencies.
+  Done: `infra/docker-compose.yml` pins `postgres:16-alpine` with a
+  healthcheck. Not done: SigNoz itself is not yet stood up locally.
+- [~] Add deterministic seed/reset scripts and document supported host
+  prerequisites. Done: `infra/reset.sh` deterministically drops/re-migrates
+  the Postgres schema. Not done: host prerequisites are not documented
+  anywhere yet (blocked on the missing README above).
 
 Acceptance criteria:
 
@@ -109,49 +142,126 @@ Acceptance criteria:
 
 - [ ] Draw the end-to-end sequence for Preflight, normal model-call permit,
   SigNoz alert, trip, blocked next call, diagnosis, Slack action, and resume.
-- [ ] Define components, trust boundaries, data ownership, deploy topology, and
-  supported single-node versus distributed behavior.
-- [ ] Define stable identifiers for tenant, environment, agent, session, task,
-  trace, alert, policy version, and breaker epoch.
-- [ ] Define breaker states and transitions (at minimum protected/armed,
-  tripped, disabled, and protection-degraded) with authorized actors and guards.
-- [ ] Specify what happens to in-flight calls at trip time and state the exact
-  guarantee for calls beginning after a committed trip.
-- [ ] Choose and document state consistency, atomic transition mechanism,
+  Not done as a diagram; the trip/permit/resume portion is documented in
+  prose in ADR-002 and enforced by tests, but there is no single sequence
+  artifact covering the full Preflight→...→Resume loop (most of that loop
+  doesn't exist yet).
+- [~] Define components, trust boundaries, data ownership, deploy topology, and
+  supported single-node versus distributed behavior. ADR-002 defines
+  component boundaries and the trust boundary (only `control-plane` touches
+  the store). Deploy topology and single-node-vs-distributed behavior are
+  not yet written down as an explicit statement.
+- [~] Define stable identifiers for tenant, environment, agent, session, task,
+  trace, alert, policy version, and breaker epoch. Done: tenant/environment/
+  agentId (`Scope`), policy version (`policyVersion`), breaker epoch
+  (`epoch`) — all implemented, validated, and tested. Not yet defined:
+  session, task, trace, and alert identifiers (these arrive with OTel
+  instrumentation and detector/alert work, §3-§5).
+- [x] Define breaker states and transitions (at minimum protected/armed,
+  tripped, disabled, and protection-degraded) with authorized actors and
+  guards. Evidence: `packages/breaker-core/src/transitions.ts` — armed/
+  tripped/disabled states, `system`/`policy`/`manual` actor types, guards for
+  cooldown and disabled-overrides-trip; 16 unit tests +  2 property-based
+  invariant tests, all passing (`pnpm --filter @fuse/breaker-core run test`).
+  Note: "protection-degraded" here refers to a distinct concept — Preflight's
+  telemetry-health status (§6), not yet built; the enforcement-state enum
+  intentionally does not conflate the two (see `breaker-state.ts` comment).
+- [x] Specify what happens to in-flight calls at trip time and state the exact
+  guarantee for calls beginning after a committed trip. Guarantee (tested,
+  not just asserted): once a trip's HTTP response has been observed, every
+  subsequent `guard()` call is denied and reaches the provider zero times —
+  proven sequentially and under 25-way concurrency in
+  `packages/sdk/src/guard.integration.test.ts`. Calls already past their
+  permit check and mid-dispatch *before* the trip request was even sent may
+  still complete; this exposure was measured at exactly the number of calls
+  actually in flight (2 of 2 in the test), not estimated. This is the
+  honest, tested limitation to state in demo/docs: Fuse cannot cancel an
+  in-flight provider request, only prevent the next one.
+- [x] Choose and document state consistency, atomic transition mechanism,
   deduplication window, TTL/retention, and recovery after process restart.
-- [ ] Decide explicit fail-open/fail-closed policy for SDK/control-plane/store
+  Evidence: ADR-002 (epoch-based CAS, 7-day idempotency-key TTL); restart
+  recovery proven by `store.integration.test.ts`'s "restart recovery" case
+  (fresh `pg.Pool` + `BreakerStore` against the same DB observes persisted
+  state correctly).
+- [x] Decide explicit fail-open/fail-closed policy for SDK/control-plane/store
   outages and allow policy-level overrides with conspicuous status.
+  Evidence: control-plane `storeOutageMode` (permit path only; mutations
+  always fail closed on store outage — tested) and SDK `outageMode` (default
+  fail-closed, fail-open opt-in — tested) in `guard.test.ts`. "Conspicuous
+  status": every permit response carries a `degraded: boolean` and, when
+  degraded, `state: "unknown"` rather than guessing armed/tripped/disabled —
+  there is no dedicated status/config-inspection endpoint yet (deferred,
+  P2 — the live per-request `degraded` flag covers the P0 honesty
+  requirement).
 - [ ] Define delivery semantics for SigNoz alerts and Slack/MCP work; design all
-  handlers for at-least-once delivery.
+  handlers for at-least-once delivery. Not started — depends on §4/§5/§7.
 - [ ] Record capacity targets and budgets for permit-check latency, webhook
   latency, trip propagation, throughput, availability, and telemetry cost.
+  Not started; no load testing has been run yet (tracked in §9.2).
 
 ### 1.2 Threat and privacy model
 
 - [ ] Inventory assets and attackers: control credentials, resume endpoint,
   policy mutation, tenant isolation, alert forgery/replay, malicious prompt/tool
-  data, log injection, denial of service, and supply-chain risk.
+  data, log injection, denial of service, and supply-chain risk. Not written
+  as a standalone document yet; individual mitigations exist in code
+  (bearer auth, tenant/environment/agent scoping, idempotency keys) but
+  have not been inventoried against attackers systematically. Genuine gap —
+  targeted for the next session before webhook work (§5) begins, since the
+  webhook is the highest-value attack surface added next.
 - [ ] Define webhook authentication/signature verification, timestamp skew,
-  replay prevention, key rotation, and least-privilege secret storage.
-- [ ] Define human-action authorization and audit requirements for resume,
-  disable, policy override, and force trip.
+  replay prevention, key rotation, and least-privilege secret storage. Not
+  started — no webhook exists yet (§5.1).
+- [x] Define human-action authorization and audit requirements for resume,
+  disable, policy override, and force trip. Evidence: every mutating
+  control-plane endpoint requires a bearer token, an `actor {type, id}`, a
+  `reason`, and an `idempotencyKey`; every transition is recorded in
+  `breaker_audit_log` with actor/reason/correlation/policy-version — tested
+  in `store.integration.test.ts` and `app.integration.test.ts`.
 - [ ] Set prompt/tool payload collection defaults, redaction rules, retention,
-  deletion, and demo-data constraints.
+  deletion, and demo-data constraints. Not started — no prompt/tool payload
+  is collected anywhere yet (no broken-agent/OTel instrumentation exists).
 - [ ] Produce an abuse-case test list and map P0/P1 threats to mitigations.
+  Not written as a standalone list yet, though the test suites already cover
+  several abuse cases ad hoc (forged/wrong bearer tokens, prefix-matching
+  tokens, malformed bodies, stale epochs, idempotency-key reuse conflicts).
 
 ### 1.3 Versioned contracts
 
-- [ ] Define and validate the policy-file schema: scope, budgets, detectors,
+- [x] Define and validate the policy-file schema: scope, budgets, detectors,
   fail mode, cooldown, notification routes, and manual/policy resume rules.
+  Evidence: `packages/contracts/src/policy.ts` — versioned `PolicySchema`
+  with `policyVersion`, `cooldownSeconds`, `storeOutageMode`,
+  `controlPlaneOutageMode`, an open-ended `detectors` record for future
+  detector configs, and `notificationRoutes`. Minimal by design: detector-
+  specific budget/threshold fields are added additively in §4 without
+  breaking this schema.
 - [ ] Define versioned alert-webhook input and normalized internal alert event.
-- [ ] Define trip/permit/resume API requests, responses, idempotency keys,
-  stable error codes, and compatibility rules.
-- [ ] Define structured breaker audit event and required correlation fields.
-- [ ] Define Preflight result and protection-state reason codes.
+  Not started (§5.1).
+- [x] Define trip/permit/resume API requests, responses, idempotency keys,
+  stable error codes, and compatibility rules. Evidence:
+  `packages/contracts/src/breaker-api.ts` and `errors.ts` — fully
+  implemented, contract-tested (11 tests covering valid fixtures and
+  malformed input: oversized reason, negative cooldown, wrong actor type,
+  missing idempotency key, wrong types), and exercised end-to-end through
+  real HTTP in the control-plane and SDK integration suites.
+- [x] Define structured breaker audit event and required correlation fields.
+  Evidence: `packages/contracts/src/audit.ts` `BreakerAuditEventSchema` —
+  scope, from/to state, epoch before/after, actor, reason, correlationId,
+  policyVersion, noop flag; persisted to `breaker_audit_log` and returned
+  in every transition response.
+- [ ] Define Preflight result and protection-state reason codes. Not started
+  (§6).
 - [ ] Define diagnosis output with evidence references, confidence/limitations,
-  recommended action, and safe fallback when MCP is unavailable.
-- [ ] Add JSON/OpenAPI schemas, generated types where appropriate, fixtures,
-  contract tests, and malformed-input/fuzz cases.
+  recommended action, and safe fallback when MCP is unavailable. Not started
+  (§7).
+- [~] Add JSON/OpenAPI schemas, generated types where appropriate, fixtures,
+  contract tests, and malformed-input/fuzz cases. Done: zod schemas +
+  inferred TS types (equivalent to generated types from one source of
+  truth), fixtures, and malformed-input contract tests for everything built
+  so far. Not done: no OpenAPI spec has been generated/published yet, and
+  there is no property-based/fuzz testing of the zod schemas themselves
+  (only of breaker-core's state machine, via `fast-check`).
 
 Acceptance criteria:
 
@@ -163,51 +273,137 @@ Acceptance criteria:
 
 ### 2.1 Breaker core
 
-- [ ] Implement the state model and policy evaluation as deterministic,
-  side-effect-free domain logic.
-- [ ] Implement atomic `trip`, `permit`, `resume`, `disable`, and status
-  operations with tenant/environment/agent scoping.
-- [ ] Make trip/resume idempotent and safe under duplicates, reordering,
-  concurrent requests, stale breaker epochs, and restarts.
-- [ ] Store who/what/why/when for every state transition and policy version.
-- [ ] Implement cooldown and authorized manual/policy resume without accidental
-  timer-based reopening.
-- [ ] Add unit/property tests for every valid and invalid transition.
+- [x] Implement the state model and policy evaluation as deterministic,
+  side-effect-free domain logic. Evidence: `packages/breaker-core/src/
+  transitions.ts` — every function is pure (`current` + `input` in,
+  outcome out; clock is caller-supplied, never read internally).
+- [x] Implement atomic `trip`, `permit`, `resume`, `disable`, and status
+  operations with tenant/environment/agent scoping. Evidence:
+  `packages/breaker-store/src/store.ts` (epoch-CAS `UPDATE ... WHERE
+  epoch=$expected`) + `services/control-plane` HTTP routes, all scoped by
+  `{tenant, environment, agentId}`.
+- [x] Make trip/resume idempotent and safe under duplicates, reordering,
+  concurrent requests, stale breaker epochs, and restarts. Evidence
+  (`store.integration.test.ts`, real Postgres via testcontainers):
+  duplicate idempotency-key delivery returns the identical stored outcome;
+  10 concurrent trip requests for one scope produce exactly one real
+  transition (epoch 0→1) and 9 no-ops; a stale `expectedEpoch` is rejected,
+  not silently applied; a fresh `BreakerStore`/`pg.Pool` against the same
+  database after a simulated restart observes the persisted tripped state.
+- [x] Store who/what/why/when for every state transition and policy version.
+  Evidence: `breaker_audit_log` table + `BreakerAuditEvent`, written inside
+  the same transaction as the state update.
+- [x] Implement cooldown and authorized manual/policy resume without
+  accidental timer-based reopening. Evidence: `applyResume` rejects a
+  `policy`-actor resume while `cooldownUntil` is in the future
+  (`cooldown_active`), a `manual`-actor resume overrides it; there is no
+  code path anywhere that transitions state on a bare timer — every
+  transition requires an explicit call. Tested in both
+  `breaker-core`'s unit tests and `breaker-store`/`control-plane`'s
+  integration tests.
+- [x] Add unit/property tests for every valid and invalid transition.
+  Evidence: 16 unit tests + 2 `fast-check` property tests (epoch
+  monotonicity; a disabled breaker can never be moved to tripped by
+  `applyTrip` for any actor/reason) in `transitions.test.ts`, all passing.
+
+Section 2.1 acceptance criteria (races/bypass/restart/store-failure/status)
+were folded into the combined gap review recorded under §2.3 below, since
+by the time 2.1 was implemented the full stack (store→control-plane→SDK)
+already existed to test it against realistically.
 
 ### 2.2 Pre-call middleware/SDK
 
-- [ ] Define a provider-neutral model-call wrapper and an initial real provider
-  adapter; keep provider SDK types out of the domain layer.
-- [ ] Check a permit immediately before provider dispatch, after expensive local
-  preparation where practical but before network bytes can be sent.
-- [ ] Return a typed, actionable breaker error containing incident/correlation
-  identifiers without leaking policy secrets.
-- [ ] Emit permit/deny latency, decision, state, and correlation telemetry while
-  controlling cardinality.
-- [ ] Implement configured behavior for control-plane timeout/unavailability and
-  expose that degraded protection state.
-- [ ] Prove with a fake provider request counter that a tripped breaker results
-  in zero provider calls; repeat under concurrency and trip/permit races.
-- [ ] Run one controlled integration test against a real provider or a faithful
-  HTTP test endpoint and preserve evidence for the demo.
+- [~] Define a provider-neutral model-call wrapper and an initial real
+  provider adapter; keep provider SDK types out of the domain layer. Done:
+  `FuseGuard.guard(dispatch, correlationId)` (`packages/sdk/src/guard.ts`)
+  wraps any `() => Promise<T>` — provider-agnostic by construction, no
+  provider SDK types anywhere near `breaker-core`. Not done: no concrete
+  real-provider (Anthropic/OpenAI) HTTP adapter exists, because no
+  provider credentials are available in this environment. Per CLAUDE.md's
+  explicit guidance for this situation, the complete local/mock path was
+  built and verified instead (`packages/sdk/src/testing.ts`'s
+  `startFakeProvider`/`callFakeProvider`, a real `node:http` server, not an
+  in-process stub) — this is the documented missing integration step, to
+  be closed the moment a provider API key is supplied.
+- [x] Check a permit immediately before provider dispatch, after expensive
+  local preparation where practical but before network bytes can be sent.
+  Evidence: `guard()` always calls `checkPermit()` and returns/throws before
+  ever invoking `dispatch()`; proven by `dispatch` mock never being called
+  on denial (`guard.test.ts`) and the fake provider receiving zero requests
+  after a real trip (`guard.integration.test.ts`).
+- [x] Return a typed, actionable breaker error containing incident/
+  correlation identifiers without leaking policy secrets. Evidence:
+  `BreakerTrippedError` (`packages/sdk/src/errors.ts`) carries only scope,
+  reason, correlationId, state, degraded — no tokens/credentials/internal
+  policy fields.
+- [~] Emit permit/deny latency, decision, state, and correlation telemetry
+  while controlling cardinality. Done: `onDecision` hook fires for every
+  permit check with `{scope, correlationId, allowed, state, degraded,
+  latencyMs, reason}` (tested in `guard.test.ts`). Not done: not yet wired
+  to an actual OTel metrics/span exporter — that wiring belongs to §3.2 and
+  will consume this same hook rather than replacing it.
+- [x] Implement configured behavior for control-plane timeout/unavailability
+  and expose that degraded protection state. Evidence: SDK `outageMode`
+  (default `fail-closed`; `fail-open` requires explicit opt-in) tested for
+  network error, non-2xx, malformed response, and timeout cases, all
+  resolving to `degraded: true, state: "unknown"` rather than a guessed
+  state.
+- [x] Prove with a fake provider request counter that a tripped breaker
+  results in zero provider calls; repeat under concurrency and trip/permit
+  races. Evidence: `guard.integration.test.ts` — 10 sequential calls after
+  a committed trip (0 new requests), 25 concurrent calls fired after the
+  trip's HTTP response returns (0 new requests, all rejected with
+  `BreakerTrippedError`), and an in-flight-exposure measurement (exactly 2
+  in-flight calls started *before* the trip request completed).
+- [x] Run one controlled integration test against a real provider or a
+  faithful HTTP test endpoint and preserve evidence for the demo. The fake
+  provider is a real, network-listening HTTP server (not an in-process
+  function-call counter) — this satisfies "faithful HTTP test endpoint."
+  A real-provider (Anthropic/OpenAI) run remains blocked on credentials
+  (see above) and is the one open item before this box could be fully
+  checked in the strictest reading; recorded as a deferred P1, target
+  milestone: whenever provider credentials become available.
 
 ### 2.3 Hardcoded trigger proof
 
-- [ ] Add a temporary deterministic threshold trigger behind a clearly named
-  demo/test policy, not the production default.
-- [ ] Run an end-to-end slice: threshold -> atomic trip -> next pre-call denied ->
-  structured audit event.
-- [ ] Measure the maximum additional calls possible due to already in-flight
-  work and present this honestly in docs/demo.
-- [ ] Perform post-slice review for races, bypass routes, process restarts,
-  state-store failure, and misleading status; fix P0/P1 findings.
+- [x] Add a temporary deterministic threshold trigger behind a clearly named
+  demo/test policy, not the production default. Evidence:
+  `packages/sdk/src/demo-threshold-trigger.ts` — `DemoThresholdTrigger`, a
+  sliding-window call counter exported only from `@fuse/sdk/demo` (kept out
+  of the default `@fuse/sdk` import path), using policy version
+  `demo-hardcoded-threshold-v1` (`packages/contracts/src/policy.ts`'s
+  `DEMO_HARDCODED_THRESHOLD_POLICY_VERSION`).
+- [x] Run an end-to-end slice: threshold -> atomic trip -> next pre-call
+  denied -> structured audit event. Evidence:
+  `demo-threshold-trigger.integration.test.ts` — 3 calls under threshold
+  succeed with no trip; the 4th call pushes the window over the limit and
+  the trigger itself (not a test helper standing in for one) calls the
+  real trip endpoint; the response's `record.state` and
+  `auditEvent.toState` are both `"tripped"`; the next guarded call is
+  denied and the real fake-provider HTTP server receives zero additional
+  requests.
+- [x] Measure the maximum additional calls possible due to already in-flight
+  work and present this honestly in docs/demo. Measured (not estimated):
+  exactly the number of calls that were genuinely in flight before the trip
+  request was issued (2, in the dedicated in-flight-exposure test) — see
+  §1.1's in-flight guarantee entry above for the full statement. This
+  number is fixture-specific (it depends on how many calls a given agent
+  actually has outstanding at trip time); the demo/README will need to
+  state this as "bounded by actual concurrency, not a fixed constant"
+  rather than quoting "2" as a universal guarantee.
+- [x] Perform post-slice review for races, bypass routes, process restarts,
+  state-store failure, and misleading status; fix P0/P1 findings. See the
+  dated gap-review entry in §12 for the independent adversarial review
+  performed across §2.1-§2.3's full implementation and its resolution.
 
 Acceptance criteria:
 
 - tests provide deterministic proof that the provider dispatch function is not
-  invoked after the committed trip;
-- all state changes are attributable and replay-safe;
-- the configured outage behavior is tested and visible.
+  invoked after the committed trip — met, see §2.2/§2.3 evidence above;
+- all state changes are attributable and replay-safe — met, see §2.1 evidence;
+- the configured outage behavior is tested and visible — met, see §1.1 and
+  §2.2 evidence (control-plane `storeOutageMode`, SDK `outageMode`, the
+  `degraded`/`state:"unknown"` fields).
 
 ## 3. Deliberately broken agent and sensing (P0)
 
@@ -611,6 +807,20 @@ Add dated entries here rather than leaving important context only in chat.
 - 2026-07-21: Repository commits must use local identity
   `Vedant817 <vedantmahajan271@gmail.com>` and pushes must be authenticated as
   GitHub user `Vedant817`.
+- 2026-07-21 (ADR-001): TypeScript/Node.js 24/pnpm workspaces monorepo. See
+  `docs/adr/001-language-and-runtime.md`.
+- 2026-07-21 (ADR-002): Component boundaries (contracts/breaker-core/
+  breaker-store/sdk/control-plane) and PostgreSQL with epoch-based CAS as
+  the single durable breaker state + audit store. See
+  `docs/adr/002-system-boundaries-and-state-store.md`.
+- 2026-07-21: Solo hackathon-speed direct-push-to-`main` branch strategy;
+  branch protection/PR review deferred until a remote and/or a second
+  contributor exists (§0.1).
+- 2026-07-21: No real LLM provider adapter was built due to unavailable
+  credentials; the complete local/mock path (a real, network-listening
+  fake-provider HTTP server, not an in-process stub) was built and verified
+  instead, per CLAUDE.md's explicit guidance for this situation. This is a
+  tracked, documented gap (§2.2), not a silent shortcut.
 
 ### Verification evidence
 
@@ -618,6 +828,74 @@ Add dated entries here rather than leaving important context only in chat.
   on `main`; repository-local `user.name` and `user.email` verified as
   `Vedant817` and `vedantmahajan271@gmail.com`. Initial commit evidence is in
   repository history; remote-push evidence remains blocked.
+- 2026-07-21: Breaker-first vertical slice (§2) built and verified end to
+  end across 5 packages (`contracts`, `breaker-core`, `breaker-store`,
+  `control-plane`, `sdk`) in commits `9a296a6`..`7e91c1a`, plus the
+  post-review fix commit below. From a fully clean state (all
+  `dist/`/`.tsbuildinfo` removed):
+  - `pnpm run check` (format, lint, build, typecheck, unit tests) passes —
+    53 unit tests across 5 buildable packages (post-review-fix count; see
+    the adversarial-review entry below for what changed).
+  - `pnpm run test:integration` passes — 32 integration tests against a
+    real Postgres (via testcontainers) and, for the SDK, a real listening
+    control-plane HTTP server and a real listening fake-provider HTTP
+    server.
+  - The central product guarantee — zero provider dispatches after a
+    committed trip — is proven by counting actual inbound HTTP requests to
+    a real server, not in-process function calls, including under 25-way
+    concurrency racing the trip itself
+    (`packages/sdk/src/guard.integration.test.ts`).
+  - `pnpm run test:coverage` verified working after fixing a missing
+    `@vitest/coverage-v8` dependency (commit `02aaa2c`).
+- 2026-07-21: Independent adversarial review of the full §2 slice
+  (correctness/races in the CAS loop, auth bypass routes, timing side
+  channels, misleading-status claims, idempotency-replay consistency,
+  fail-open/fail-closed consistency, cooldown-bypass logic, swallowed
+  errors), performed by a separate reviewing agent with no access to this
+  session's implementation reasoning. Confirmed correct with no findings:
+  CAS transition core logic (verified live with 8-way and 10-way
+  concurrent writers), idempotency-key replay consistency, auth
+  bypass/route-registration order, the constant-time bearer-token check,
+  fail-open/fail-closed honesty (mutations always 503 on store outage
+  regardless of configured mode), and cooldown/manual-override logic.
+  Three findings, all resolved same-day:
+  - **P1 (fixed)**: N truly concurrent requests sharing the same
+    idempotency key each independently computed and committed their own
+    `breaker_audit_log` row (one real transition + N-1 phantom "no-op"
+    rows) before discovering via `ON CONFLICT DO NOTHING` that only one
+    should have run — clients still got a correct, identical response, but
+    the audit trail gained fabricated duplicate-observation rows. Fixed by
+    serializing all same-key requests through a Postgres session-level
+    advisory lock (`pg_advisory_lock(hashtext(scope+key))`) held for the
+    idempotency-check-through-commit lifetime of `executeTransition`
+    (`packages/breaker-store/src/store.ts`); different keys still run
+    concurrently, only true duplicates now serialize. Regression test:
+    `store.integration.test.ts`'s "N truly concurrent requests sharing the
+    SAME idempotency key produce exactly one audit row" (8-way, passing).
+  - **P1 (fixed)**: every configured API token could call every endpoint,
+    including force-trip/resume/disable/enable — an agent-embedded SDK
+    token (meant only to check permits) could assert `actor: {type:
+    "manual"}` on `/v1/breaker/resume` and bypass an active cooldown,
+    contradicting AGENTS.md's least-privilege requirement for
+    resume/override operations. Fixed by splitting tokens into two roles:
+    `CONTROL_PLANE_API_TOKENS` (operator: full access) and
+    `CONTROL_PLANE_AGENT_API_TOKENS` (agent: `/v1/permit` only); a valid
+    agent token attempting `/v1/breaker/*` now gets 403 `unauthorized`
+    (not a silent pass, and distinct from 401 `unauthenticated` for an
+    unknown token) — see `services/control-plane/src/auth.ts`,
+    `config.ts`, `app.ts`. Tests: `auth.test.ts`'s scoped-token describe
+    block (unit) and `app.integration.test.ts`'s "token scoping" describe
+    block (integration, real HTTP + Postgres), both passing.
+  - **P2 (fixed)**: CAS-retry exhaustion (sustained write contention on one
+    scope past `MAX_CAS_ATTEMPTS`) threw a plain, unlabeled `Error`,
+    surfacing as a generic 500 indistinguishable from an unexpected bug.
+    Fixed with a typed `CasContentionExhaustedError`, mapped to a new
+    `contention_exhausted` (409) error code with a `Retry-After` header.
+    Not separately load-tested (P2, low likelihood at current scale); will
+    be exercised naturally once load testing (§9.2) runs.
+  Verified after fixes: full workspace `pnpm run check` and
+  `pnpm run test:integration` pass from a clean state — 53 unit tests + 32
+  integration tests across 5 buildable packages, zero failures.
 
 ### Open blockers and risks
 
@@ -627,3 +905,12 @@ Add dated entries here rather than leaving important context only in chat.
 - Actual SigNoz version, deployment target, MCP capabilities, LLM provider, and
   Slack workspace are not yet selected; these require explicit ADRs/configuration
   before integration assumptions are encoded in production paths.
+- No real LLM provider credentials are available in this environment; the
+  real-provider adapter and its integration test (§2.2) remain blocked on
+  this. The complete mock path is built and verified in the meantime.
+- No root `README.md`, `CONTRIBUTING.md`, or `CODEOWNERS` exist yet, so the
+  §0.2 "a new contributor can clone... from documented commands" acceptance
+  criterion is not yet met. Highest-priority near-term gap.
+- No formal threat model document exists yet (§1.2); the webhook (§5.1),
+  the next planned P0 slice, is the highest-risk new attack surface and
+  should not be built without one.
