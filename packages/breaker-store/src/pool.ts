@@ -2,11 +2,28 @@ import pg from 'pg';
 import { StoreUnavailableError } from './errors.js';
 
 const CONNECTION_ERROR_CODES = new Set([
+  // Node/TCP-level: the connection attempt itself never reached Postgres.
   'ECONNREFUSED',
   'ENOTFOUND',
   'ETIMEDOUT',
   'EHOSTUNREACH',
   'ECONNRESET',
+  // Postgres SQLSTATE class 08 (Connection Exception): node-postgres
+  // surfaces these on the same `.code` property as the errno codes above,
+  // but they mean the server itself rejected or dropped an established
+  // connection (not a Node-level networking failure) — equally "the store
+  // cannot be reached," so they must be classified the same way or an
+  // in-flight Postgres restart/failover would surface as a generic
+  // internal error instead of the documented store-outage behavior.
+  '08000', // connection_exception
+  '08001', // sqlclient_unable_to_establish_sqlconnection
+  '08003', // connection_does_not_exist
+  '08004', // sqlserver_rejected_establishment_of_sqlconnection
+  '08006', // connection_failure
+  '08007', // transaction_resolution_unknown
+  '57P01', // admin_shutdown
+  '57P02', // crash_shutdown
+  '57P03', // cannot_connect_now
 ]);
 
 export interface CreatePoolOptions {
