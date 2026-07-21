@@ -611,30 +611,44 @@ Acceptance criteria:
 
 ### 3.3 SigNoz ingestion proof
 
-- [~] Configure OTLP export through environment-driven secure endpoints.
+- [x] Configure OTLP export through environment-driven secure endpoints.
   Done: `bootstrapOtel` defaults to standard `OTEL_EXPORTER_OTLP_*`
-  environment variables when no explicit endpoint is passed — works
-  identically whether they point at a local collector or SigNoz Cloud, no
-  code branching needed. Verified end-to-end against a real local HTTP
-  receiver (not SigNoz): `packages/otel/src/sdk.integration.test.ts` —
-  real span/metric export requests reach `/v1/traces` and `/v1/metrics`
-  with non-empty bodies and the configured custom header. Not done: no
-  TLS/auth-header verification specific to SigNoz Cloud's actual ingestion
-  requirements, since no SigNoz Cloud account/key has been supplied yet
-  (ADR-003 decision; tracked as an open blocker in §12).
-- [ ] Verify traces, metrics, and logs arrive in the targeted SigNoz version and
-  can be correlated for one demo run. Blocked on SigNoz Cloud credentials
-  (§12 open blockers) — this is the one item in §3 that cannot be
-  completed locally; everything else in §3.2/§3.3 that doesn't require the
-  actual SigNoz backend is done and tested.
-- [ ] Capture saved queries/screenshots or an automated smoke check as evidence.
-  Blocked on the same SigNoz Cloud credentials.
+  environment variables when no explicit endpoint is passed. Verified
+  against a real local HTTP receiver (`packages/otel/src/
+  sdk.integration.test.ts`, kept lightweight/no-Docker for every test run)
+  **and** against the real self-hosted SigNoz collector (ADR-005) — see
+  below. `.env.example`'s `OTEL_EXPORTER_OTLP_ENDPOINT` now defaults to
+  `http://localhost:4318`, no auth header needed for the local,
+  unauthenticated collector.
+- [x] Verify traces arrive in the targeted SigNoz version and originate from
+  Fuse's own instrumentation, not a synthetic probe.
+  Evidence (ADR-005, docs/adr/005-self-hosted-signoz.md): with the
+  self-hosted stack up (`infra/signoz-up.sh`, SigNoz v0.133.0 +
+  signoz-otel-collector v0.144.6), the actual `@fuse/otel` package's
+  `bootstrapOtel`/`withGenAiSpan` emitted one real span, and it was
+  confirmed present by directly querying the stack's own ClickHouse store:
+  `SELECT serviceName, name, timestamp FROM
+  signoz_traces.distributed_signoz_index_v3 WHERE serviceName =
+  'fuse-signoz-smoke-test'` returned the row, with `name` matching
+  `withGenAiSpan`'s `${operationName} ${requestModel}` naming convention
+  exactly (`chat smoke-test-model`). This is real end-to-end ingestion
+  proof, not a wire-level request-shape assertion.
+- [ ] Verify metrics and logs also arrive and can be correlated with the
+  trace for one demo run (e.g. via the SigNoz UI, not just ClickHouse).
+  Not yet done — traces are proven; metrics/logs export uses the identical
+  `bootstrapOtel` path so there's no specific reason to expect a different
+  result, but that's an expectation, not evidence, and this is now
+  genuinely actionable (no credential blocker) rather than blocked.
+- [ ] Capture saved queries/screenshots or an automated smoke check as
+  evidence. Not yet done — the ClickHouse-query verification above is real
+  evidence but isn't itself a repeatable, checked-in smoke test yet.
 - [ ] Validate representative cardinality and ingestion volume; remove
   high-cardinality dimensions from metrics where required. Partially
   addressed by design (metrics.ts's cardinality-discipline comments: token/
   duration histograms are dimensioned by model, not by
-  session/agent/correlation id) but not validated against real ingestion
-  volume, which requires the real backend.
+  session/agent/correlation id) but not validated against real sustained
+  ingestion volume, which requires a longer-running load test, not just
+  the single-span proof above.
 
 Acceptance criteria:
 
@@ -736,7 +750,9 @@ Acceptance criteria:
   `services/control-plane/src/signoz-alert-mapper.ts`'s
   `mapSignozAlertToNormalizedEvent` — tolerant of dotted/underscored label
   key variants (which form SigNoz's alert-rule label propagation actually
-  uses is unverified pending SigNoz Cloud access, so both are accepted);
+  uses is still unverified — no longer blocked on credentials now that
+  self-hosted SigNoz is available (ADR-005), but not yet checked against
+  a real alert rule, so both forms are still accepted defensively);
   returns `undefined` for unresolvable scope, and the webhook route reports
   `unknown-scope` per-alert rather than trip anything. 8 mapper unit tests
   + a dedicated integration test.
@@ -1227,10 +1243,10 @@ Add dated entries here rather than leaving important context only in chat.
 - 2026-07-21: Solo hackathon-speed direct-push-to-`main` branch strategy;
   branch protection/PR review deferred until a remote and/or a second
   contributor exists (§0.1).
-- 2026-07-21 (ADR-003, explicit user choice): SigNoz Cloud (not
-  self-hosted) is the target deployment for the next slice — requires the
-  user to supply an account/ingestion key, which cannot be created by an
-  agent. Real LLM provider adapters target Groq and NVIDIA Build (NIM),
+- 2026-07-21 (initial choice, later reversed — see below): SigNoz Cloud
+  (not self-hosted) was the target deployment — required the user to
+  supply an account/ingestion key, which could not be created by an agent.
+  Real LLM provider adapters target Groq and NVIDIA Build (NIM),
   both via a shared OpenAI-compatible `/chat/completions` client
   (`packages/sdk/src/providers/`), chosen explicitly by the user over the
   initially-assumed Anthropic/OpenAI default. No credentials for either are
@@ -1239,6 +1255,16 @@ Add dated entries here rather than leaving important context only in chat.
   (`*.live.test.ts`) ready to run the moment `GROQ_API_KEY`/
   `NVIDIA_API_KEY` are exported — no code changes needed. See
   `docs/adr/003-llm-provider-adapters.md`.
+- 2026-07-21 (ADR-005, explicit user choice — reverses the SigNoz Cloud
+  entry above): self-hosted SigNoz via Foundry (`foundryctl`), the current
+  officially-supported deployment tool. No external account/credential
+  needed, unblocking the ingestion-proof work that was stuck all session.
+  `infra/signoz/casting.yaml` + `infra/signoz-up.sh` stand up the stack
+  (pinned image versions) and complete SigNoz's first-run org/admin
+  bootstrap non-interactively. See `docs/adr/005-self-hosted-signoz.md` for
+  the full decision record, including a real deployment bug found and
+  fixed along the way (OTLP receivers silently never starting until the
+  org bootstrap step exists) and the concrete verification evidence.
 
 ### Verification evidence
 
@@ -1374,14 +1400,14 @@ Add dated entries here rather than leaving important context only in chat.
 - Git remote and repository URL have not yet been supplied or created.
 - GitHub CLI (`gh`) is not installed, so personal-account authentication cannot
   yet be verified and the publish workflow cannot run.
-- SigNoz Cloud is the chosen deployment target (ADR-003/2026-07-21), but no
-  account/ingestion key has been supplied yet — needed before OTel export
-  configuration (§3.2/§3.3) can be verified against a real SigNoz backend.
-  Per the user's explicit 2026-07-21 decision, this verification (and §4.5's
-  SigNoz alert-rule installation) is deliberately deferred rather than
-  blocking further work; everything in §3-§5 that can be built and tested
-  against the local/mock path has been. MCP capabilities and Slack
-  workspace remain unselected.
+- **Resolved**: the SigNoz-Cloud-credential blocker no longer applies — the
+  deployment target was reversed to self-hosted SigNoz via Foundry
+  (ADR-005/2026-07-21), which needs no external account or key. Real
+  ingestion is now verified (§3.3). Still genuinely open, now that the
+  blocker is gone: §4.5's SigNoz alert-rule-as-code installation, and
+  `signoz-alert-mapper.ts`'s label-propagation-format question — both are
+  actionable against the local self-hosted instance but not yet done. MCP
+  capabilities and Slack workspace remain unselected.
 - No real LLM provider credentials (`GROQ_API_KEY`/`NVIDIA_API_KEY`) are
   available in this environment; the live-optional provider tests
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
