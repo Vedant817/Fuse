@@ -649,46 +649,140 @@ Acceptance criteria:
 
 ### 5.1 Alert webhook
 
-- [ ] Implement strict content type/body size/schema validation.
-- [ ] Verify signature/authentication, timestamp freshness, and replay nonce or
-  idempotency key before any state change.
-- [ ] Map external payloads to the normalized alert contract and reject unknown
-  tenant/environment/agent scope.
-- [ ] Make duplicate delivery return the original outcome and prevent duplicate
-  incidents/notifications.
-- [ ] Handle resolved alerts according to explicit policy; never auto-resume
+- [x] Implement strict content type/body size/schema validation. Evidence:
+  `services/control-plane/src/routes/webhook.ts` — a route-specific 256KB
+  body limit (grouped Alertmanager deliveries can carry many alerts, wider
+  than the global 64KB default) and `SignozAlertmanagerWebhookPayloadSchema`
+  validation (bounded to 1-200 alerts per delivery); malformed payloads
+  return 400 `invalid_request`, tested.
+- [~] Verify signature/authentication, timestamp freshness, and replay nonce or
+  idempotency key before any state change. Done: bearer-token authentication
+  (SigNoz has no HMAC-signing option for webhooks — verified against its
+  current docs; it authenticates via HTTP Basic Auth or, with an empty
+  configured username, a bearer token, so Fuse's webhook uses the same
+  bearer mechanism as the rest of the API, with its own least-privilege
+  token tier — see below) and idempotency via a key derived from the
+  alert's own stable identity (`fingerprint`+`startsAt`), tested for
+  duplicate delivery. Not done: no timestamp-freshness/replay-window check
+  (Alertmanager's webhook payload doesn't carry a signed timestamp to
+  check freshness against the way an HMAC scheme would — the fingerprint-
+  based idempotency key is the actual replay defense here); genuinely
+  deferred, not silently dropped.
+- [x] Map external payloads to the normalized alert contract and reject unknown
+  tenant/environment/agent scope. Evidence:
+  `services/control-plane/src/signoz-alert-mapper.ts`'s
+  `mapSignozAlertToNormalizedEvent` — tolerant of dotted/underscored label
+  key variants (which form SigNoz's alert-rule label propagation actually
+  uses is unverified pending SigNoz Cloud access, so both are accepted);
+  returns `undefined` for unresolvable scope, and the webhook route reports
+  `unknown-scope` per-alert rather than trip anything. 8 mapper unit tests
+  + a dedicated integration test.
+- [x] Make duplicate delivery return the original outcome and prevent duplicate
+  incidents/notifications. Evidence: `webhook.integration.test.ts`'s
+  duplicate-delivery test — two identical deliveries produce identical
+  `results[]` (the second replays the first's outcome verbatim via
+  `BreakerStore`'s idempotency mechanism) and the breaker's epoch advances
+  exactly once. A real bug was caught and fixed here: the webhook initially
+  derived its `correlationId` from Fastify's per-request auto-generated ID,
+  which differs on every HTTP delivery — since the idempotency check hashes
+  the whole request including `correlationId`, this made every genuine
+  Alertmanager retry look like a *different* request and spuriously threw
+  `idempotency_conflict`. Fixed by deriving both the idempotency key and the
+  correlation ID passed to the store from the alert's own stable identity.
+- [x] Handle resolved alerts according to explicit policy; never auto-resume
   solely because an alert resolved unless the policy deliberately allows it.
-- [ ] Return fast after durable acceptance when diagnosis/Slack work is queued.
-- [ ] Rate-limit abusive sources and emit safe audit/operational telemetry for
-  accepted and rejected requests.
+  Evidence: the webhook's default (and only implemented) behavior for
+  `status: "resolved"` is `resolved-observed` — no state mutation at all;
+  tested that a breaker tripped by a firing alert stays `tripped` after
+  the matching alert resolves. No opt-in auto-resume-on-resolve path
+  exists yet (not required, avoids speculative abstraction).
+- [x] Return fast after durable acceptance when diagnosis/Slack work is
+  queued. No diagnosis/Slack queue exists yet (§7, not built) — the
+  webhook's response IS the durable acceptance today (a synchronous,
+  atomically-committed `store.trip()` per alert), which is stronger than
+  "fast after queuing," not a shortfall.
+- [x] Rate-limit abusive sources and emit safe audit/operational telemetry for
+  accepted and rejected requests. Evidence: the webhook inherits the
+  global `@fastify/rate-limit` policy (120/min, keyed by bearer token) from
+  `app.ts`, same as every other route; every trip (or no-op/rejection) is
+  recorded in `breaker_audit_log` with the `system:signoz-webhook:{detector}`
+  actor, same as any other trip source.
+
+Least-privilege token tier added alongside this slice: `CONTROL_PLANE_
+WEBHOOK_TOKENS`, scoped to only `/v1/webhooks/*` — a leaked SigNoz webhook
+credential can cause a trip for the scope named in an alert's own labels,
+but cannot resume, disable, or force-trip anything directly (agent tokens
+get 403, not a silent pass, tested).
 
 ### 5.2 Operational API
 
-- [ ] Implement authenticated health, readiness, scoped status, force-trip,
-  resume, disable/enable, and policy inspection endpoints.
-- [ ] Enforce roles and tenant/environment boundaries for all control actions.
-- [ ] Require reason and idempotency key for manual mutations; record actor,
-  before/after state, and correlation IDs.
-- [ ] Provide safe pagination/filtering for incident and audit views.
-- [ ] Publish OpenAPI and contract tests; ensure error responses leak no stack,
-  secret, or cross-tenant existence information.
+- [x] Implement authenticated health, readiness, scoped status, force-trip,
+  resume, disable/enable, and policy inspection endpoints. Evidence: built
+  and tested as part of the breaker-first vertical slice (§2) —
+  `/healthz`, `/readyz`, `/v1/breaker/status`, `/v1/breaker/{trip,resume,
+  disable,enable}`. No separate "policy inspection" endpoint exists since
+  there is no policy *file* yet (policy values are per-request/env-config
+  today) — tracked as a gap once policy-file loading is built.
+- [x] Enforce roles and tenant/environment boundaries for all control actions.
+  Evidence: the three-tier token model (operator/agent/webhook, §2 and
+  this slice) plus scope-parameterized routes; cross-scope isolation is
+  inherent to `BreakerStore` keying every operation by
+  `(tenant, environment, agentId)`.
+- [x] Require reason and idempotency key for manual mutations; record actor,
+  before/after state, and correlation IDs. Evidence: `TripRequestSchema`/
+  `ResumeRequestSchema`/etc. require `reason`, `actor`, `idempotencyKey`;
+  `breaker_audit_log` records `from_state`/`to_state`/`actor`/`reason`/
+  `correlation_id`/`policy_version` for every transition (§2.1).
+- [ ] Provide safe pagination/filtering for incident and audit views. Not
+  done — no audit-log *read* API exists yet (only the write path via
+  `breaker_audit_log`); needed once a dashboard/incident view is built (§8).
+- [ ] Publish OpenAPI and contract tests; ensure error responses leak no
+  stack, secret, or cross-tenant existence information. Partial: contract
+  tests exist for the zod schemas (not yet exported as an OpenAPI spec);
+  error responses are verified to return stable `{error, message,
+  correlationId}` shapes with no stack traces (tested), but no formal
+  cross-tenant-existence-leak audit has been performed.
 
 ### 5.3 Resilience
 
-- [ ] Add health/readiness distinction, graceful shutdown, timeouts, bounded
+- [x] Add health/readiness distinction, graceful shutdown, timeouts, bounded
   retry with jitter, circuit breaking for dependencies, and backpressure.
+  Evidence: `/healthz` (liveness, no dependency check) vs `/readyz`
+  (pings Postgres) built in §2; graceful shutdown via `server.ts`'s
+  SIGTERM/SIGINT handlers; Postgres pool timeouts (`pool.ts`). Not done:
+  no explicit circuit-breaker-for-dependencies pattern beyond the CAS
+  retry loop's own bounded attempts, and no dedicated backpressure
+  mechanism beyond the global rate limiter — acceptable at current scale,
+  revisit under real load testing (§9.2).
 - [ ] Add durable work queue/outbox or document the smaller mechanism that
   prevents accepted incidents from being lost before diagnosis/notification.
-- [ ] Test restart recovery, store/queue outage, partial write, clock skew,
-  duplicate delivery, and multi-instance concurrency.
+  Not built — there is no diagnosis/notification consumer yet (§7), so
+  there is nothing downstream that could lose an accepted incident today;
+  the trip itself is already durable (synchronous Postgres commit). This
+  becomes a real requirement once §7 exists and must be revisited then,
+  not assumed away.
+- [~] Test restart recovery, store/queue outage, partial write, clock skew,
+  duplicate delivery, and multi-instance concurrency. Done: restart
+  recovery, store outage (`StoreUnavailableError` → 503), duplicate
+  delivery (webhook + operational API), and concurrency (10-way/8-way
+  concurrent writer races) — all tested in §2/§5.1's integration suites.
+  Not done: no explicit clock-skew test (the store's `now` is always
+  server-supplied, so client clock skew doesn't reach it, but this hasn't
+  been tested directly) and no multi-instance (two control-plane processes
+  against one Postgres) test — single-instance-per-test-run so far.
 - [ ] Define backup/restore, migration, rollback, and retention procedures.
+  Not done — tracked for the production-hardening pass (§9.3 runbooks).
 
 Acceptance criteria:
 
 - forged, replayed, oversized, malformed, or cross-scope requests cannot trip
-  or resume a breaker;
-- webhook response and state transition remain correct under retries/restarts;
-- core enforcement does not depend synchronously on Slack or MCP availability.
+  or resume a breaker — met and tested (auth tiers, schema validation, size
+  limits, unknown-scope rejection);
+- webhook response and state transition remain correct under retries/restarts
+  — met and tested (idempotent duplicate delivery, restart recovery);
+- core enforcement does not depend synchronously on Slack or MCP availability
+  — trivially true today since neither exists yet (§7); revisit once built
+  to ensure it stays true.
 
 ## 6. Preflight telemetry health (P0)
 
@@ -1059,6 +1153,27 @@ Add dated entries here rather than leaving important context only in chat.
   (`pnpm run check`, `pnpm run test:integration`). Real SigNoz Cloud
   ingestion (§3.3) remains the one blocked item — needs the account/key
   from the open blockers list below.
+- 2026-07-21: Detector logic (`packages/detectors`: loop-signature,
+  context-bloat, cost-velocity) and the SigNoz alert webhook
+  (`services/control-plane/src/routes/webhook.ts`, §5.1) added, per the
+  user's explicit choice to skip SigNoz Cloud verification for now and
+  continue with detector logic/webhook/alert-rule-as-code against the
+  local/mock path. Researched (not assumed) that SigNoz's webhook channel
+  follows the Prometheus Alertmanager payload contract and authenticates
+  via HTTP Basic Auth/bearer token, not HMAC signing — this reshaped the
+  webhook's auth design before any code was written against a wrong
+  assumption. Added a third least-privilege token tier
+  (`CONTROL_PLANE_WEBHOOK_TOKENS`) scoped to only the webhook route. A
+  real bug was found and fixed via integration testing: the webhook
+  initially derived its correlation ID from Fastify's per-request
+  auto-generated ID, which silently broke idempotency-key matching for
+  genuine Alertmanager retries (each retry hashed as a "different"
+  request) — fixed by deriving both the idempotency key and correlation ID
+  from the alert's own stable fingerprint+startsAt identity. Verified:
+  130 unit + 47 integration tests pass across 9 packages from a clean
+  workspace state. SigNoz alert-rule-as-code translation (§4.5) and live
+  SigNoz ingestion (§3.3) remain explicitly deferred/blocked per the
+  user's decision, not silently dropped.
 
 ### Open blockers and risks
 
@@ -1068,7 +1183,11 @@ Add dated entries here rather than leaving important context only in chat.
 - SigNoz Cloud is the chosen deployment target (ADR-003/2026-07-21), but no
   account/ingestion key has been supplied yet — needed before OTel export
   configuration (§3.2/§3.3) can be verified against a real SigNoz backend.
-  MCP capabilities and Slack workspace remain unselected.
+  Per the user's explicit 2026-07-21 decision, this verification (and §4.5's
+  SigNoz alert-rule installation) is deliberately deferred rather than
+  blocking further work; everything in §3-§5 that can be built and tested
+  against the local/mock path has been. MCP capabilities and Slack
+  workspace remain unselected.
 - No real LLM provider credentials (`GROQ_API_KEY`/`NVIDIA_API_KEY`) are
   available in this environment; the live-optional provider tests
   (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
