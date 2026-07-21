@@ -138,10 +138,22 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
           content: callResult.content,
         };
         if (role === 'verifier') {
-          round.approved = /\bapproved\b/i.test(callResult.content);
+          // Anchored to the start, not a bare `\bapproved\b` substring
+          // search: the latter also matches negated content ("not
+          // approved", "cannot be approved"), which the mock model never
+          // produces but a real Model implementation (an explicit,
+          // documented substitution point — see RunConfig.model) could.
+          // Matching only a leading "approved" mirrors the mock's exact
+          // 'Approved.' output while refusing to misfire on a rejection
+          // that merely mentions the word.
+          round.approved = /^\s*approved\b/i.test(callResult.content);
         }
         rounds.push(round);
 
+        if (totalTokens >= ceilings.maxTotalTokens) {
+          stopReason = 'safety-ceiling';
+          break;
+        }
         if (totalTokens * DEMO_PRICE_PER_TOKEN_USD >= ceilings.maxSpendUsd) {
           stopReason = 'safety-ceiling';
           break;

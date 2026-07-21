@@ -153,4 +153,45 @@ describe('runAnalyzerVerifier', () => {
     expect(result.totalCalls).toBe(1); // only the first (allowed) call actually dispatched
     expect(modelSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('does not treat a negated rejection ("not approved") as approval', async () => {
+    const model: Model = {
+      call: vi.fn().mockResolvedValue({
+        content: 'This draft is not approved and needs substantial revision.',
+        inputTokens: 5,
+        outputTokens: 5,
+      }),
+    };
+    const result = await runAnalyzerVerifier({
+      scenario: 'normal',
+      seed: 1,
+      guard: allowingGuard(),
+      model,
+      maxCalls: 4,
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    expect(result.rounds.every((r) => r.role !== 'verifier' || r.approved !== true)).toBe(
+      true,
+    );
+  });
+
+  it('stops immediately (not one round late) when a single call pushes total tokens past the ceiling', async () => {
+    const model: Model = {
+      call: vi.fn().mockResolvedValue({
+        content: 'Needs revision: still not there.',
+        inputTokens: 50_000,
+        outputTokens: 50_000,
+      }),
+    };
+    const result = await runAnalyzerVerifier({
+      scenario: 'normal',
+      seed: 1,
+      guard: allowingGuard(),
+      model,
+      maxCalls: 20,
+      maxTotalTokens: 80_000, // a single round's 100k tokens blows past this
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    expect(result.totalCalls).toBe(1); // caught right after the offending call, not on round 2
+  });
 });
