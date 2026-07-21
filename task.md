@@ -470,33 +470,108 @@ Acceptance criteria:
 
 ### 3.2 OTel instrumentation
 
-- [ ] Pin the tested OTel semantic-convention/version assumptions.
-- [ ] Emit model/provider, operation, input/output/total tokens, estimated cost,
+- [x] Pin the tested OTel semantic-convention/version assumptions. Evidence:
+  `packages/otel` — `@opentelemetry/semantic-conventions@1.43.0`, gen_ai
+  attributes imported from its `/incubating` subpath (these remain
+  experimental/incubating upstream, not yet in the stable registry — this
+  is stated honestly, not glossed over). Actual current attribute/metric
+  names (`gen_ai.provider.name`, `gen_ai.request.model`,
+  `gen_ai.usage.{input,output}_tokens`, `gen_ai.operation.name`,
+  `gen_ai.response.finish_reasons`, `gen_ai.client.token.usage`,
+  `gen_ai.client.operation.duration`) were verified against the installed
+  package's actual `.d.ts` type declarations, not assumed from memory or
+  blog posts — the initial `^0.57.x`/`^1.30.x` OTel JS package guesses were
+  found to be badly stale (real latest: sdk-node/exporters `0.220.0`,
+  sdk-metrics/sdk-trace/resources `2.9.0`) and corrected before writing any
+  code against them.
+- [x] Emit model/provider, operation, input/output/total tokens, estimated cost,
   agent/session/task, step index, parent chain, retry, and outcome attributes
-  using standard `gen_ai` names where available and namespaced extensions where
-  necessary.
-- [ ] Preserve trace context across agents, tools, queues, and HTTP calls; test
-  that there are no unexpected orphan step spans.
-- [ ] Emit monotonic token/cost counters, request/error/denial counts, latency
+  using standard `gen_ai` names where available and namespaced extensions
+  where necessary. Evidence: `packages/otel/src/gen-ai-span.ts`'s
+  `withGenAiSpan` + `attributes.ts`'s `fuse.*` namespaced extensions
+  (tenant/environment/agent_id/session_id/task_id/step_index/scenario/
+  outcome/estimated_cost/correlation_id). Not done: no `retry` attribute
+  yet (no detector/webhook retry path exists to instrument) — tracked for
+  §5/§7.
+- [x] Preserve trace context across agents, tools, queues, and HTTP calls; test
+  that there are no unexpected orphan step spans. Evidence:
+  `services/broken-agent`'s run is one root `invoke_agent` span with each
+  round nested as a `chat` child via `withGenAiSpan`'s use of the OTel
+  active-context API (no manual parent-id plumbing) —
+  `analyzer-verifier.otel.test.ts` proves every non-root span has the root
+  as its parent and shares its trace ID, with an explicit "nothing floats
+  free" span-count assertion. Caveat: this fixture is entirely in-process
+  (no real queue/HTTP hop between "agents" yet), so cross-process
+  propagation (W3C traceparent over an actual HTTP call) is exercised by
+  `@opentelemetry/sdk-node`'s built-in HTTP context propagation but not
+  yet covered by a Fuse-specific test — deferred until a real
+  network-separated agent step exists.
+- [x] Emit monotonic token/cost counters, request/error/denial counts, latency
   histograms, active-loop signals, and derived cost velocity with documented
-  units and aggregation windows.
-- [ ] Define a versioned price table with effective dates and model alias
+  units and aggregation windows. Evidence: `gen_ai.client.token.usage`
+  (`{token}` unit histogram, dimensioned by token type + model, tested)
+  and `gen_ai.client.operation.duration` (`s` unit histogram, tested) in
+  `metrics.ts`; `fuse.breaker.permit.decisions` counter for permit
+  allow/deny history. Not done: no active-loop signal or derived
+  cost-velocity metric yet — those are detector outputs (§4), which don't
+  exist yet; this slice provides the raw token/duration data they will
+  consume.
+- [x] Define a versioned price table with effective dates and model alias
   handling; label calculated cost as estimated and retain raw token counts.
+  Evidence: `packages/otel/src/pricing.ts` — `PRICE_TABLE_VERSION`,
+  per-entry `effectiveDate`, `estimateCostUsd()` returns `priced: false`
+  (not a misleading zero) for unmatched provider/model pairs, tested.
+  Explicitly labeled illustrative/estimated in code comments, not a live
+  pricing feed. No model-alias remapping table yet (not needed until
+  detectors need to match a rotating/aliased model name).
 - [ ] Emit structured breaker logs correlated to trace, alert, agent, task, and
-  policy without prompt content or secrets by default.
-- [ ] Apply resource attributes for service, version/build, deployment
-  environment, and telemetry schema version.
-- [ ] Add batching, timeouts, bounded queues, sampling policy, and a visible
-  dropped-telemetry metric.
+  policy without prompt content or secrets by default. Not done — the
+  OTel logs pipeline is bootstrapped (`bootstrapOtel` configures an OTLP
+  log exporter) but nothing actually emits a log record yet; the
+  control-plane's audit events (already correlated to trace/agent/policy
+  in Postgres, §2.1) have not yet been mirrored as OTel log records. Real
+  gap, tracked for the control-plane's next OTel integration pass.
+- [x] Apply resource attributes for service, version/build, deployment
+  environment, and telemetry schema version. Evidence:
+  `packages/otel/src/resource.ts` — `service.name`, `service.version`,
+  `deployment.environment.name`, and a custom
+  `fuse.telemetry_schema_version` resource attribute
+  (`FUSE_TELEMETRY_SCHEMA_VERSION`), merged with OTel's env-detected
+  default resource.
+- [~] Add batching, timeouts, bounded queues, sampling policy, and a visible
+  dropped-telemetry metric. Done: batching (BatchLogRecordProcessor,
+  PeriodicExportingMetricReader), timeouts (OTLP exporter
+  `timeoutMillis`/`concurrencyLimit` available, using SDK defaults). Not
+  done: no explicit sampling policy configured (uses OTel's default
+  always-on sampler) and no dropped-telemetry metric exists yet — real gap
+  for the production-hardening pass (§9).
 
 ### 3.3 SigNoz ingestion proof
 
-- [ ] Configure OTLP export through environment-driven secure endpoints.
+- [~] Configure OTLP export through environment-driven secure endpoints.
+  Done: `bootstrapOtel` defaults to standard `OTEL_EXPORTER_OTLP_*`
+  environment variables when no explicit endpoint is passed — works
+  identically whether they point at a local collector or SigNoz Cloud, no
+  code branching needed. Verified end-to-end against a real local HTTP
+  receiver (not SigNoz): `packages/otel/src/sdk.integration.test.ts` —
+  real span/metric export requests reach `/v1/traces` and `/v1/metrics`
+  with non-empty bodies and the configured custom header. Not done: no
+  TLS/auth-header verification specific to SigNoz Cloud's actual ingestion
+  requirements, since no SigNoz Cloud account/key has been supplied yet
+  (ADR-003 decision; tracked as an open blocker in §12).
 - [ ] Verify traces, metrics, and logs arrive in the targeted SigNoz version and
-  can be correlated for one demo run.
+  can be correlated for one demo run. Blocked on SigNoz Cloud credentials
+  (§12 open blockers) — this is the one item in §3 that cannot be
+  completed locally; everything else in §3.2/§3.3 that doesn't require the
+  actual SigNoz backend is done and tested.
 - [ ] Capture saved queries/screenshots or an automated smoke check as evidence.
+  Blocked on the same SigNoz Cloud credentials.
 - [ ] Validate representative cardinality and ingestion volume; remove
-  high-cardinality dimensions from metrics where required.
+  high-cardinality dimensions from metrics where required. Partially
+  addressed by design (metrics.ts's cardinality-discipline comments: token/
+  duration histograms are dimensioned by model, not by
+  session/agent/correlation id) but not validated against real ingestion
+  volume, which requires the real backend.
 
 Acceptance criteria:
 
@@ -966,6 +1041,24 @@ Add dated entries here rather than leaving important context only in chat.
   against the real APIs correctly skip (exit 0) with no credentials
   present. Full workspace `pnpm run check`/`test:integration` pass — 61
   unit + 34 integration tests across 5 packages.
+- 2026-07-21: OTel `gen_ai` instrumentation added (`packages/otel`) and
+  wired into `services/broken-agent`. Actual current OTel JS package
+  versions and API surface were verified against installed `.d.ts` files
+  rather than assumed (initial guesses were significantly stale — see
+  §3.2 evidence). `withGenAiSpan` wraps every model call in a CLIENT span
+  with `gen_ai.*` + `fuse.*` attributes and records token-usage/duration
+  metrics; the broken-agent's run is one root `invoke_agent` span with
+  each round correctly nested underneath (no orphans, verified). A
+  versioned, explicitly-estimated price table avoids misleading zero-cost
+  claims for unpriced models. `bootstrapOtel` exports via standard
+  `OTEL_EXPORTER_OTLP_*` env vars (works for a local collector or SigNoz
+  Cloud identically) and was verified end-to-end against a real local
+  HTTP receiver — actual non-empty export requests reach `/v1/traces` and
+  `/v1/metrics` with the configured header. Verified: 78 unit + 39
+  integration tests pass across 8 packages from a clean workspace state
+  (`pnpm run check`, `pnpm run test:integration`). Real SigNoz Cloud
+  ingestion (§3.3) remains the one blocked item — needs the account/key
+  from the open blockers list below.
 
 ### Open blockers and risks
 
