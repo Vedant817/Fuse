@@ -206,7 +206,21 @@ Acceptance criteria:
   degraded, `state: "unknown"` rather than guessing armed/tripped/disabled —
   there is no dedicated status/config-inspection endpoint yet (deferred,
   P2 — the live per-request `degraded` flag covers the P0 honesty
-  requirement).
+  requirement). **Found and fixed during a later audit pass**:
+  `packages/breaker-store/src/pool.ts`'s `withStoreErrors` — the function
+  this entire fail-open/fail-closed contract depends on to detect "the
+  store is unreachable" — only classified Node/TCP-level errno codes
+  (`ECONNREFUSED`, `ETIMEDOUT`, etc.), not Postgres's own SQLSTATE
+  connection-loss codes (`57P01`/`57P02` admin/crash shutdown, `08006`
+  connection_failure, and the rest of SQLSTATE class 08). A real Postgres
+  restart, failover, or admin-initiated disconnect would have surfaced as
+  a generic unclassified error instead of the documented, configured
+  outage behavior — an incomplete classifier presented with the
+  confidence of "any connection-level failure becomes
+  `StoreUnavailableError`." Fixed by extending the code set; 17 new unit
+  tests (`pool.test.ts`) cover every added code plus confirmation that an
+  unrelated Postgres error code (e.g. `23505` unique_violation) is
+  correctly left unwrapped.
 - [ ] Define delivery semantics for SigNoz alerts and Slack/MCP work; design all
   handlers for at-least-once delivery. Not started — depends on §4/§5/§7.
 - [ ] Record capacity targets and budgets for permit-check latency, webhook
@@ -511,7 +525,17 @@ Acceptance criteria:
   environment variable or config path raises the absolute ceiling. Test:
   "clamps a configured ceiling far above the absolute maximum back down to
   it" (`maxCalls: 999_999` still executes at most `ABSOLUTE_MAX_CALLS`
-  rounds).
+  rounds). **Found and fixed during a later audit pass**:
+  `analyzer-verifier.ts`'s claim that ceilings are "checked before every
+  single call, unconditionally" was only symmetric for spend, not tokens —
+  spend was re-checked immediately after each call, but `totalTokens` was
+  only re-checked at the *top of the next* loop iteration, so a single
+  call that pushed tokens past the ceiling wasn't caught until one round
+  later (or never, if that call happened to be the last one anyway).
+  Fixed with a symmetric post-call token check; regression test "stops
+  immediately (not one round late) when a single call pushes total tokens
+  past the ceiling" configures a call that returns 100k tokens against an
+  80k ceiling and asserts `totalCalls === 1`, not 2.
 - [x] Make the fixture deterministic with seed, scenario, iteration delay, and
   reset controls. Evidence: `RunConfig.{scenario, seed, iterationDelayMs}`
   fully determine output (no real randomness anywhere in `mock-model.ts`);
@@ -519,17 +543,29 @@ Acceptance criteria:
   independent run with no shared mutable state between runs.
 - [x] Add tests proving the normal workflow does not trip default policies and
   each broken scenario produces its intended telemetry shape. Evidence:
-  `analyzer-verifier.test.ts` (6 unit tests: normal terminates via
-  verifier-approved without ever being denied; loop produces a repeated
-  byte-identical shape and runs to the safety ceiling; context-bloat
-  produces strictly-increasing input tokens; cost-velocity is measurably
-  faster than a paced normal run; ceiling clamping; a mocked breaker trip
-  stops dispatch immediately with zero further model calls) and
-  `analyzer-verifier.integration.test.ts` (2 tests against a real Postgres
-  + control plane: a normal run completes end to end; a trip issued via
-  the real operational API mid-run — exactly as a detector's webhook will
-  do in §5 — stops the fixture at `breaker-tripped` with the model spy
-  showing zero calls after the trip committed).
+  `analyzer-verifier.test.ts` (originally 6 unit tests, now 8: normal
+  terminates via verifier-approved without ever being denied; loop
+  produces a repeated byte-identical shape and runs to the safety ceiling;
+  context-bloat produces strictly-increasing input tokens; cost-velocity
+  is measurably faster than a paced normal run; ceiling clamping; a mocked
+  breaker trip stops dispatch immediately with zero further model calls;
+  plus 2 new regression tests below) and `analyzer-verifier.integration.test.ts`
+  (2 tests against a real Postgres + control plane: a normal run completes
+  end to end; a trip issued via the real operational API mid-run — exactly
+  as a detector's webhook will do in §5 — stops the fixture at
+  `breaker-tripped` with the model spy showing zero calls after the trip
+  committed). **Found and fixed during a later audit pass**: verifier
+  approval was detected with a bare `/\bapproved\b/i` substring search,
+  which also matches negated content ("not approved", "cannot be
+  approved") — harmless with the mock model's exact `'Approved.'` output,
+  but a real, correctness-relevant bug the moment a real `Model`
+  implementation is substituted (an explicitly documented substitution
+  point, `RunConfig.model`) and produces free-text verifier output with
+  more natural rejection phrasing. Fixed by anchoring the match to the
+  start of the content (`/^\s*approved\b/i`); regression test "does not
+  treat a negated rejection ('not approved') as approval" injects a
+  custom model whose verifier text starts with "This draft is not
+  approved..." and asserts no round is ever marked approved.
 
 ### 3.2 OTel instrumentation
 
@@ -575,7 +611,18 @@ Acceptance criteria:
   (`{token}` unit histogram, dimensioned by token type + model, tested)
   and `gen_ai.client.operation.duration` (`s` unit histogram, tested) in
   `metrics.ts`; `fuse.breaker.permit.decisions` counter for permit
-  allow/deny history. Not done: no active-loop signal or derived
+  allow/deny history — **found and fixed during a later audit pass**: this
+  counter existed and was documented as if wired, but nothing in any real
+  code path ever called it (only its own unit test did) — a metric
+  presented with the confidence of finished instrumentation while being
+  dead scaffolding. Now genuinely wired in
+  `services/control-plane/src/routes/permit.ts` (the one place a permit
+  decision is actually authoritative, network-wide across every SDK/agent
+  caller, not client-side per `FuseGuard` instance), proven by 3 new unit
+  tests (`routes/permit.test.ts`) asserting the exact scope/state/allowed/
+  degraded dimensions are recorded on both a successful and a
+  store-unavailable-degraded decision, and NOT recorded for a request that
+  never reaches the store. Not done: no active-loop signal or derived
   cost-velocity metric yet — those are detector outputs (§4), which don't
   exist yet; this slice provides the raw token/duration data they will
   consume.
@@ -608,6 +655,24 @@ Acceptance criteria:
   done: no explicit sampling policy configured (uses OTel's default
   always-on sampler) and no dropped-telemetry metric exists yet — real gap
   for the production-hardening pass (§9).
+- [x] **Found and fixed during a later audit pass**: `bootstrapOtel` was
+  never actually called by any real, long-running service process —
+  `services/control-plane/src/server.ts` (the actual production
+  entrypoint, run via `pnpm --filter @fuse/control-plane run start/dev`)
+  never invoked it, meaning the control plane emitted zero telemetry about
+  itself outside of tests that manually called `bootstrapOtel` in-process.
+  All the OTel plumbing in `packages/otel` was real and well-tested, but
+  the one long-running service meant to use it in production never
+  actually wired it in — a genuine gap between "looks OTel-native" and "is
+  OTel-native when actually run." Fixed: `server.ts`'s `main()` now calls
+  `bootstrapOtel({ serviceName: 'fuse-control-plane', serviceVersion,
+  deploymentEnvironment })` once at startup (added `@fuse/otel` as a real
+  dependency, a new `CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT` config field),
+  and flushes/shuts it down alongside the existing SIGTERM/SIGINT
+  handlers. Deliberately NOT called from `buildApp()`, which every
+  integration test also calls (often many times per process) — OTel
+  global-provider registration is a one-shot no-op on repeat, so it must
+  happen exactly once, only in the real entrypoint.
 
 ### 3.3 SigNoz ingestion proof
 
