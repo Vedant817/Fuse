@@ -1,0 +1,5 @@
+# Fuse is currently a single-maintainer project.
+# Every path defaults to the same owner; split this out if/when other
+# maintainers are added.
+
+* @Vedant817
