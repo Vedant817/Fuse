@@ -118,6 +118,9 @@ Scope any of these to one package with pnpm's `--filter`, e.g.
   honestly rather than silently dropped.
 - [`docs/adr/`](./docs/adr) — accepted architecture decisions (language/
   runtime choice, system boundaries and state store, provider adapters).
+- [`docs/threat-model.md`](./docs/threat-model.md) — assets, actors, webhook
+  auth/replay analysis, and an honest risk register (what's mitigated, what
+  isn't yet).
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — how changes are made in this repo.
 
 ## License
