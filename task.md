@@ -419,16 +419,54 @@ Acceptance criteria:
 
 ### 3.1 Authentic failure fixture
 
-- [ ] Select and document an authentic Analyzer/Verifier-style workflow with a
-  safe, bounded, provider-mocked default mode.
-- [ ] Implement normal termination and three opt-in failure modes: repeating
+- [x] Select and document an authentic Analyzer/Verifier-style workflow with a
+  safe, bounded, provider-mocked default mode. Decision (2026-07-21, user
+  chose a generic invented example over modeling a specific real system):
+  a generic Analyzer↔Verifier reflection loop — Analyzer drafts, Verifier
+  critiques or approves — a common real production pattern (self-critique/
+  reflection agents). `services/broken-agent`. Default mode uses a fully
+  deterministic mock model (`mock-model.ts`, no network, no real cost); a
+  real provider (`@fuse/sdk/providers`) can be substituted at the call site
+  behind its own explicit opt-in, still bounded by the same safety
+  ceilings.
+- [x] Implement normal termination and three opt-in failure modes: repeating
   loop, growing conversation context, and abnormal call/cost velocity.
-- [ ] Add hard demo safety ceilings for calls, runtime, tokens, and actual spend
-  that cannot be disabled accidentally in a real-provider run.
-- [ ] Make the fixture deterministic with seed, scenario, iteration delay, and
-  reset controls.
-- [ ] Add tests proving the normal workflow does not trip default policies and
-  each broken scenario produces its intended telemetry shape.
+  Evidence: `Scenario = 'normal' | 'loop' | 'context-bloat' |
+  'cost-velocity'` (`types.ts`); `normal` terminates via verifier approval
+  in a handful of rounds; `loop` never approves and produces
+  byte-identical analyzer content every round (the canonicalizable
+  loop-signature shape); `context-bloat` never approves and produces
+  strictly-increasing input token counts round over round; `cost-velocity`
+  has the same approve-quickly shape as `normal` but is paced with
+  near-zero inter-round delay, producing an abnormally high calls/time
+  rate.
+- [x] Add hard demo safety ceilings for calls, runtime, tokens, and actual
+  spend that cannot be disabled accidentally in a real-provider run.
+  Evidence: `safety.ts`'s `clampCeilings` — every configured ceiling is
+  `Math.min(configured, ABSOLUTE_MAX_*)`, so it can only ever be
+  *tightened*, never loosened past the in-code absolute maximum; no
+  environment variable or config path raises the absolute ceiling. Test:
+  "clamps a configured ceiling far above the absolute maximum back down to
+  it" (`maxCalls: 999_999` still executes at most `ABSOLUTE_MAX_CALLS`
+  rounds).
+- [x] Make the fixture deterministic with seed, scenario, iteration delay, and
+  reset controls. Evidence: `RunConfig.{scenario, seed, iterationDelayMs}`
+  fully determine output (no real randomness anywhere in `mock-model.ts`);
+  "reset" is implicit — every call to `runAnalyzerVerifier` is a fresh,
+  independent run with no shared mutable state between runs.
+- [x] Add tests proving the normal workflow does not trip default policies and
+  each broken scenario produces its intended telemetry shape. Evidence:
+  `analyzer-verifier.test.ts` (6 unit tests: normal terminates via
+  verifier-approved without ever being denied; loop produces a repeated
+  byte-identical shape and runs to the safety ceiling; context-bloat
+  produces strictly-increasing input tokens; cost-velocity is measurably
+  faster than a paced normal run; ceiling clamping; a mocked breaker trip
+  stops dispatch immediately with zero further model calls) and
+  `analyzer-verifier.integration.test.ts` (2 tests against a real Postgres
+  + control plane: a normal run completes end to end; a trip issued via
+  the real operational API mid-run — exactly as a detector's webhook will
+  do in §5 — stops the fixture at `breaker-tripped` with the model spy
+  showing zero calls after the trip committed).
 
 ### 3.2 OTel instrumentation
 

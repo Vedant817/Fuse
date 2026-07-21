@@ -1,0 +1,156 @@
+import { FuseGuard } from '@fuse/sdk';
+import { describe, expect, it, vi } from 'vitest';
+import { runAnalyzerVerifier } from './analyzer-verifier.js';
+import { ABSOLUTE_MAX_CALLS } from './safety.js';
+import type { Model } from './types.js';
+
+function allowingGuard(): FuseGuard {
+  // mockImplementation (not mockResolvedValue) so every call gets a fresh
+  // Response instance — reusing one Response across calls means its body
+  // stream is already consumed after the first .json() read.
+  const fetchImpl = vi.fn().mockImplementation(
+    () =>
+      new Response(
+        JSON.stringify({
+          allowed: true,
+          state: 'armed',
+          reason: 'armed',
+          epoch: 0,
+          degraded: false,
+          correlationId: 'c1',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+  );
+  return new FuseGuard({
+    scope: { tenant: 't1', environment: 'test', agentId: 'broken-agent' },
+    controlPlaneUrl: 'http://cp.internal',
+    apiToken: 'tok',
+    fetchImpl,
+  });
+}
+
+describe('runAnalyzerVerifier', () => {
+  it('normal scenario terminates via verifier-approved within a small bounded number of rounds', async () => {
+    const result = await runAnalyzerVerifier({
+      scenario: 'normal',
+      seed: 1,
+      guard: allowingGuard(),
+    });
+    expect(result.stopReason).toBe('verifier-approved');
+    expect(result.totalCalls).toBeLessThan(10);
+    expect(result.rounds.at(-1)?.approved).toBe(true);
+  });
+
+  it('loop scenario never approves and runs until the safety ceiling, with a canonicalizable repeated shape', async () => {
+    const result = await runAnalyzerVerifier({
+      scenario: 'loop',
+      seed: 1,
+      guard: allowingGuard(),
+      maxCalls: 10,
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    expect(result.rounds.every((r) => r.role !== 'verifier' || r.approved !== true)).toBe(
+      true,
+    );
+
+    const analyzerContents = result.rounds
+      .filter((r) => r.role === 'analyzer')
+      .map((r) => r.content);
+    expect(new Set(analyzerContents).size).toBe(1); // byte-identical every round: the loop signature
+  });
+
+  it('context-bloat scenario produces strictly growing input tokens round over round', async () => {
+    const result = await runAnalyzerVerifier({
+      scenario: 'context-bloat',
+      seed: 1,
+      guard: allowingGuard(),
+      maxCalls: 10,
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    const inputTokenSeries = result.rounds.map((r) => r.inputTokens);
+    for (let i = 1; i < inputTokenSeries.length; i++) {
+      expect(inputTokenSeries[i]).toBeGreaterThan(inputTokenSeries[i - 1]!);
+    }
+  });
+
+  it('cost-velocity scenario (near-zero delay) completes far faster than the same call count with a real delay', async () => {
+    const fast = await runAnalyzerVerifier({
+      scenario: 'cost-velocity',
+      seed: 1,
+      guard: allowingGuard(),
+      iterationDelayMs: 0,
+    });
+    const paced = await runAnalyzerVerifier({
+      scenario: 'normal',
+      seed: 1,
+      guard: allowingGuard(),
+      iterationDelayMs: 50,
+    });
+    // Same shape (both approve around the same round), wildly different pacing.
+    expect(fast.elapsedMs).toBeLessThan(paced.elapsedMs);
+  });
+
+  it('clamps a configured ceiling far above the absolute maximum back down to it', async () => {
+    const result = await runAnalyzerVerifier({
+      scenario: 'loop',
+      seed: 1,
+      guard: allowingGuard(),
+      maxCalls: 999_999,
+    });
+    expect(result.totalCalls).toBeLessThanOrEqual(ABSOLUTE_MAX_CALLS);
+  });
+
+  it('stops immediately on a breaker trip mid-run, with zero further model dispatches', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            allowed: true,
+            state: 'armed',
+            reason: 'armed',
+            epoch: 0,
+            degraded: false,
+            correlationId: 'c1',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            allowed: false,
+            state: 'tripped',
+            reason: 'loop detected',
+            epoch: 1,
+            degraded: false,
+            correlationId: 'c2',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    const guard = new FuseGuard({
+      scope: { tenant: 't1', environment: 'test', agentId: 'broken-agent' },
+      controlPlaneUrl: 'http://cp.internal',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+
+    const modelSpy = vi
+      .fn()
+      .mockResolvedValue({ content: 'x', inputTokens: 1, outputTokens: 1 });
+    const model: Model = { call: modelSpy };
+
+    const result = await runAnalyzerVerifier({
+      scenario: 'loop',
+      seed: 1,
+      guard,
+      model,
+      maxCalls: 20,
+    });
+    expect(result.stopReason).toBe('breaker-tripped');
+    expect(result.totalCalls).toBe(1); // only the first (allowed) call actually dispatched
+    expect(modelSpy).toHaveBeenCalledTimes(1);
+  });
+});
