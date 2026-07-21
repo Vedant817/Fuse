@@ -13,6 +13,10 @@
     "./testing": {
       "types": "./dist/testing.d.ts",
       "default": "./dist/testing.js"
+    },
+    "./demo": {
+      "types": "./dist/demo-threshold-trigger.d.ts",
+      "default": "./dist/demo-threshold-trigger.js"
     }
   },
   "scripts": {
