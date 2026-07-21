@@ -17,14 +17,19 @@
     "./demo": {
       "types": "./dist/demo-threshold-trigger.d.ts",
       "default": "./dist/demo-threshold-trigger.js"
+    },
+    "./providers": {
+      "types": "./dist/providers/index.d.ts",
+      "default": "./dist/providers/index.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
-    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test": "vitest run --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'",
     "test:integration": "vitest run integration",
-    "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts'"
+    "test:live": "vitest run live",
+    "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'"
   },
   "dependencies": {
     "@fuse/contracts": "workspace:*"
