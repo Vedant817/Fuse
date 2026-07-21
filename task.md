@@ -313,18 +313,23 @@ already existed to test it against realistically.
 
 ### 2.2 Pre-call middleware/SDK
 
-- [~] Define a provider-neutral model-call wrapper and an initial real
-  provider adapter; keep provider SDK types out of the domain layer. Done:
-  `FuseGuard.guard(dispatch, correlationId)` (`packages/sdk/src/guard.ts`)
-  wraps any `() => Promise<T>` — provider-agnostic by construction, no
-  provider SDK types anywhere near `breaker-core`. Not done: no concrete
-  real-provider (Anthropic/OpenAI) HTTP adapter exists, because no
-  provider credentials are available in this environment. Per CLAUDE.md's
-  explicit guidance for this situation, the complete local/mock path was
-  built and verified instead (`packages/sdk/src/testing.ts`'s
-  `startFakeProvider`/`callFakeProvider`, a real `node:http` server, not an
-  in-process stub) — this is the documented missing integration step, to
-  be closed the moment a provider API key is supplied.
+- [x] Define a provider-neutral model-call wrapper and an initial real
+  provider adapter; keep provider SDK types out of the domain layer.
+  Evidence: `FuseGuard.guard(dispatch, correlationId)`
+  (`packages/sdk/src/guard.ts`) wraps any `() => Promise<T>` —
+  provider-agnostic by construction, no provider SDK types anywhere near
+  `breaker-core`. Real provider adapters (ADR-003, 2026-07-21 decision):
+  `packages/sdk/src/providers/` — a shared `OpenAiCompatibleProvider` class
+  plus `createGroqProvider`/`createNvidiaBuildProvider` factories (both
+  platforms expose an OpenAI-compatible `/chat/completions` API; base
+  URLs/auth verified against each platform's current docs). No credentials
+  are available in this environment, so live verification against the real
+  APIs remains blocked (tracked below and in §12); the adapter logic itself
+  is fully built and tested against a faithful local mock
+  (`openai-compatible-mock.ts`), and a live-optional test
+  (`groq.live.test.ts`/`nvidia-build.live.test.ts`) is ready to run the
+  moment `GROQ_API_KEY`/`NVIDIA_API_KEY` are exported — no code changes
+  needed.
 - [x] Check a permit immediately before provider dispatch, after expensive
   local preparation where practical but before network bytes can be sent.
   Evidence: `guard()` always calls `checkPermit()` and returns/throws before
@@ -356,13 +361,18 @@ already existed to test it against realistically.
   `BreakerTrippedError`), and an in-flight-exposure measurement (exactly 2
   in-flight calls started *before* the trip request completed).
 - [x] Run one controlled integration test against a real provider or a
-  faithful HTTP test endpoint and preserve evidence for the demo. The fake
-  provider is a real, network-listening HTTP server (not an in-process
-  function-call counter) — this satisfies "faithful HTTP test endpoint."
-  A real-provider (Anthropic/OpenAI) run remains blocked on credentials
-  (see above) and is the one open item before this box could be fully
-  checked in the strictest reading; recorded as a deferred P1, target
-  milestone: whenever provider credentials become available.
+  faithful HTTP test endpoint and preserve evidence for the demo. Both the
+  generic fake provider and the OpenAI-compatible mock are real,
+  network-listening HTTP servers (not in-process function-call counters)
+  — `packages/sdk/src/providers/openai-compatible.integration.test.ts`
+  runs the actual `OpenAiCompatibleProvider` class (the same code a real
+  Groq/NVIDIA call would use) through `FuseGuard` against the mock,
+  proving the concrete adapter's request/auth/response handling — not just
+  the generic dispatch-wrapper contract — respects the breaker. A live run
+  against the real Groq/NVIDIA APIs remains blocked on credentials (see
+  above); tracked as a deferred P1 in §12, target milestone: whenever
+  `GROQ_API_KEY`/`NVIDIA_API_KEY` become available (the test is
+  pre-written and gated to run automatically once they are).
 
 ### 2.3 Hardcoded trigger proof
 
@@ -816,11 +826,18 @@ Add dated entries here rather than leaving important context only in chat.
 - 2026-07-21: Solo hackathon-speed direct-push-to-`main` branch strategy;
   branch protection/PR review deferred until a remote and/or a second
   contributor exists (§0.1).
-- 2026-07-21: No real LLM provider adapter was built due to unavailable
-  credentials; the complete local/mock path (a real, network-listening
-  fake-provider HTTP server, not an in-process stub) was built and verified
-  instead, per CLAUDE.md's explicit guidance for this situation. This is a
-  tracked, documented gap (§2.2), not a silent shortcut.
+- 2026-07-21 (ADR-003, explicit user choice): SigNoz Cloud (not
+  self-hosted) is the target deployment for the next slice — requires the
+  user to supply an account/ingestion key, which cannot be created by an
+  agent. Real LLM provider adapters target Groq and NVIDIA Build (NIM),
+  both via a shared OpenAI-compatible `/chat/completions` client
+  (`packages/sdk/src/providers/`), chosen explicitly by the user over the
+  initially-assumed Anthropic/OpenAI default. No credentials for either are
+  available in this environment; the adapters are built and verified
+  against a faithful local mock, with live-optional tests
+  (`*.live.test.ts`) ready to run the moment `GROQ_API_KEY`/
+  `NVIDIA_API_KEY` are exported — no code changes needed. See
+  `docs/adr/003-llm-provider-adapters.md`.
 
 ### Verification evidence
 
@@ -896,18 +913,36 @@ Add dated entries here rather than leaving important context only in chat.
   Verified after fixes: full workspace `pnpm run check` and
   `pnpm run test:integration` pass from a clean state — 53 unit tests + 32
   integration tests across 5 buildable packages, zero failures.
+- 2026-07-21: Real LLM provider adapters added (ADR-003) — Groq and NVIDIA
+  Build, both via `packages/sdk/src/providers/`'s shared
+  `OpenAiCompatibleProvider`. Base URLs and auth verified against each
+  platform's current documentation (Groq: `console.groq.com/docs/openai`;
+  NVIDIA: `docs.nvidia.com/nim`). Verified: unit tests (8 passed, mocked
+  fetch, both providers) covering request shaping/auth header/response
+  parsing/HTTP-error typing/timeout; an integration test running the real
+  adapter class through `FuseGuard` against a faithful local mock server
+  (2 passed) proving the concrete adapter — not just the generic
+  dispatch-wrapper contract — respects the breaker (armed calls reach the
+  mock with the correct auth header; after a trip, 5 concurrent calls are
+  all denied with zero new requests to the mock). Live-optional tests
+  against the real APIs correctly skip (exit 0) with no credentials
+  present. Full workspace `pnpm run check`/`test:integration` pass — 61
+  unit + 34 integration tests across 5 packages.
 
 ### Open blockers and risks
 
 - Git remote and repository URL have not yet been supplied or created.
 - GitHub CLI (`gh`) is not installed, so personal-account authentication cannot
   yet be verified and the publish workflow cannot run.
-- Actual SigNoz version, deployment target, MCP capabilities, LLM provider, and
-  Slack workspace are not yet selected; these require explicit ADRs/configuration
-  before integration assumptions are encoded in production paths.
-- No real LLM provider credentials are available in this environment; the
-  real-provider adapter and its integration test (§2.2) remain blocked on
-  this. The complete mock path is built and verified in the meantime.
+- SigNoz Cloud is the chosen deployment target (ADR-003/2026-07-21), but no
+  account/ingestion key has been supplied yet — needed before OTel export
+  configuration (§3.2/§3.3) can be verified against a real SigNoz backend.
+  MCP capabilities and Slack workspace remain unselected.
+- No real LLM provider credentials (`GROQ_API_KEY`/`NVIDIA_API_KEY`) are
+  available in this environment; the live-optional provider tests
+  (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
+  automatically the moment either is supplied — no code changes needed.
+  The complete mock path is built and verified in the meantime.
 - No root `README.md`, `CONTRIBUTING.md`, or `CODEOWNERS` exist yet, so the
   §0.2 "a new contributor can clone... from documented commands" acceptance
   criterion is not yet met. Highest-priority near-term gap.
