@@ -788,36 +788,133 @@ Acceptance criteria:
 
 ### 6.1 Coverage evaluator
 
-- [ ] Define required versus optional fields for spans/metrics by instrumentation
+- [x] Define required versus optional fields for spans/metrics by instrumentation
   schema version: model, token counts, estimated cost inputs, scoped identity,
   parent propagation, and flow timestamps.
-- [ ] Evaluate recent coverage percentage, freshness, orphan-span rate,
+  Evidence: `packages/contracts/src/preflight.ts` `SpanTelemetrySampleSchema`
+  (`hasRequestModel`, `hasInputTokens`, `hasOutputTokens`, `hasScopedIdentity`,
+  `hasValidTimestamps`, `isRootSpan`, `hasParent`) is the wire contract every
+  reporter (agent SDK, or a manual `curl`) must satisfy.
+- [~] Evaluate recent coverage percentage, freshness, orphan-span rate,
   cost/velocity flow, exporter drop signals, and build/version changes.
-- [ ] Implement state/reason model for `protected`, `degraded`, `blind`, and
+  Done: coverage % (`requiredFieldCoveragePercent`), freshness
+  (`freshnessMs`/staleness threshold), orphan-span rate
+  (`orphanRatePercent`, driven by `hasParent`/`isRootSpan`) — all in
+  `packages/preflight/src/evaluator.ts`.
+  Deferred (real gap, not silently dropped): cost/velocity flow health is
+  covered by the separate `cost-velocity` detector (§ existing detectors),
+  not folded into the Preflight evaluator; there is no distinct "exporter
+  drop" signal beyond span absence/missing-fields; there is no
+  build/version-regression signal (e.g. "spans stopped reporting a field
+  right after a deploy") — Preflight cannot yet distinguish "this build
+  broke instrumentation" from "telemetry is generically degraded."
+- [x] Implement state/reason model for `protected`, `degraded`, `blind`, and
   `disabled`, including hysteresis to avoid flapping.
-- [ ] Distinguish no traffic from broken telemetry using agent heartbeat or
+  Evidence: `PreflightStateSchema`/`PreflightReasonCodeSchema` in
+  `packages/contracts/src/preflight.ts`; asymmetric hysteresis (instant
+  degrade, dwell-gated recovery via `minRecoveryDwellMs`) in
+  `packages/preflight/src/evaluator.ts`, unit-tested in
+  `packages/preflight/src/evaluator.test.ts` (13/13 passing, including
+  degrade-resets-dwell-timer and re-enable-does-not-instant-recover cases).
+- [x] Distinguish no traffic from broken telemetry using agent heartbeat or
   another documented signal.
-- [ ] Store last-good and last-evaluated times and evidence references.
-- [ ] Test missing fields, partial sampling, idle agents, orphan spans, delayed
+  Evidence: `HeartbeatSignalSchema` (`lastSeenAtMs`); evaluator test
+  `'distinguishes idle (heartbeat alive, no spans) from broken telemetry
+  (no signal at all)'` and `'treats a stale heartbeat the same as no
+  heartbeat (blind, not degraded)'` — both passing.
+- [~] Store last-good and last-evaluated times and evidence references.
+  Done: `lastGoodAt`/`evaluatedAt` persisted in Postgres
+  (`packages/breaker-store/migrations/0002_preflight.sql`,
+  `preflight-store.ts`), confirmed round-tripped across separate
+  `evaluate()` calls by `preflight-store.integration.test.ts` (4/4 passing).
+  Deferred: "evidence references" is currently just the three aggregate
+  numbers (coverage %, orphan %, freshness ms), not links/IDs to the
+  specific offending spans — an operator sees "40% coverage" but not
+  which spans lacked which field.
+- [~] Test missing fields, partial sampling, idle agents, orphan spans, delayed
   data, exporter outage, release regression, and recovery.
+  Covered (13 unit tests in `evaluator.test.ts` + 4 store integration
+  tests): missing required fields, partial coverage (degraded vs blind
+  boundary), orphan/broken-parent spans, idle-vs-broken via heartbeat,
+  stale/delayed evidence, degrade-then-recover hysteresis (including
+  reset-mid-dwell), operator disable/re-enable.
+  Not covered (no such signal exists yet, see gap above): exporter outage
+  as a distinct condition from "no spans arrived," and release/version
+  regression.
 
 ### 6.2 Protection semantics and self-alert
 
-- [ ] Expose current Preflight state beside breaker state through API,
+- [~] Expose current Preflight state beside breaker state through API,
   dashboards, Slack, and middleware decision telemetry.
+  Done: `POST /v1/preflight/report` and `GET /v1/preflight/status` in
+  `services/control-plane/src/routes/preflight.ts`, authenticated via the
+  same three-tier bearer model as the breaker API (any known token may
+  report/read); 8/8 integration tests passing in
+  `services/control-plane/src/preflight.integration.test.ts`, covering
+  auth rejection, unknown-scope 404, agent-reports/operator-reads,
+  blind-on-missing-tokens, malformed-request 400, cross-request hysteresis
+  persistence, and operator-disable.
+  Deferred (real gap): no dashboard panel exists yet (§8 not started); no
+  Slack surfacing (§7.3 not started); and critically, the SDK's
+  `FuseGuard` middleware (`packages/sdk/src/guard.ts`) does **not** call
+  `/v1/preflight/report` from span data, and breaker `permit()` decisions
+  are not annotated with or gated by current Preflight state. Preflight
+  today is a standalone API + store an operator or agent can call
+  directly — it is not yet wired into the SDK's live request path. This
+  is the most important remaining gap in this slice: the brief's
+  intended flow (agent's own telemetry continuously informs its own
+  Preflight state without extra integration work) is not yet automatic.
 - [ ] Alert when protection degrades, including affected scope, missing signal,
   start time, last known good build, current build, and remediation link.
+  Not started — no self-alert path exists; a degrade/blind transition is
+  only visible if something polls `GET /v1/preflight/status`.
 - [ ] Deduplicate and rate-limit blind-spot notifications; emit a recovery event.
-- [ ] Apply/document policy for whether blind status fails open or closed and
+  Not started (depends on the alert path above existing first).
+- [x] Apply/document policy for whether blind status fails open or closed and
   ensure UI wording never implies full protection.
+  Evidence: `disabled` is modeled as a distinct, operator-only-triggered
+  state from `blind` specifically so an involuntary blind spot can never
+  be confused with an intentional maintenance window (see the doc comment
+  in `packages/contracts/src/preflight.ts`); Preflight itself is
+  read-only/advisory and never mutates breaker enforcement state, so a
+  `blind` telemetry verdict cannot itself trip or resume the breaker —
+  today the breaker's own enforcement fails closed per ADR-002 regardless
+  of Preflight state, and Preflight's role is confined to honest
+  reporting, not gating. No UI exists yet to word this for a human, so
+  the "never implies full protection" requirement is satisfied by the API
+  contract (any consumer must read `state`/`reasonCode` — nothing renders
+  a default "protected" absent evidence) but not yet demonstrated in an
+  actual UI surface.
 - [ ] Reproduce the demo beat: remove a required token field or propagation,
   detect it, alert, restore it, and show recovery.
+  Partially reproducible today via direct API calls (the hysteresis
+  integration test above IS this beat, minus the alert) but no rehearsed
+  demo script/fixture exists yet.
 
 Acceptance criteria:
 
-- Fuse never displays `protected` without current evidence;
-- an instrumentation regression becomes visible within the declared window;
-- idle/no-traffic is not falsely presented as healthy telemetry.
+- [x] Fuse never displays `protected` without current evidence — enforced
+  structurally: `evaluatePreflight` only returns `protected` when the
+  current window's spans (or heartbeat) pass freshness + coverage +
+  orphan checks; there is no default/fallback path that returns
+  `protected` without evaluating current input.
+- [x] an instrumentation regression becomes visible within the declared
+  window — degrade/blind commits on the very next evaluation (no
+  hysteresis delay on the way down); demonstrated by
+  `'degrades immediately (no hysteresis delay) when previously protected
+  and telemetry breaks'`.
+- [x] idle/no-traffic is not falsely presented as healthy telemetry — an
+  idle agent with a live heartbeat and zero spans reports `degraded`
+  (`no-recent-telemetry`), never `protected`; a dead agent (no heartbeat,
+  no spans) reports `blind` (`no-signal`).
+
+Honest overall status: the evaluator, its hysteresis, and its persisted
+Postgres-backed API are built and fully tested (13 unit + 4 + 8 integration
+tests, all passing as of this commit). What remains before this slice can
+be called "done" against the brief: wiring the SDK to actually report live
+span telemetry into this API as part of normal request handling, a
+self-alert/notification path, and a dashboard/Slack surface. These are
+tracked as open work in §7/§8, not silently assumed complete.
 
 ## 7. Diagnosis, recommendations, and Slack (P1)
 
