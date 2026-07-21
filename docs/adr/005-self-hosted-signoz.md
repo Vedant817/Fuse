@@ -88,6 +88,39 @@ ${requestModel}` naming convention exactly). This is strictly stronger
 evidence than was ever available for the SigNoz Cloud path, where no
 credentials existed to verify anything at all.
 
+A follow-up pass extended this to all three signals plus cross-signal
+correlation, task.md §3.3's remaining acceptance criterion. A second
+smoke run emitted one `chat` span (via `withGenAiSpan`, as above) and, in
+the same span context, one log record via the OTel Logs API
+(`@opentelemetry/api-logs` + `LoggerProvider`/`BatchLogRecordProcessor`,
+exported to `/v1/logs`) — logs are otherwise not emitted anywhere in this
+codebase today, so this specifically exercises `bootstrapOtel`'s
+already-configured log pipeline rather than any Fuse-specific log
+content. All three signals were confirmed in ClickHouse:
+
+- **Trace**: `signoz_traces.distributed_signoz_index_v3` — one row,
+  `serviceName = 'fuse-signoz-verify'`, `name = 'chat verify-model'`.
+- **Metrics**: `signoz_metrics.distributed_time_series_v4` — both
+  `gen_ai.client.token.usage` and `gen_ai.client.operation.duration`
+  histograms present for the same service (decomposed into ClickHouse's
+  bucket/count/sum/min/max representation), confirming the metrics
+  recorded internally by `withGenAiSpan` (`packages/otel/src/metrics.ts`)
+  reach the real backend, not just the local in-memory/mock-receiver
+  tests.
+- **Logs, correlated by trace ID**: `signoz_logs.distributed_logs_v2` —
+  `SELECT body, trace_id FROM ... WHERE trace_id = '<the span's trace
+ID>'` returned exactly the emitted log record, with `trace_id` matching
+  the span's own trace ID byte-for-byte — real proof that a log and its
+  originating span can be correlated in this backend, not merely that
+  both signals separately arrive.
+
+This closes task.md §3.3's "traces, metrics, and logs arrive... and can be
+correlated" acceptance criterion for real. What remains open in §3.3 is
+narrower: capturing this as an automated, checked-in smoke test (today
+it's a documented manual verification, matching how the original trace
+proof was done) and validating cardinality/ingestion volume under
+sustained load rather than one span.
+
 ## Alternatives considered
 
 - **Hand-roll a docker-compose.yml directly** (ClickHouse, otel-collector,

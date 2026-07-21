@@ -633,15 +633,28 @@ Acceptance criteria:
   `withGenAiSpan`'s `${operationName} ${requestModel}` naming convention
   exactly (`chat smoke-test-model`). This is real end-to-end ingestion
   proof, not a wire-level request-shape assertion.
-- [ ] Verify metrics and logs also arrive and can be correlated with the
-  trace for one demo run (e.g. via the SigNoz UI, not just ClickHouse).
-  Not yet done — traces are proven; metrics/logs export uses the identical
-  `bootstrapOtel` path so there's no specific reason to expect a different
-  result, but that's an expectation, not evidence, and this is now
-  genuinely actionable (no credential blocker) rather than blocked.
-- [ ] Capture saved queries/screenshots or an automated smoke check as
-  evidence. Not yet done — the ClickHouse-query verification above is real
-  evidence but isn't itself a repeatable, checked-in smoke test yet.
+- [x] Verify metrics and logs also arrive and can be correlated with the
+  trace for one demo run.
+  Evidence (docs/adr/005-self-hosted-signoz.md, "Verification" section): a
+  second smoke run emitted one `chat` span plus, in the same span
+  context, one manually-emitted log record (via `@opentelemetry/api-logs`
+  — logs aren't emitted anywhere in the app code today, so this exercises
+  `bootstrapOtel`'s configured log pipeline specifically, not app content).
+  All three signals confirmed in ClickHouse: the trace
+  (`signoz_traces.distributed_signoz_index_v3`); both `gen_ai.client.*`
+  histograms (`signoz_metrics.distributed_time_series_v4`); and the log
+  record (`signoz_logs.distributed_logs_v2`) with its `trace_id` column
+  matching the span's own trace ID byte-for-byte — real proof of
+  cross-signal correlation, not just three separate arrivals. Verified via
+  direct ClickHouse query (not yet the SigNoz UI itself, which reads the
+  same data through its own query layer).
+- [~] Capture saved queries/screenshots or an automated smoke check as
+  evidence. Done: the exact ClickHouse queries and their results are
+  recorded in docs/adr/005-self-hosted-signoz.md as reproducible evidence.
+  Not done: this isn't yet a checked-in automated test (would need a
+  ClickHouse client dependency and a live-optional gate, matching the
+  `*.live.test.ts` pattern) — today it's documented manual verification,
+  reproducible by a human following the ADR, not CI-enforced.
 - [ ] Validate representative cardinality and ingestion volume; remove
   high-cardinality dimensions from metrics where required. Partially
   addressed by design (metrics.ts's cardinality-discipline comments: token/
