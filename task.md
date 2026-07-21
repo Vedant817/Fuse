@@ -854,16 +854,45 @@ Acceptance criteria:
   auth rejection, unknown-scope 404, agent-reports/operator-reads,
   blind-on-missing-tokens, malformed-request 400, cross-request hysteresis
   persistence, and operator-disable.
-  Deferred (real gap): no dashboard panel exists yet (§8 not started); no
-  Slack surfacing (§7.3 not started); and critically, the SDK's
-  `FuseGuard` middleware (`packages/sdk/src/guard.ts`) does **not** call
-  `/v1/preflight/report` from span data, and breaker `permit()` decisions
-  are not annotated with or gated by current Preflight state. Preflight
-  today is a standalone API + store an operator or agent can call
-  directly — it is not yet wired into the SDK's live request path. This
-  is the most important remaining gap in this slice: the brief's
-  intended flow (agent's own telemetry continuously informs its own
-  Preflight state without extra integration work) is not yet automatic.
+  Also done (was the top-flagged gap, now closed): the SDK's live request
+  path reports real span telemetry into Preflight automatically, with no
+  extra integration work by the agent author. `withGenAiSpan`
+  (`packages/otel/src/gen-ai-span.ts`) now fires an `onTelemetryObserved`
+  hook after every span ends (success or error) with a structural
+  `SpanTelemetryObservation` (field/token/identity/timestamp presence,
+  root/parent status computed from the OTel active-context chain before
+  the span starts). `FuseGuard.recordSpanTelemetry()`
+  (`packages/sdk/src/guard.ts`) forwards these into a new
+  `PreflightReporter` (`packages/sdk/src/preflight-reporter.ts`) that
+  batches them and flushes to `/v1/preflight/report` off the request
+  critical path — a flush failure is swallowed (never retried, never
+  thrown) so a Preflight-reporting outage cannot affect whether a guarded
+  call proceeds. `services/broken-agent/src/analyzer-verifier.ts` wires
+  this at both its root `invoke_agent` and per-round `chat` spans.
+  Evidence: 3 new unit tests in `packages/otel/src/gen-ai-span.test.ts`
+  (14/14 passing), 9 unit tests in the new
+  `packages/sdk/src/preflight-reporter.test.ts`, 3 new unit tests in
+  `packages/sdk/src/guard.test.ts` (34/34 sdk unit tests passing), and
+  two live end-to-end integration tests against a real control
+  plane + Postgres: `packages/sdk/src/guard.integration.test.ts`
+  ("recordSpanTelemetry + flush makes this scope visible as protected via
+  the real Preflight API") and
+  `services/broken-agent/src/analyzer-verifier.integration.test.ts` ("a
+  normal run reports its own real span telemetry to Preflight, with no
+  extra wiring by the caller").
+  Deferred (real gap, honestly scoped down from the original ask): no
+  dashboard panel exists yet (§8 not started); no Slack surfacing (§7.3
+  not started); and breaker `permit()` decisions are not annotated with
+  or gated by current Preflight state — Preflight remains a parallel,
+  advisory signal rather than something the permit response itself
+  carries. Live-wired telemetry also cannot organically produce an
+  orphan-span or missing-token-count observation under normal operation
+  (the OTel API guarantees a parent span in context, and the SDK's
+  provider types require token counts), so the `blind`/`degraded` states
+  are only reachable live via a genuine bug in a caller's own
+  instrumentation, an actual call failure (tokens unknown), or the
+  existing direct-API path — not via a deliberately-flippable demo
+  switch, which is still the unstarted item below.
 - [ ] Alert when protection degrades, including affected scope, missing signal,
   start time, last known good build, current build, and remediation link.
   Not started — no self-alert path exists; a degrade/blind transition is
@@ -910,11 +939,16 @@ Acceptance criteria:
 
 Honest overall status: the evaluator, its hysteresis, and its persisted
 Postgres-backed API are built and fully tested (13 unit + 4 + 8 integration
-tests, all passing as of this commit). What remains before this slice can
-be called "done" against the brief: wiring the SDK to actually report live
-span telemetry into this API as part of normal request handling, a
-self-alert/notification path, and a dashboard/Slack surface. These are
-tracked as open work in §7/§8, not silently assumed complete.
+tests), and the SDK's live request path (`FuseGuard` + `withGenAiSpan`) now
+reports real span telemetry into that API automatically, with two
+end-to-end integration tests proving a real guarded run makes its own
+scope visible as `protected` via the real Preflight API. What remains
+before this slice can be called fully "done" against the brief: a
+self-alert/notification path, a dashboard/Slack surface, permit-response
+annotation with current Preflight state, and a rehearsed demo fixture that
+can deliberately flip a scope's telemetry from healthy to broken and back.
+These are tracked as open work in §7/§8 and as follow-on tasks, not
+silently assumed complete.
 
 ## 7. Diagnosis, recommendations, and Slack (P1)
 
