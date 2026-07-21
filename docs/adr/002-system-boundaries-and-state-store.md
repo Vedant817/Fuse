@@ -62,13 +62,13 @@ Postgres).
 Schema (initial):
 
 - `breaker_state(tenant, environment, agent_id, state, epoch, reason,
-  policy_version, cooldown_until, updated_at, updated_by)` — one row per
+policy_version, cooldown_until, updated_at, updated_by)` — one row per
   scoped breaker; primary key `(tenant, environment, agent_id)`.
 - `breaker_audit_log(id, tenant, environment, agent_id, from_state, to_state,
-  epoch_before, epoch_after, actor, reason, correlation_id, policy_version,
-  created_at)` — append-only, one row per committed transition.
+epoch_before, epoch_after, actor, reason, correlation_id, policy_version,
+created_at)` — append-only, one row per committed transition.
 - `idempotency_keys(key, tenant, environment, agent_id, request_hash,
-  response_snapshot, created_at, expires_at)` — dedupes retried/duplicate
+response_snapshot, created_at, expires_at)` — dedupes retried/duplicate
   webhook and API calls so retries return the original outcome rather than
   re-executing a transition.
 
