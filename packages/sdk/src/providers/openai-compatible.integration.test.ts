@@ -59,6 +59,8 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
+        webhookMaxAlertAgeMs: 600_000,
+        webhookMaxClockSkewAheadMs: 60_000,
       },
     });
     await controlPlane.listen({ port: 0, host: '127.0.0.1' });

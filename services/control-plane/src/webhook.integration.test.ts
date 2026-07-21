@@ -25,6 +25,8 @@ const CONFIG: ControlPlaneConfig = {
   webhookTokens: [WEBHOOK_TOKEN],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
+  webhookMaxAlertAgeMs: 600_000,
+  webhookMaxClockSkewAheadMs: 60_000,
 };
 
 describe('SigNoz alert webhook (real Postgres + control plane)', () => {
@@ -52,7 +54,10 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     await container.stop();
   });
 
-  function firingAlert(overrides: Record<string, unknown> = {}) {
+  function firingAlert(
+    overrides: Record<string, unknown> = {},
+    alertOverrides: Record<string, unknown> = {},
+  ) {
     return {
       status: 'firing',
       alerts: [
@@ -67,6 +72,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
           annotations: { summary: 'loop detected' },
           startsAt: new Date().toISOString(),
           fingerprint: randomUUID(),
+          ...alertOverrides,
         },
       ],
       ...overrides,
@@ -307,5 +313,87 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     const results = res.json().results as Array<{ outcome: string }>;
     expect(results).toHaveLength(2);
     expect(results.every((r) => r.outcome === 'tripped')).toBe(true);
+  });
+
+  it('rejects an alert whose startsAt is older than the configured max age — outcome stale-alert, no trip', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const staleStartsAt = new Date(Date.now() - 20 * 60 * 1000).toISOString(); // 20 min ago, config allows 10
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          startsAt: staleStartsAt,
+        },
+      ),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().results[0].outcome).toBe('stale-alert');
+
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(statusRes.statusCode).toBe(404); // unknown_scope — never actually tripped
+  });
+
+  it('rejects an alert whose startsAt claims to be further in the future than the clock-skew tolerance', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const futureStartsAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min ahead, config allows 1
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          startsAt: futureStartsAt,
+        },
+      ),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().results[0].outcome).toBe('stale-alert');
+  });
+
+  it('rejects an alert with an unparseable startsAt (fail closed, not "assume fresh")', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          startsAt: 'not-a-real-timestamp',
+        },
+      ),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().results[0].outcome).toBe('stale-alert');
+  });
+
+  it('accepts an alert comfortably within the freshness window', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const freshStartsAt = new Date(Date.now() - 60 * 1000).toISOString(); // 1 min ago
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          startsAt: freshStartsAt,
+        },
+      ),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().results[0].outcome).toBe('tripped');
   });
 });

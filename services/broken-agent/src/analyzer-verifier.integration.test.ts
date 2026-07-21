@@ -46,6 +46,8 @@ describe('runAnalyzerVerifier against a real control plane: breaker trip mid-run
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
+        webhookMaxAlertAgeMs: 600_000,
+        webhookMaxClockSkewAheadMs: 60_000,
       },
     });
     await controlPlane.listen({ port: 0, host: '127.0.0.1' });

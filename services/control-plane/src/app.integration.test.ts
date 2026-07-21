@@ -23,6 +23,8 @@ const CONFIG: ControlPlaneConfig = {
   webhookTokens: [],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
+  webhookMaxAlertAgeMs: 600_000,
+  webhookMaxClockSkewAheadMs: 60_000,
 };
 
 function scopeFor(name: string): Scope {
@@ -278,6 +280,8 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
+        webhookMaxAlertAgeMs: 600_000,
+        webhookMaxClockSkewAheadMs: 60_000,
       },
     });
     await app.ready();
@@ -395,6 +399,8 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
+        webhookMaxAlertAgeMs: 600_000,
+        webhookMaxClockSkewAheadMs: 60_000,
       },
     });
     await app.ready();

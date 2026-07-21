@@ -25,7 +25,28 @@ interface AlertOutcome {
     | 'cooldown-active'
     | 'invalid-transition'
     | 'stale-epoch'
-    | 'idempotency-conflict';
+    | 'idempotency-conflict'
+    | 'stale-alert';
+}
+
+/** Replay/staleness guard (docs/threat-model.md §3, config.ts's
+ * `webhookMaxAlertAgeMs` doc comment): true if `startsAt` cannot be parsed
+ * at all, is older than the configured max age, or claims to be further in
+ * the future than the configured clock-skew tolerance. Fail-closed on an
+ * unparseable timestamp — `startsAt` is only `z.string().min(1)` at the
+ * schema layer (Alertmanager's real format is a valid RFC3339 timestamp,
+ * but that isn't enforced there), so treat "can't tell if it's fresh" the
+ * same as "not fresh," never as "assume fresh." */
+function isStaleAlert(
+  startsAt: string,
+  now: number,
+  maxAgeMs: number,
+  maxClockSkewAheadMs: number,
+): boolean {
+  const startsAtMs = Date.parse(startsAt);
+  if (Number.isNaN(startsAtMs)) return true;
+  const ageMs = now - startsAtMs;
+  return ageMs > maxAgeMs || ageMs < -maxClockSkewAheadMs;
 }
 
 export function registerWebhookRoutes(
@@ -65,6 +86,20 @@ export function registerWebhookRoutes(
           // Deliberate default (task.md §5.1): never auto-resume solely
           // because an alert resolved. Observed, no state change.
           results.push({ fingerprint: alert.fingerprint, outcome: 'resolved-observed' });
+          continue;
+        }
+
+        if (
+          isStaleAlert(
+            normalized.startsAt,
+            Date.now(),
+            config.webhookMaxAlertAgeMs,
+            config.webhookMaxClockSkewAheadMs,
+          )
+        ) {
+          // Reject per-alert, not the whole batch — a grouped delivery may
+          // legitimately mix a stale/replayed alert with fresh ones.
+          results.push({ fingerprint: alert.fingerprint, outcome: 'stale-alert' });
           continue;
         }
 

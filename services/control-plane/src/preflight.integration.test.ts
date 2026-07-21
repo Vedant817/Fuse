@@ -24,6 +24,8 @@ const CONFIG: ControlPlaneConfig = {
   webhookTokens: [],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
+  webhookMaxAlertAgeMs: 600_000,
+  webhookMaxClockSkewAheadMs: 60_000,
 };
 
 function healthySpan(timestampMs: number) {

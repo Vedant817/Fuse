@@ -70,6 +70,19 @@ const ConfigSchema = z.object({
    * (or long) cooldown. */
   webhookDefaultPolicyVersion: z.string().min(1).default('signoz-webhook-v1'),
   webhookDefaultCooldownSeconds: z.number().int().nonnegative().default(300),
+  /** Replay/staleness guard (docs/threat-model.md §3): an alert whose
+   * `startsAt` is older than this is rejected per-alert (outcome
+   * `stale-alert`) rather than causing a trip. This defends against a
+   * captured HTTP request (or a stale re-queued delivery) being replayed
+   * long after it stopped being relevant — it does NOT defend against an
+   * attacker who holds a valid webhook token minting a brand-new,
+   * currently-fresh forged alert, which remains a documented, accepted
+   * limitation given SigNoz has no webhook payload-signing option. */
+  webhookMaxAlertAgeMs: z.number().int().positive().default(600_000),
+  /** Tolerance for `startsAt` claiming to be slightly in the future
+   * (clock skew between SigNoz and the control plane) before it is
+   * treated as suspicious/malformed rather than merely fresh. */
+  webhookMaxClockSkewAheadMs: z.number().int().nonnegative().default(60_000),
 });
 export type ControlPlaneConfig = z.infer<typeof ConfigSchema>;
 
@@ -113,6 +126,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     webhookDefaultPolicyVersion: env['CONTROL_PLANE_WEBHOOK_POLICY_VERSION'],
     webhookDefaultCooldownSeconds: env['CONTROL_PLANE_WEBHOOK_COOLDOWN_SECONDS']
       ? Number(env['CONTROL_PLANE_WEBHOOK_COOLDOWN_SECONDS'])
+      : undefined,
+    webhookMaxAlertAgeMs: env['CONTROL_PLANE_WEBHOOK_MAX_ALERT_AGE_MS']
+      ? Number(env['CONTROL_PLANE_WEBHOOK_MAX_ALERT_AGE_MS'])
+      : undefined,
+    webhookMaxClockSkewAheadMs: env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS']
+      ? Number(env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS'])
       : undefined,
   });
   if (!parsed.success) {

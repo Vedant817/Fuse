@@ -64,23 +64,28 @@ Implemented (`services/control-plane/src/routes/webhook.ts`,
   `policyVersion`/`cooldownSeconds` (`config.webhookDefaultPolicyVersion`/
   `webhookDefaultCooldownSeconds`) — never read from the untrusted alert
   payload.
-
-**Gaps (real, not hypothetical):**
-
-- **No replay-window / timestamp-skew check.** There is no verification that
-  `startsAt` is recent. `fingerprint` and `startsAt` are both attacker-chosen
-  fields inside the alert payload, not server-generated — a holder of a
-  valid webhook token can mint an arbitrarily large number of distinct
-  `(fingerprint, startsAt)` pairs and force a fresh trip for each one; the
-  idempotency mechanism only collapses _exact_ duplicates of a _single_
-  already-seen pair, it is not a rate limiter and provides no forgery
-  resistance. **Mitigation today:** none beyond the global 120 req/min
-  bearer-token rate limit (§6) and the fact that a trip is a fail-safe
-  action (it stops calls, it doesn't cost money or leak data) — the practical
-  impact of this gap is nuisance/availability against one's own agents, not
-  data exposure. **Recommended follow-up:** reject alerts whose `startsAt`
-  is older than a bounded window (e.g. 10 minutes) and/or apply a
-  per-webhook-token trip-rate limit tighter than the global default.
+- **Fixed: replay/timestamp-skew window.** `isStaleAlert`
+  (`services/control-plane/src/routes/webhook.ts`) rejects any alert
+  (per-alert, not the whole batch) whose `startsAt` is older than
+  `config.webhookMaxAlertAgeMs` (default 10 minutes) or claims to be
+  further in the future than `webhookMaxClockSkewAheadMs` (default 1
+  minute) — outcome `stale-alert`, never a trip. An unparseable `startsAt`
+  fails closed (treated as stale) rather than being assumed fresh. Proven
+  in `webhook.integration.test.ts`: a 20-minute-old alert, a 5-minute-future
+  alert, and an unparseable timestamp are all rejected without tripping
+  anything, while a 1-minute-old alert still trips normally. **What this
+  does and does not fix:** it defends against a captured HTTP request (or
+  a stale re-queued delivery) being replayed long after it stopped being
+  relevant. It does **not** defend against an attacker who already holds a
+  valid webhook token minting a brand-new, currently-fresh forged alert —
+  `fingerprint` and `startsAt` remain entirely attacker-chosen fields with
+  no payload signature to verify, since SigNoz offers no signing option
+  for its webhook channel. That residual capability (a valid token can
+  still force a trip for any scope it names, as often as it likes, as long
+  as each attempt uses a fresh timestamp) is unchanged and tracked below.
+  **Recommended follow-up** for that residual gap: a per-webhook-token
+  trip-rate limit tighter than the global 120 req/min default (§6), since
+  the staleness window alone cannot bound how often a valid token is used.
 - **No scope binding on the token itself.** `mapSignozAlertToNormalizedEvent`
   derives `scope` (tenant/environment/agentId) entirely from the alert
   payload's own labels. A webhook token is not associated with any specific
@@ -249,22 +254,30 @@ of what this document originally found is still visible):
   tenants) and that a wildcard token still can (the documented, opt-in
   tradeoff).
 
+- ~~Webhook replay via a stale `(fingerprint, startsAt)` pair (§3)~~ — now
+  covered: `webhook.integration.test.ts` proves a 20-minute-old alert, a
+  5-minute-future alert, and an unparseable timestamp are all rejected
+  (`stale-alert`, no trip), while a fresh alert still trips normally.
+
 Still with **no test** (tracked as follow-up work, not silently dropped):
 
-- Webhook replay/forgery via attacker-chosen `(fingerprint, startsAt)` pairs
-  (§3) — no test exists exercising this today.
+- Forgery via a _fresh_, attacker-chosen `(fingerprint, startsAt)` pair from
+  a holder of a genuinely valid webhook token (§3's residual gap — the
+  staleness window doesn't and can't prevent this; would need a rate-limit
+  test once that follow-up is built).
 - Endpoint-specific rate-limit exhaustion on `/v1/preflight/report` (§6).
 
 ## 9. Summary risk register
 
-| #   | Risk                                                                                         | Severity (given current scale)                                               | Status                                                                          |
-| --- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant                | High for any multi-tenant deployment; low for the current single-tenant demo | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice |
-| 2   | Webhook has no replay-window; attacker-chosen fingerprint/startsAt can force unlimited trips | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing) | Open, documented, not yet fixed                                                 |
-| 3   | Flat rate limit across cheap and heavy endpoints                                             | Low                                                                          | Open, documented, not yet fixed                                                 |
-| 4   | No online key rotation                                                                       | Low (env-var restart-based rotation works, just isn't graceful)              | Open, documented                                                                |
-| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                                | Low-medium, narrow scope                                                     | Open, no CI exists yet to enforce it                                            |
-| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it         | None today (nothing populates it with sensitive content yet)                 | Monitor, no action needed now                                                   |
+| #   | Risk                                                                                 | Severity (given current scale)                                               | Status                                                                          |
+| --- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant        | High for any multi-tenant deployment; low for the current single-tenant demo | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice |
+| 2   | Webhook had no replay-window; a stale captured alert could be replayed indefinitely  | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing) | Fixed — `webhookMaxAlertAgeMs`/`webhookMaxClockSkewAheadMs` (§3)                |
+| 2b  | Residual: a _fresh_ forged alert from a valid webhook token is still not prevented   | Medium (same fail-safe-only impact; SigNoz has no payload signing)           | Open — recommended fix is a per-webhook-token trip-rate limit                   |
+| 3   | Flat rate limit across cheap and heavy endpoints                                     | Low                                                                          | Open, documented, not yet fixed                                                 |
+| 4   | No online key rotation                                                               | Low (env-var restart-based rotation works, just isn't graceful)              | Open, documented                                                                |
+| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                        | Low-medium, narrow scope                                                     | Open, no CI exists yet to enforce it                                            |
+| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it | None today (nothing populates it with sensitive content yet)                 | Monitor, no action needed now                                                   |
 
 None of these gaps affect the breaker's core guarantee (zero provider calls
 after a committed trip) — that guarantee is enforced independently of the
