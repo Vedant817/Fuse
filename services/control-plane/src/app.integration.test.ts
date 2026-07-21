@@ -20,6 +20,9 @@ const CONFIG: ControlPlaneConfig = {
   storeOutageMode: 'fail-closed',
   apiTokens: [VALID_TOKEN],
   agentApiTokens: [],
+  webhookTokens: [],
+  webhookDefaultPolicyVersion: 'signoz-webhook-v1',
+  webhookDefaultCooldownSeconds: 300,
 };
 
 function scopeFor(name: string): Scope {
@@ -269,6 +272,9 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         storeOutageMode: 'fail-closed',
         apiTokens: [OPERATOR_TOKEN],
         agentApiTokens: [AGENT_TOKEN],
+        webhookTokens: [],
+        webhookDefaultPolicyVersion: 'signoz-webhook-v1',
+        webhookDefaultCooldownSeconds: 300,
       },
     });
     await app.ready();

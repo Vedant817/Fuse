@@ -5,3 +5,4 @@ export * from './breaker-state.js';
 export * from './audit.js';
 export * from './breaker-api.js';
 export * from './detector.js';
+export * from './alert-webhook.js';

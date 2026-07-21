@@ -41,6 +41,9 @@ describe('runAnalyzerVerifier against a real control plane: breaker trip mid-run
         storeOutageMode: 'fail-closed',
         apiTokens: [API_TOKEN],
         agentApiTokens: [],
+        webhookTokens: [],
+        webhookDefaultPolicyVersion: 'signoz-webhook-v1',
+        webhookDefaultCooldownSeconds: 300,
       },
     });
     await controlPlane.listen({ port: 0, host: '127.0.0.1' });

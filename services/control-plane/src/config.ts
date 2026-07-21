@@ -26,6 +26,22 @@ const ConfigSchema = z.object({
    * CONTROL_PLANE_AGENT_API_TOKENS; optional — if empty, only operator
    * tokens can call /v1/permit (still secure, just no separate role). */
   agentApiTokens: z.array(z.string().min(16)).default([]),
+  /** Webhook tokens: SigNoz's alert-webhook channel only. SigNoz has no
+   * HMAC-signing option (verified against its current docs — the channel
+   * authenticates via HTTP Basic Auth, or a bearer token when the
+   * configured username is left empty); a token scoped to only this route
+   * means a leaked SigNoz webhook credential still cannot resume, disable,
+   * or force-trip anything directly — it can only cause a *trip*, and only
+   * for the scope named in the alert's own labels. Comma-separated in
+   * CONTROL_PLANE_WEBHOOK_TOKENS. */
+  webhookTokens: z.array(z.string().min(16)).default([]),
+  /** Server-controlled defaults applied to every trip the webhook causes.
+   * Deliberately NOT read from the alert payload itself — an inbound
+   * alert is untrusted input, and letting it dictate its own cooldown
+   * would let a forged or misconfigured alert set an arbitrarily short
+   * (or long) cooldown. */
+  webhookDefaultPolicyVersion: z.string().min(1).default('signoz-webhook-v1'),
+  webhookDefaultCooldownSeconds: z.number().int().nonnegative().default(300),
 });
 export type ControlPlaneConfig = z.infer<typeof ConfigSchema>;
 
@@ -39,6 +55,7 @@ function parseTokenList(raw: string | undefined): string[] {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
   const apiTokens = parseTokenList(env['CONTROL_PLANE_API_TOKENS']);
   const agentApiTokens = parseTokenList(env['CONTROL_PLANE_AGENT_API_TOKENS']);
+  const webhookTokens = parseTokenList(env['CONTROL_PLANE_WEBHOOK_TOKENS']);
 
   const parsed = ConfigSchema.safeParse({
     port: env['CONTROL_PLANE_PORT'],
@@ -48,6 +65,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,
     agentApiTokens,
+    webhookTokens,
+    webhookDefaultPolicyVersion: env['CONTROL_PLANE_WEBHOOK_POLICY_VERSION'],
+    webhookDefaultCooldownSeconds: env['CONTROL_PLANE_WEBHOOK_COOLDOWN_SECONDS']
+      ? Number(env['CONTROL_PLANE_WEBHOOK_COOLDOWN_SECONDS'])
+      : undefined,
   });
   if (!parsed.success) {
     throw new Error(`invalid control-plane configuration: ${parsed.error.message}`);
