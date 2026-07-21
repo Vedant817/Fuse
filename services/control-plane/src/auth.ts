@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { FuseHttpError } from '@fuse/contracts';
+import { normalizeTokens, type ScopedToken, type TokenConfigEntry } from './config.js';
 
 function digest(value: string): Buffer {
   return createHash('sha256').update(value).digest();
@@ -8,16 +9,37 @@ function digest(value: string): Buffer {
 
 /** Constant-time membership check: hashes both sides to a fixed-length
  * digest before comparing, so neither the token's length nor a partial
- * prefix match is observable via timing. */
-function tokenMatches(candidate: string, validTokens: readonly string[]): boolean {
-  const candidateDigest = digest(candidate);
-  let matched = false;
-  for (const valid of validTokens) {
-    if (timingSafeEqual(candidateDigest, digest(valid))) {
-      matched = true;
+ * prefix match is observable via timing. Does not short-circuit on match —
+ * every candidate is compared against every configured token regardless,
+ * so a match early in the list takes the same time as one late in it (or
+ * none at all). Returns the matched record (so its `tenant` can be checked)
+ * or undefined. */
+function tokenRecordMatches(
+  candidateDigest: Buffer,
+  tokens: readonly ScopedToken[],
+): ScopedToken | undefined {
+  let found: ScopedToken | undefined;
+  for (const candidate of tokens) {
+    if (timingSafeEqual(candidateDigest, digest(candidate.token))) {
+      found = candidate;
     }
   }
-  return matched;
+  return found;
+}
+
+/** Reads the tenant a request targets, for tenant-scope enforcement: a
+ * POST/PUT body's `scope.tenant` (permit, breaker mutations, Preflight
+ * report) or a GET request's `?tenant=` query param (breaker/Preflight
+ * status). Returns undefined if neither is present as a string — callers
+ * treat that as "could not determine," which is fail-closed for any
+ * non-wildcard token (see `requireBearerAuth`). Not used for the webhook
+ * route — see config.ts's `webhookTokens` doc comment for why. */
+export function extractTenantFromRequest(request: FastifyRequest): string | undefined {
+  const body = request.body as { scope?: { tenant?: unknown } } | null | undefined;
+  if (typeof body?.scope?.tenant === 'string') return body.scope.tenant;
+  const query = request.query as { tenant?: unknown } | undefined;
+  if (typeof query?.tenant === 'string') return query.tenant;
+  return undefined;
 }
 
 /**
@@ -29,11 +51,23 @@ function tokenMatches(candidate: string, validTokens: readonly string[]): boolea
  * distinction is what lets an agent-scoped token call `/v1/permit` while
  * being rejected (not silently accepted) on `/v1/breaker/*` — least
  * privilege for resume/disable/force-trip, per AGENTS.md.
+ *
+ * `extractTenant`, when given, adds a second privilege dimension: a token
+ * matched by role but bound to a specific tenant (not the `'*'` wildcard)
+ * must also match the tenant the request actually targets, or it gets the
+ * same 403 `unauthorized` — a role-correct token is not enough if it was
+ * scoped to a different tenant (docs/adr/004-tenant-scoped-tokens.md). A
+ * wildcard-tenant token (including every plain, unscoped token — see
+ * `normalizeToken`) always passes this check, so omitting `extractTenant`
+ * or configuring only unscoped tokens reproduces the exact prior behavior.
  */
 export function requireBearerAuth(
-  allowedTokens: readonly string[],
-  allKnownTokens: readonly string[] = allowedTokens,
+  allowedTokens: readonly TokenConfigEntry[],
+  allKnownTokens: readonly TokenConfigEntry[] = allowedTokens,
+  extractTenant?: (request: FastifyRequest) => string | undefined,
 ) {
+  const normalizedAllowed = normalizeTokens(allowedTokens);
+  const normalizedAllKnown = normalizeTokens(allKnownTokens);
   return async function authPreHandler(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -62,10 +96,25 @@ export function requireBearerAuth(
       await reply.code(err.httpStatus).send(err.toBody());
       return;
     }
-    if (tokenMatches(token, allowedTokens)) {
+    const candidateDigest = digest(token);
+    const matched = tokenRecordMatches(candidateDigest, normalizedAllowed);
+    if (matched) {
+      if (extractTenant && matched.tenant !== '*') {
+        const requestTenant = extractTenant(request);
+        if (requestTenant === undefined || requestTenant !== matched.tenant) {
+          const err = new FuseHttpError(
+            'unauthorized',
+            'this token is not authorized for the requested tenant',
+            403,
+            correlationId,
+          );
+          await reply.code(err.httpStatus).send(err.toBody());
+          return;
+        }
+      }
       return;
     }
-    if (tokenMatches(token, allKnownTokens)) {
+    if (tokenRecordMatches(candidateDigest, normalizedAllKnown)) {
       const err = new FuseHttpError(
         'unauthorized',
         'this token is valid but not authorized for this operation',

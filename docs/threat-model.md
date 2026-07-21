@@ -111,27 +111,49 @@ SQL layer, every store query filters by `tenant`/`environment`/`agent_id`
 (`packages/breaker-store/src/store.ts`) — there is no missing-`WHERE`-clause
 cross-tenant data leakage.
 
-**The gap is one layer up, at authorization, not storage:** `scope` is read
-directly from the request body/query
-(`services/control-plane/src/routes/permit.ts`,
-`routes/breaker.ts`, `routes/preflight.ts`) with no check that the
-presenting token is associated with that particular tenant — because no
-token is associated with any particular tenant. Concretely, today:
+**Fixed (ADR-004, `docs/adr/004-tenant-scoped-tokens.md`):** the gap was one
+layer up from storage, at authorization — `scope` is read directly from the
+request body/query (`services/control-plane/src/routes/permit.ts`,
+`routes/breaker.ts`, `routes/preflight.ts`) and, previously, no token was
+associated with any particular tenant, so:
 
-- A single leaked **operator** token can trip/resume/disable/enable
+- A single leaked **operator** token could trip/resume/disable/enable
   **every** tenant's breaker on the deployment, not just one team's.
-- A single leaked **agent** token can read or report Preflight status for
+- A single leaked **agent** token could read or report Preflight status for
   **any** tenant's scope, not just the agent it was issued to.
 
-This is the most consequential residual risk in the current design. It is an
-explicit scope-reduction for the hackathon build (ADR-002 defines the
-control-plane/store boundary but does not claim per-tenant credential
-isolation), not an oversight to silently accept going forward — recorded
-here so it is visible and testable rather than assumed away.
-**Recommended follow-up:** either issue tokens per-tenant (smallest change:
-one token set per tenant, checked against the scope in the request) or add
-an explicit tenant claim to the token that the auth layer validates against
-`request.body.scope.tenant` before delegating to the store.
+Bearer tokens can now optionally be bound to a single tenant via a
+`tenant:token` config entry (instead of a plain token); `requireBearerAuth`
+(`services/control-plane/src/auth.ts`) checks the matched token's tenant
+against the request's actual target tenant
+(`extractTenantFromRequest` — `request.body.scope.tenant` for POST bodies,
+`request.query.tenant` for GET) and returns `403 unauthorized` on mismatch.
+Wired into `/v1/permit`, `/v1/preflight/*`, and `/v1/breaker/*`. Proven
+against a real Postgres-backed store in
+`services/control-plane/src/app.integration.test.ts` ("control-plane
+tenant-scoped tokens: closing the cross-tenant blast radius") — a tenant-A
+token gets 403 attempting to trip/resume tenant B's scope or read its
+Preflight status, and the attempted cross-tenant trip is confirmed to have
+never actually happened (tenant B's scope remains `unknown_scope`
+afterward).
+
+**This fix is opt-in, not a default, and that tradeoff is deliberate and
+recorded, not silently glossed over:** a plain (unscoped) token — the only
+form that existed before this ADR — still normalizes to the wildcard
+tenant `'*'` and is valid for every tenant, exactly reproducing prior
+behavior. A deployment that never migrates its `.env` to `tenant:token`
+pairs is **still exactly as exposed as described above** — the capability
+to close the gap now exists and is tested, but using it requires an
+operator to actually configure tenant-scoped tokens. `.env.example`
+documents the format and recommends it once more than one tenant shares a
+deployment.
+
+**Still not covered by this fix:** the SigNoz webhook (`/v1/webhooks/*`) is
+deliberately excluded from tenant binding — see ADR-004's "Scope of this
+decision" section for why (a webhook channel may watch multiple tenants,
+and one delivery can carry alerts for several scopes at once). Its
+authentication remains exactly as described in §3, including the
+still-open replay/timestamp-skew gap.
 
 ## 5. Prompt/tool payload collection, redaction, and retention
 
@@ -217,27 +239,32 @@ abuse-case list before this document, but real coverage):
 | Store outage during permit vs. during a mutation                 | `guard.test.ts` (SDK-side), `app.integration.test.ts`/`preflight.integration.test.ts` (control-plane side) |
 | Control-plane unreachable from the SDK                           | `guard.test.ts` (timeout/network-error fail-closed/fail-open cases)                                        |
 
-Threats identified by this document with **no test yet** (tracked as
-follow-up work, not silently dropped):
+Threats identified by this document, now with a test (updated from the
+original "no test yet" list — struck through, not deleted, so the history
+of what this document originally found is still visible):
 
-- Cross-tenant control via a single leaked operator/agent token (§4) — no
-  test currently proves or disproves this; one should be added asserting
-  the _current_ (undesirable) behavior so a future fix can be verified
-  against it, and to prevent the gap from silently regressing further.
+- ~~Cross-tenant control via a single leaked operator/agent token (§4)~~ —
+  now covered: `app.integration.test.ts`'s "control-plane tenant-scoped
+  tokens" suite proves both the fixed behavior (a scoped token cannot cross
+  tenants) and that a wildcard token still can (the documented, opt-in
+  tradeoff).
+
+Still with **no test** (tracked as follow-up work, not silently dropped):
+
 - Webhook replay/forgery via attacker-chosen `(fingerprint, startsAt)` pairs
   (§3) — no test exists exercising this today.
 - Endpoint-specific rate-limit exhaustion on `/v1/preflight/report` (§6).
 
 ## 9. Summary risk register
 
-| #   | Risk                                                                                         | Severity (given current scale)                                               | Status                               |
-| --- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------ |
-| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant                | High for any multi-tenant deployment; low for the current single-tenant demo | Open, documented, not yet fixed      |
-| 2   | Webhook has no replay-window; attacker-chosen fingerprint/startsAt can force unlimited trips | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing) | Open, documented, not yet fixed      |
-| 3   | Flat rate limit across cheap and heavy endpoints                                             | Low                                                                          | Open, documented, not yet fixed      |
-| 4   | No online key rotation                                                                       | Low (env-var restart-based rotation works, just isn't graceful)              | Open, documented                     |
-| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                                | Low-medium, narrow scope                                                     | Open, no CI exists yet to enforce it |
-| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it         | None today (nothing populates it with sensitive content yet)                 | Monitor, no action needed now        |
+| #   | Risk                                                                                         | Severity (given current scale)                                               | Status                                                                          |
+| --- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant                | High for any multi-tenant deployment; low for the current single-tenant demo | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice |
+| 2   | Webhook has no replay-window; attacker-chosen fingerprint/startsAt can force unlimited trips | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing) | Open, documented, not yet fixed                                                 |
+| 3   | Flat rate limit across cheap and heavy endpoints                                             | Low                                                                          | Open, documented, not yet fixed                                                 |
+| 4   | No online key rotation                                                                       | Low (env-var restart-based rotation works, just isn't graceful)              | Open, documented                                                                |
+| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                                | Low-medium, narrow scope                                                     | Open, no CI exists yet to enforce it                                            |
+| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it         | None today (nothing populates it with sensitive content yet)                 | Monitor, no action needed now                                                   |
 
 None of these gaps affect the breaker's core guarantee (zero provider calls
 after a committed trip) — that guarantee is enforced independently of the

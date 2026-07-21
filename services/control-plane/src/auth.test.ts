@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
-import { requireBearerAuth } from './auth.js';
+import { extractTenantFromRequest, requireBearerAuth } from './auth.js';
+import type { ScopedToken } from './config.js';
 
 const TOKEN_A = 'a'.repeat(32);
 const TOKEN_B = 'b'.repeat(32);
@@ -130,6 +131,147 @@ describe('requireBearerAuth with a scoped (allowed vs. known) token set', () => 
     });
     expect(res.statusCode).toBe(401);
     expect(res.json().error).toBe('unauthenticated');
+    await app.close();
+  });
+});
+
+describe('requireBearerAuth with tenant-scoped tokens', () => {
+  const TENANT_A_TOKEN: ScopedToken = {
+    token: 't1-token-'.padEnd(32, '0'),
+    tenant: 't1',
+  };
+  const TENANT_B_TOKEN: ScopedToken = {
+    token: 't2-token-'.padEnd(32, '0'),
+    tenant: 't2',
+  };
+  const WILDCARD_TOKEN = 'wildcard-token-'.padEnd(32, '0');
+
+  async function buildTenantScopedApp() {
+    const app = Fastify();
+    app.addHook(
+      'preHandler',
+      requireBearerAuth(
+        [TENANT_A_TOKEN, TENANT_B_TOKEN, WILDCARD_TOKEN],
+        [TENANT_A_TOKEN, TENANT_B_TOKEN, WILDCARD_TOKEN],
+        extractTenantFromRequest,
+      ),
+    );
+    app.post('/scoped', async () => ({ ok: true }));
+    app.get('/scoped', async () => ({ ok: true }));
+    await app.ready();
+    return app;
+  }
+
+  it('accepts a tenant-bound token when the request targets its own tenant (body scope)', async () => {
+    const app = await buildTenantScopedApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/scoped',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: { scope: { tenant: 't1', environment: 'prod', agentId: 'a1' } },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('rejects a tenant-bound token acting on a different tenant (body scope) with 403, not a silent cross-tenant pass', async () => {
+    const app = await buildTenantScopedApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/scoped',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: { scope: { tenant: 't2', environment: 'prod', agentId: 'a1' } },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+    await app.close();
+  });
+
+  it('rejects a tenant-bound token acting on a different tenant (query scope)', async () => {
+    const app = await buildTenantScopedApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/scoped?tenant=t2&environment=prod&agentId=a1',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+    });
+    expect(res.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('rejects a tenant-bound token when the request has no determinable tenant at all (fail closed)', async () => {
+    const app = await buildTenantScopedApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/scoped',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: {},
+    });
+    expect(res.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('a wildcard (plain, unscoped) token is accepted for any tenant, preserving prior behavior', async () => {
+    const app = await buildTenantScopedApp();
+    for (const tenant of ['t1', 't2', 'some-other-tenant']) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/scoped',
+        headers: { authorization: `Bearer ${WILDCARD_TOKEN}` },
+        payload: { scope: { tenant, environment: 'prod', agentId: 'a1' } },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    await app.close();
+  });
+
+  it('without an extractTenant function, a tenant-bound token is accepted regardless of scope (opt-in enforcement)', async () => {
+    const app = Fastify();
+    app.addHook(
+      'preHandler',
+      requireBearerAuth([TENANT_A_TOKEN], [TENANT_A_TOKEN]), // no extractTenant passed
+    );
+    app.post('/unscoped-check', async () => ({ ok: true }));
+    await app.ready();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/unscoped-check',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: { scope: { tenant: 't2', environment: 'prod', agentId: 'a1' } },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+  });
+});
+
+describe('extractTenantFromRequest', () => {
+  it('reads tenant from a POST body scope.tenant', async () => {
+    const app = Fastify();
+    app.post('/echo', async (request) => ({ tenant: extractTenantFromRequest(request) }));
+    await app.ready();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/echo',
+      payload: { scope: { tenant: 't1' } },
+    });
+    expect(res.json().tenant).toBe('t1');
+    await app.close();
+  });
+
+  it('reads tenant from a GET query param when no body scope is present', async () => {
+    const app = Fastify();
+    app.get('/echo', async (request) => ({ tenant: extractTenantFromRequest(request) }));
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: '/echo?tenant=t2' });
+    expect(res.json().tenant).toBe('t2');
+    await app.close();
+  });
+
+  it('returns undefined when neither is present', async () => {
+    const app = Fastify();
+    app.post('/echo', async (request) => ({ tenant: extractTenantFromRequest(request) }));
+    await app.ready();
+    const res = await app.inject({ method: 'POST', url: '/echo', payload: {} });
+    expect(res.json().tenant).toBeUndefined();
     await app.close();
   });
 });

@@ -361,3 +361,167 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
     expect(res.statusCode).toBe(404); // unknown_scope, not 401/403 — auth passed
   });
 });
+
+describe('control-plane tenant-scoped tokens: closing the cross-tenant blast radius', () => {
+  const TENANT_A_TOKEN = { token: 'tenant-a-'.padEnd(32, '0'), tenant: 'tenant-a' };
+  const TENANT_B_TOKEN = { token: 'tenant-b-'.padEnd(32, '0'), tenant: 'tenant-b' };
+  const WILDCARD_TOKEN = 'wildcard-operator-'.padEnd(32, '0');
+  let container: StartedPostgreSqlContainer;
+  let pool: pg.Pool;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer('postgres:16-alpine')
+      .withDatabase('fuse')
+      .withUsername('fuse')
+      .withPassword('fuse')
+      .start();
+    pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    await runMigrations(pool);
+    const store = new BreakerStore(pool);
+    const preflightStore = new PreflightStore(pool);
+    app = await buildApp({
+      store,
+      preflightStore,
+      pool,
+      config: {
+        port: 0,
+        host: '127.0.0.1',
+        logLevel: 'silent',
+        databaseUrl: container.getConnectionUri(),
+        storeOutageMode: 'fail-closed',
+        apiTokens: [TENANT_A_TOKEN, TENANT_B_TOKEN, WILDCARD_TOKEN],
+        agentApiTokens: [],
+        webhookTokens: [],
+        webhookDefaultPolicyVersion: 'signoz-webhook-v1',
+        webhookDefaultCooldownSeconds: 300,
+      },
+    });
+    await app.ready();
+  }, 120_000);
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end();
+    await container.stop();
+  });
+
+  function scopeForTenant(tenant: string, name: string): Scope {
+    return {
+      tenant,
+      environment: 'test',
+      agentId: `agent-${name}-${randomUUID().slice(0, 8)}`,
+    };
+  }
+
+  it("tenant A's token can trip tenant A's own breaker", async () => {
+    const scope = scopeForTenant('tenant-a', 'own-scope');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: {
+        scope,
+        reason: 'tenant A tripping its own scope',
+        policyVersion: 'v1',
+        cooldownSeconds: 60,
+        actor: { type: 'manual', id: 'user:tenant-a-admin' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().record.state).toBe('tripped');
+  });
+
+  it("tenant A's token gets 403 (not a silent trip) when targeting tenant B's scope — the blast-radius fix", async () => {
+    const scope = scopeForTenant('tenant-b', 'cross-tenant-attempt');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: {
+        scope,
+        reason: 'tenant A attempting to trip tenant B',
+        policyVersion: 'v1',
+        cooldownSeconds: 60,
+        actor: { type: 'manual', id: 'user:tenant-a-admin' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+
+    // Confirm it genuinely never happened — tenant B's own token still
+    // sees a fresh, never-tripped scope, not something A already tripped.
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      headers: { authorization: `Bearer ${TENANT_B_TOKEN.token}` },
+    });
+    expect(statusRes.statusCode).toBe(404); // unknown_scope — never touched
+  });
+
+  it("tenant B's token cannot resume a scope tripped under tenant A", async () => {
+    const scope = scopeForTenant('tenant-a', 'cross-tenant-resume-attempt');
+    await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+      payload: {
+        scope,
+        reason: 'loop',
+        policyVersion: 'v1',
+        cooldownSeconds: 3600,
+        actor: { type: 'system', id: 'system:detector' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/resume',
+      headers: { authorization: `Bearer ${TENANT_B_TOKEN.token}` },
+      payload: {
+        scope,
+        reason: 'tenant B attempting to resume tenant A',
+        actor: { type: 'manual', id: 'user:tenant-b-admin' },
+        correlationId: 'c2',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
+  });
+
+  it("tenant A's token cannot read tenant B's Preflight status", async () => {
+    const scope = scopeForTenant('tenant-b', 'preflight-cross-tenant');
+    const res = await app.inject({
+      method: 'GET',
+      url: `/v1/preflight/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      headers: { authorization: `Bearer ${TENANT_A_TOKEN.token}` },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('a wildcard (unscoped) operator token still retains cross-tenant access — the documented, opt-in escape hatch', async () => {
+    const scope = scopeForTenant('tenant-a', 'wildcard-still-works');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: { authorization: `Bearer ${WILDCARD_TOKEN}` },
+      payload: {
+        scope,
+        reason: 'wildcard operator token',
+        policyVersion: 'v1',
+        cooldownSeconds: 60,
+        actor: { type: 'manual', id: 'user:break-glass' },
+        correlationId: 'c1',
+        idempotencyKey: `idem-${randomUUID()}`,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().record.state).toBe('tripped');
+  });
+});
