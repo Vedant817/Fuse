@@ -1,5 +1,5 @@
 {
-  "name": "@fuse/contracts",
+  "name": "@fuse/breaker-store",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -14,13 +14,20 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
-    "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "migrate": "tsx src/migrate.ts",
+    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test:integration": "vitest run integration",
+    "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts'"
   },
   "dependencies": {
-    "zod": "^3.24.1"
+    "@fuse/breaker-core": "workspace:*",
+    "@fuse/contracts": "workspace:*",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^10.16.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.0"
   }

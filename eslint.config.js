@@ -2,6 +2,7 @@ import js from '@eslint/js';
 import tseslint from '@typescript-eslint/eslint-plugin';
 import tsParser from '@typescript-eslint/parser';
 import prettierConfig from 'eslint-config-prettier';
+import globals from 'globals';
 
 export default [
   js.configs.recommended,
@@ -12,6 +13,7 @@ export default [
       parserOptions: {
         project: true,
       },
+      globals: globals.node,
     },
     plugins: {
       '@typescript-eslint': tseslint,
@@ -22,7 +24,6 @@ export default [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
-      'no-console': ['warn', { allow: ['warn', 'error'] }],
     },
   },
   prettierConfig,

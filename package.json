@@ -18,8 +18,10 @@
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
     "test": "pnpm -r --if-present run test",
+    "test:integration": "pnpm -r --if-present run test:integration",
     "test:coverage": "pnpm -r --if-present run test:coverage",
-    "check": "pnpm run format && pnpm run lint && pnpm run typecheck && pnpm run test"
+    "check": "pnpm run format && pnpm run lint && pnpm run build && pnpm run typecheck && pnpm run test",
+    "check:full": "pnpm run check && pnpm run test:integration"
   },
   "devDependencies": {
     "@eslint/js": "^9.18.0",
@@ -28,6 +30,7 @@
     "@typescript-eslint/parser": "^8.20.0",
     "eslint": "^9.18.0",
     "eslint-config-prettier": "^9.1.0",
+    "globals": "^15.14.0",
     "prettier": "^3.4.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.0"

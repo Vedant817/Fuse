@@ -3,3 +3,9 @@ dist
 build
 coverage
 pnpm-lock.yaml
+
+# Pre-existing hackathon-brief/tracker prose, authored outside this
+# toolchain's formatting conventions; edits should preserve their existing
+# style rather than being wholesale-reformatted.
+Fuse_Hackathon_Brief.md
+task.md
