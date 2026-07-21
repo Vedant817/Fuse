@@ -8,6 +8,7 @@
   "references": [
     { "path": "../../packages/contracts" },
     { "path": "../../packages/breaker-core" },
-    { "path": "../../packages/breaker-store" }
+    { "path": "../../packages/breaker-store" },
+    { "path": "../../packages/preflight" }
   ]
 }

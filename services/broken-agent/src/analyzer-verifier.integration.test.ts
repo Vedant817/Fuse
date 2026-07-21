@@ -6,7 +6,7 @@ import {
 import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '@fuse/control-plane';
-import { BreakerStore, runMigrations } from '@fuse/breaker-store';
+import { BreakerStore, PreflightStore, runMigrations } from '@fuse/breaker-store';
 import type { Scope } from '@fuse/contracts';
 import { FuseGuard } from '@fuse/sdk';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -30,8 +30,10 @@ describe('runAnalyzerVerifier against a real control plane: breaker trip mid-run
     pool = new pg.Pool({ connectionString: pgContainer.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    const preflightStore = new PreflightStore(pool);
     controlPlane = await buildApp({
       store,
+      preflightStore,
       pool,
       config: {
         port: 0,

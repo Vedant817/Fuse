@@ -6,7 +6,7 @@ import {
 import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '@fuse/control-plane';
-import { BreakerStore, runMigrations } from '@fuse/breaker-store';
+import { BreakerStore, PreflightStore, runMigrations } from '@fuse/breaker-store';
 import type { Scope } from '@fuse/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FuseGuard } from '../guard.js';
@@ -43,8 +43,10 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
     pool = new pg.Pool({ connectionString: pgContainer.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    const preflightStore = new PreflightStore(pool);
     controlPlane = await buildApp({
       store,
+      preflightStore,
       pool,
       config: {
         port: 0,

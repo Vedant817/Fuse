@@ -5,9 +5,5 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "references": [
-    { "path": "../contracts" },
-    { "path": "../breaker-core" },
-    { "path": "../preflight" }
-  ]
+  "references": [{ "path": "../contracts" }]
 }

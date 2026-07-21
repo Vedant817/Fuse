@@ -66,6 +66,9 @@ importers:
       '@fuse/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@fuse/preflight':
+        specifier: workspace:*
+        version: link:../preflight
       pg:
         specifier: ^8.13.1
         version: 8.22.0
@@ -151,6 +154,19 @@ importers:
       '@opentelemetry/sdk-trace-base':
         specifier: ^2.9.0
         version: 2.9.0(@opentelemetry/api@1.9.1)
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@24.13.3)(tsx@4.23.1)(yaml@2.9.0)
+
+  packages/preflight:
+    dependencies:
+      '@fuse/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+    devDependencies:
       typescript:
         specifier: ^5.7.3
         version: 5.9.3
@@ -252,6 +268,9 @@ importers:
       '@fuse/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@fuse/preflight':
+        specifier: workspace:*
+        version: link:../../packages/preflight
       fastify:
         specifier: ^5.2.1
         version: 5.10.0

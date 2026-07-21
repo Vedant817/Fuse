@@ -6,7 +6,7 @@ import {
 import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { runMigrations, BreakerStore } from '@fuse/breaker-store';
+import { runMigrations, BreakerStore, PreflightStore } from '@fuse/breaker-store';
 import type { Scope } from '@fuse/contracts';
 import { buildApp } from './app.js';
 import type { ControlPlaneConfig } from './config.js';
@@ -47,7 +47,8 @@ describe('control-plane HTTP API (Postgres integration)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
-    app = await buildApp({ store, pool, config: CONFIG });
+    const preflightStore = new PreflightStore(pool);
+    app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
   }, 120_000);
 
@@ -261,8 +262,10 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    const preflightStore = new PreflightStore(pool);
     app = await buildApp({
       store,
+      preflightStore,
       pool,
       config: {
         port: 0,

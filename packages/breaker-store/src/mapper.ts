@@ -3,6 +3,9 @@ import type {
   BreakerAuditEvent,
   BreakerRecord,
   BreakerState,
+  PreflightReasonCode,
+  PreflightResult,
+  PreflightState,
   Scope,
 } from '@fuse/contracts';
 
@@ -70,5 +73,37 @@ export function rowToAuditEvent(row: BreakerAuditRow): BreakerAuditEvent {
     policyVersion: row.policy_version,
     noop: row.noop,
     createdAt: row.created_at.toISOString(),
+  };
+}
+
+export interface PreflightStateRow {
+  tenant: string;
+  environment: string;
+  agent_id: string;
+  state: PreflightState;
+  reason_code: PreflightReasonCode;
+  reason: string;
+  evaluated_at: Date;
+  last_good_at: Date | null;
+  required_field_coverage_percent: number;
+  orphan_rate_percent: number;
+  freshness_ms: string | null; // BIGINT comes back as string from node-postgres
+  pending_recovery_state: PreflightState | null;
+  pending_since: Date | null;
+}
+
+export function rowToPreflightResult(row: PreflightStateRow): PreflightResult {
+  return {
+    scope: { tenant: row.tenant, environment: row.environment, agentId: row.agent_id },
+    state: row.state,
+    reasonCode: row.reason_code,
+    reason: row.reason,
+    evaluatedAt: row.evaluated_at.toISOString(),
+    lastGoodAt: row.last_good_at ? row.last_good_at.toISOString() : null,
+    requiredFieldCoveragePercent: row.required_field_coverage_percent,
+    orphanRatePercent: row.orphan_rate_percent,
+    freshnessMs: row.freshness_ms !== null ? Number(row.freshness_ms) : null,
+    pendingRecoveryState: row.pending_recovery_state,
+    pendingSince: row.pending_since ? row.pending_since.toISOString() : null,
   };
 }

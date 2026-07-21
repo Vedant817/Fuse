@@ -24,6 +24,7 @@
     "@fuse/breaker-core": "workspace:*",
     "@fuse/breaker-store": "workspace:*",
     "@fuse/contracts": "workspace:*",
+    "@fuse/preflight": "workspace:*",
     "@fastify/rate-limit": "^10.2.2",
     "fastify": "^5.2.1",
     "pg": "^8.13.1",

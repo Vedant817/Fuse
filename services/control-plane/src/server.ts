@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { BreakerStore } from '@fuse/breaker-store';
+import { BreakerStore, PreflightStore } from '@fuse/breaker-store';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 
@@ -21,7 +21,8 @@ async function main(): Promise<void> {
   await assertSchemaReady(pool);
 
   const store = new BreakerStore(pool);
-  const app = await buildApp({ store, pool, config });
+  const preflightStore = new PreflightStore(pool);
+  const app = await buildApp({ store, preflightStore, pool, config });
 
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info({ signal }, 'shutting down');

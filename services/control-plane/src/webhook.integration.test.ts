@@ -6,7 +6,7 @@ import {
 import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { BreakerStore, runMigrations } from '@fuse/breaker-store';
+import { BreakerStore, PreflightStore, runMigrations } from '@fuse/breaker-store';
 import { buildApp } from './app.js';
 import type { ControlPlaneConfig } from './config.js';
 
@@ -41,7 +41,8 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
-    app = await buildApp({ store, pool, config: CONFIG });
+    const preflightStore = new PreflightStore(pool);
+    app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
   }, 120_000);
 
