@@ -1,7 +1,7 @@
 import { FuseGuard } from '@fuse/sdk';
 import { describe, expect, it, vi } from 'vitest';
 import { runAnalyzerVerifier } from './analyzer-verifier.js';
-import { ABSOLUTE_MAX_CALLS } from './safety.js';
+import { ABSOLUTE_MAX_CALLS, ABSOLUTE_MAX_TOTAL_TOKENS } from './safety.js';
 import type { Model } from './types.js';
 
 function allowingGuard(): FuseGuard {
@@ -193,5 +193,33 @@ describe('runAnalyzerVerifier', () => {
     });
     expect(result.stopReason).toBe('safety-ceiling');
     expect(result.totalCalls).toBe(1); // caught right after the offending call, not on round 2
+  });
+
+  it('a NaN maxTotalTokens config does not disable the token ceiling', async () => {
+    // Regression for a `clampCeilings` bug: `Math.min(NaN, absoluteMax)` is
+    // `NaN`, and every `totalTokens >= ceilings.maxTotalTokens` check is
+    // then `false` (comparisons against NaN are always false) — so a NaN
+    // config value silently disabled the token ceiling instead of falling
+    // back to the absolute maximum. Before the fix, this ran all 20 calls
+    // (never stopping on the ceiling); after the fix it stops once
+    // cumulative tokens reach ABSOLUTE_MAX_TOTAL_TOKENS (10 calls of 30k).
+    const model: Model = {
+      call: vi.fn().mockResolvedValue({
+        content: 'Needs revision: still not there.',
+        inputTokens: 15_000,
+        outputTokens: 15_000,
+      }),
+    };
+    const result = await runAnalyzerVerifier({
+      scenario: 'normal',
+      seed: 1,
+      guard: allowingGuard(),
+      model,
+      maxCalls: 20,
+      maxTotalTokens: NaN,
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    expect(result.totalCalls).toBe(10);
+    expect(result.totalTokens).toBeLessThanOrEqual(ABSOLUTE_MAX_TOTAL_TOKENS);
   });
 });

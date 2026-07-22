@@ -22,21 +22,31 @@ export interface Ceilings {
   maxSpendUsd: number;
 }
 
+/**
+ * `Math.min(configured, absoluteMax)` only "tightens" when `configured` is
+ * an ordinary comparable number. `NaN` poisons `Math.min` (it returns
+ * `NaN`, not `absoluteMax`), and every `>=` comparison against `NaN` in the
+ * run loop below is `false` — so a `NaN` ceiling doesn't tighten to zero
+ * dispatches, it silently disables that ceiling's check for the rest of the
+ * run. `+Infinity`/`-Infinity` happen to be handled correctly by `Math.min`
+ * already, but are rejected here too for the same "reject non-finite
+ * input outright" reasoning rather than relying on that being incidental.
+ * Any non-finite `configured` value is treated as absent (falls back to
+ * the absolute maximum), never as "no limit."
+ */
+function clampCeiling(configured: number | undefined, absoluteMax: number): number {
+  if (configured === undefined || !Number.isFinite(configured)) {
+    return absoluteMax;
+  }
+  return Math.min(configured, absoluteMax);
+}
+
 export function clampCeilings(configured: SafetyCeilingsConfig): Ceilings {
   return {
-    maxCalls: Math.min(configured.maxCalls ?? ABSOLUTE_MAX_CALLS, ABSOLUTE_MAX_CALLS),
-    maxRuntimeMs: Math.min(
-      configured.maxRuntimeMs ?? ABSOLUTE_MAX_RUNTIME_MS,
-      ABSOLUTE_MAX_RUNTIME_MS,
-    ),
-    maxTotalTokens: Math.min(
-      configured.maxTotalTokens ?? ABSOLUTE_MAX_TOTAL_TOKENS,
-      ABSOLUTE_MAX_TOTAL_TOKENS,
-    ),
-    maxSpendUsd: Math.min(
-      configured.maxSpendUsd ?? ABSOLUTE_MAX_SPEND_USD,
-      ABSOLUTE_MAX_SPEND_USD,
-    ),
+    maxCalls: clampCeiling(configured.maxCalls, ABSOLUTE_MAX_CALLS),
+    maxRuntimeMs: clampCeiling(configured.maxRuntimeMs, ABSOLUTE_MAX_RUNTIME_MS),
+    maxTotalTokens: clampCeiling(configured.maxTotalTokens, ABSOLUTE_MAX_TOTAL_TOKENS),
+    maxSpendUsd: clampCeiling(configured.maxSpendUsd, ABSOLUTE_MAX_SPEND_USD),
   };
 }
 
