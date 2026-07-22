@@ -189,6 +189,20 @@ describe('detectContextBloat', () => {
     ).not.toThrow();
   });
 
+  it('reports a finite, JSON-serializable score for growth starting from a legitimate zero-token first step (regression: used to emit Infinity, which JSON.stringify silently turns into null)', () => {
+    const steps: StepRecord[] = [0, 10, 20, 30].map((inputTokens, i) => ({
+      timestampMs: NOW_MS - (4 - i) * 1000,
+      canonicalShape: `s${i}`,
+      inputTokens,
+      outputTokens: 20,
+      estimatedCostUsd: 0.001,
+    }));
+    const result = detectContextBloat(SCOPE, steps, DEFAULT_CONTEXT_BLOAT_CONFIG, NOW);
+    expect(result.fired).toBe(true);
+    expect(Number.isFinite(result.score)).toBe(true);
+    expect(JSON.parse(JSON.stringify(result)).score).toBe(result.score);
+  });
+
   it('handles an empty window without crashing (missing token attributes / no data)', () => {
     const result = detectContextBloat(SCOPE, [], DEFAULT_CONTEXT_BLOAT_CONFIG, NOW);
     expect(result.fired).toBe(false);

@@ -75,7 +75,28 @@ export function detectContextBloat(
 
   const first = steps[0]!.inputTokens;
   const last = steps[steps.length - 1]!.inputTokens;
-  const ratio = first > 0 ? last / first : last > 0 ? Number.POSITIVE_INFINITY : 0;
+  // A zero-token first step (e.g. a cold-start step with no prompt yet)
+  // makes the growth ratio mathematically undefined, not merely large.
+  // This used to report `Infinity`, which `JSON.stringify` silently turns
+  // into `null` for every HTTP/DB consumer — DetectorResultSchema's
+  // `score: z.number()` (packages/contracts/src/detector.ts) has no
+  // `.finite()` guard to catch it, so a "fired: true" result would ship
+  // with a `null` score. Any growth from a true zero baseline is
+  // unambiguous bloat, so fire unconditionally, but report the absolute
+  // token count reached — a finite, serializable value — instead of a
+  // ratio that doesn't exist.
+  if (first === 0 && last > 0) {
+    return {
+      ...base,
+      fired: true,
+      score: last,
+      threshold: config.minGrowthRatio,
+      evidence: [
+        `input tokens grew from 0 to ${last} (undefined ratio, treated as unbounded growth)`,
+      ],
+    };
+  }
+  const ratio = first > 0 ? last / first : 0;
   if (ratio >= config.minGrowthRatio) {
     return {
       ...base,
