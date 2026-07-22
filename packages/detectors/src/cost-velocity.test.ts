@@ -123,4 +123,58 @@ describe('detectCostVelocity', () => {
     const result = detectCostVelocity(SCOPE, [], DEFAULT_COST_VELOCITY_CONFIG, NOW);
     expect(result.fired).toBe(false);
   });
+
+  it('documents (does not fix): a burst split evenly across the trailing-window boundary can hide real spend from a single evaluation — inherent to the fixed window, see task.md §4.4', () => {
+    const windowStartMs = NOW_MS - DEFAULT_COST_VELOCITY_CONFIG.windowMs;
+    const steps: StepRecord[] = [
+      // 3 calls just before the window edge — excluded from this evaluation.
+      {
+        timestampMs: windowStartMs - 3000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+      {
+        timestampMs: windowStartMs - 2000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+      {
+        timestampMs: windowStartMs - 1000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+      // 3 calls just after the window edge — the only ones this evaluation sees.
+      {
+        timestampMs: windowStartMs + 1000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+      {
+        timestampMs: windowStartMs + 2000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+      {
+        timestampMs: windowStartMs + 3000,
+        canonicalShape: 'a',
+        inputTokens: 100,
+        outputTokens: 100,
+        estimatedCostUsd: 0.1,
+      },
+    ];
+    // Genuine burst total ($0.60) is over the $0.50 threshold, but only the
+    // in-window half ($0.30) is summed, so the detector reports quiet.
+    const result = detectCostVelocity(SCOPE, steps, DEFAULT_COST_VELOCITY_CONFIG, NOW);
+    expect(result.fired).toBe(false);
+  });
 });

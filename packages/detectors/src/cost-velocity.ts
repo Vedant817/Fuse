@@ -31,6 +31,16 @@ export const DEFAULT_COST_VELOCITY_CONFIG: CostVelocityConfig = {
  * this slice — task.md §4.4 marks it optional and lower priority than a
  * working static-threshold detector. Revisit once real production traffic
  * history exists to learn from.
+ *
+ * Known characteristic (not a defect): this is a fixed, non-overlapping
+ * trailing window with no carry-over from the previous window, so a burst
+ * of real spend that straddles the window boundary can be under-counted by
+ * a single evaluation. In the worst case — spend split evenly across the
+ * boundary — up to just-under-2x `thresholdUsdPerWindow` in genuine spend
+ * can evade detection, because only the calls that happen to fall inside
+ * the current window are summed. Full mitigation requires either
+ * overlapping/sliding-window evaluation or the learned-baseline detector
+ * already deferred in task.md §4.4 (see above); neither is in scope here.
  */
 export function detectCostVelocity(
   scope: Scope,
