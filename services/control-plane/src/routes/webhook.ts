@@ -20,6 +20,7 @@ interface AlertOutcome {
   outcome:
     | 'tripped'
     | 'already-tripped'
+    | 'breaker-disabled'
     | 'resolved-observed'
     | 'unknown-scope'
     | 'cooldown-active'
@@ -135,10 +136,17 @@ export function registerWebhookRoutes(
                     : 'invalid-transition',
             });
           } else {
-            results.push({
-              fingerprint: alert.fingerprint,
-              outcome: tripResult.noop ? 'already-tripped' : 'tripped',
-            });
+            // `trip()` can only ever noop for one of these two reasons
+            // (see applyTrip in breaker-core/src/transitions.ts) — a
+            // disabled scope never actually tripped, so it must be
+            // reported distinctly from a scope that was genuinely already
+            // tripped by an earlier alert.
+            const outcome: AlertOutcome['outcome'] = !tripResult.noop
+              ? 'tripped'
+              : tripResult.noopReason === 'breaker-disabled'
+                ? 'breaker-disabled'
+                : 'already-tripped';
+            results.push({ fingerprint: alert.fingerprint, outcome });
           }
         } catch (err) {
           if (err instanceof IdempotencyConflictError) {

@@ -390,6 +390,81 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     expect(res.json().results[0].outcome).toBe('stale-alert');
   });
 
+  it('a genuinely already-tripped scope reports already-tripped, not breaker-disabled', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const labels = {
+      fuse_tenant: 't1',
+      fuse_environment: 'test',
+      fuse_agent_id: agentId,
+    };
+
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert({}, { labels, startsAt: new Date().toISOString() }),
+    });
+    expect(first.json().results[0]).toMatchObject({ outcome: 'tripped' });
+
+    // A second, distinct alert (different fingerprint/startsAt — not a
+    // replay) for the same already-tripped scope.
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert({}, { labels, startsAt: new Date().toISOString() }),
+    });
+    expect(second.json().results[0]).toMatchObject({ outcome: 'already-tripped' });
+
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(statusRes.json().record.state).toBe('tripped');
+  });
+
+  it('a disabled scope reports breaker-disabled on a fresh alert, not already-tripped, and stays disabled', async () => {
+    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const scope = { tenant: 't1', environment: 'test', agentId };
+
+    const disableRes = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/disable',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+      payload: {
+        scope,
+        reason: 'operator maintenance window',
+        actor: { type: 'manual', id: 'operator:test' },
+        correlationId: `disable-${randomUUID()}`,
+        idempotencyKey: `disable-${randomUUID()}`,
+      },
+    });
+    expect(disableRes.json().record.state).toBe('disabled');
+
+    const webhookRes = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          startsAt: new Date().toISOString(),
+        },
+      ),
+    });
+    expect(webhookRes.statusCode).toBe(200);
+    expect(webhookRes.json().results[0]).toMatchObject({ outcome: 'breaker-disabled' });
+
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(statusRes.json().record.state).toBe('disabled'); // never mutated by the webhook
+  });
+
   it('accepts an alert comfortably within the freshness window', async () => {
     const agentId = `agent-${randomUUID().slice(0, 8)}`;
     const freshStartsAt = new Date(Date.now() - 60 * 1000).toISOString(); // 1 min ago
