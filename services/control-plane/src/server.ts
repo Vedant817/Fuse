@@ -3,6 +3,7 @@ import { BreakerStore, PreflightStore, createPool } from '@fuse/breaker-store';
 import { bootstrapOtel, type FuseOtelHandle } from '@fuse/otel';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
+import { createShutdownHandler } from './shutdown.js';
 
 async function assertSchemaReady(pool: pg.Pool): Promise<void> {
   try {
@@ -48,13 +49,13 @@ async function main(): Promise<void> {
   const preflightStore = new PreflightStore(pool);
   const app = await buildApp({ store, preflightStore, pool, config });
 
-  const shutdown = async (signal: string): Promise<void> => {
-    app.log.info({ signal }, 'shutting down');
-    await app.close();
-    await pool.end();
-    await otel.shutdown();
-    process.exit(0);
-  };
+  const shutdown = createShutdownHandler({
+    log: app.log,
+    closeApp: () => app.close(),
+    closePool: () => pool.end(),
+    shutdownOtel: () => otel.shutdown(),
+    exit: (code) => process.exit(code),
+  });
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
 

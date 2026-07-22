@@ -409,14 +409,11 @@ already existed to test it against realistically.
   `packages/sdk/src/providers/` — a shared `OpenAiCompatibleProvider` class
   plus `createGroqProvider`/`createNvidiaBuildProvider` factories (both
   platforms expose an OpenAI-compatible `/chat/completions` API; base
-  URLs/auth verified against each platform's current docs). No credentials
-  are available in this environment, so live verification against the real
-  APIs remains blocked (tracked below and in §12); the adapter logic itself
-  is fully built and tested against a faithful local mock
-  (`openai-compatible-mock.ts`), and a live-optional test
-  (`groq.live.test.ts`/`nvidia-build.live.test.ts`) is ready to run the
-  moment `GROQ_API_KEY`/`NVIDIA_API_KEY` are exported — no code changes
-  needed.
+  URLs/auth verified against each platform's current docs). The adapter logic
+  is tested against a faithful local mock (`openai-compatible-mock.ts`) and,
+  after credentials were supplied on 2026-07-23, against both real APIs:
+  `pnpm --filter @fuse/sdk run test:live` passed the Groq and NVIDIA Build
+  smoke tests with non-empty content and positive token usage.
 - [x] Check a permit immediately before provider dispatch, after expensive
   local preparation where practical but before network bytes can be sent.
   Evidence: `guard()` always calls `checkPermit()` and returns/throws before
@@ -459,13 +456,11 @@ already existed to test it against realistically.
   network-listening HTTP servers (not in-process function-call counters)
   — `packages/sdk/src/providers/openai-compatible.integration.test.ts`
   runs the actual `OpenAiCompatibleProvider` class (the same code a real
-  Groq/NVIDIA call would use) through `FuseGuard` against the mock,
-  proving the concrete adapter's request/auth/response handling — not just
-  the generic dispatch-wrapper contract — respects the breaker. A live run
-  against the real Groq/NVIDIA APIs remains blocked on credentials (see
-  above); tracked as a deferred P1 in §12, target milestone: whenever
-  `GROQ_API_KEY`/`NVIDIA_API_KEY` become available (the test is
-  pre-written and gated to run automatically once they are).
+  Groq/NVIDIA call would use) through `FuseGuard` against the mock, proving
+  the concrete adapter's request/auth/response handling — not just the
+  generic dispatch-wrapper contract — respects the breaker. Real API evidence
+  was added on 2026-07-23: both live provider tests passed, and the narrated
+  demo made a guarded Groq call after a real HTTP 200 permit decision.
 
 ### 2.3 Hardcoded trigger proof
 
@@ -602,8 +597,11 @@ Acceptance criteria:
   Preflight status; optionally a real Groq/NVIDIA call when
   `GROQ_API_KEY`/`NVIDIA_API_KEY` is set. Fails fast with setup
   instructions if the control plane isn't reachable. Manually run
-  end-to-end against a real Postgres + real control-plane process (not
-  just `app.inject()`) — output verified to be accurate and legible.
+  end-to-end against a real Postgres + real control-plane process (not just
+  `app.inject()`) — output verified to be accurate and legible. Re-run with
+  real credentials on 2026-07-23: Act 6 returned a Groq
+  `llama-3.1-8b-instant` response with 47 total tokens; Postgres independently
+  recorded the generated `agent-real-llm-*` guard scope as `armed`, epoch 0.
   Found and fixed one real bug during this verification: the OTel
   shutdown/flush at the end originally threw uncaught when no OTLP
   collector was reachable (a fully valid, unconfigured-by-default state —
@@ -1408,11 +1406,9 @@ Add dated entries here rather than leaving important context only in chat.
   Real LLM provider adapters target Groq and NVIDIA Build (NIM),
   both via a shared OpenAI-compatible `/chat/completions` client
   (`packages/sdk/src/providers/`), chosen explicitly by the user over the
-  initially-assumed Anthropic/OpenAI default. No credentials for either are
-  available in this environment; the adapters are built and verified
-  against a faithful local mock, with live-optional tests
-  (`*.live.test.ts`) ready to run the moment `GROQ_API_KEY`/
-  `NVIDIA_API_KEY` are exported — no code changes needed. See
+  initially-assumed Anthropic/OpenAI default. The adapters are verified
+  against both a faithful local mock and, as of 2026-07-23, the real Groq and
+  NVIDIA Build APIs via the 2/2 passing live-optional tests. See
   `docs/adr/003-llm-provider-adapters.md`.
 - 2026-07-21 (ADR-005, explicit user choice — reverses the SigNoz Cloud
   entry above): self-hosted SigNoz via Foundry (`foundryctl`), the current
@@ -1722,8 +1718,8 @@ Add dated entries here rather than leaving important context only in chat.
   config execution reports port 8090 and 120/60000 limiter defaults.
 - 2026-07-23 (final independent-audit gate): deleted all workspace `dist`
   directories and `.tsbuildinfo` files, then ran `pnpm install` (`Already up
-  to date`), `pnpm run check` (format, lint, all 9 builds/typechecks, 256/256
-  unit tests across 26 files), and `pnpm run test:integration` (83/83 tests
+  to date`), `pnpm run check` (format, lint, all 9 builds/typechecks, 258/258
+  unit tests across 27 files), and `pnpm run test:integration` (83/83 tests
   across 10 files against Testcontainers Postgres). The first integration
   attempt after the clean build found that the local OrbStack daemon had
   stopped (`Could not find a working container runtime strategy`); after
@@ -1736,6 +1732,16 @@ Add dated entries here rather than leaving important context only in chat.
   secondary `Cannot read properties of undefined (reading 'end')` error that
   obscures diagnostics. This does not affect application runtime or the
   container-available test path.
+- 2026-07-23 (live-provider follow-up): after Groq and NVIDIA credentials were
+  supplied, both real-provider SDK smoke tests passed and the full narrated
+  demo completed with a guarded real Groq call. This run exposed a P2 graceful
+  shutdown race: one Ctrl-C delivered duplicate `SIGINT` notifications through
+  `tsx watch`, so shutdown called `pool.end()` twice and crashed with
+  `Error: Called end on pool more than once`. Shutdown is now memoized and
+  idempotent, attempts all cleanup stages even if one fails, and exits nonzero
+  on cleanup failure. Evidence: 2 focused shutdown tests, the 57-test
+  control-plane unit suite, build/typecheck, and a real start/Ctrl-C cycle that
+  logged one shutdown and exited 0 without a stack trace.
 
 ### Open blockers and risks
 
