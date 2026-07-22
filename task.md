@@ -1728,9 +1728,10 @@ Add dated entries here rather than leaving important context only in chat.
   attempt after the clean build found that the local OrbStack daemon had
   stopped (`Could not find a working container runtime strategy`); after
   restarting OrbStack, the unchanged suite passed in full. Optional live
-  provider tests were also executed and honestly skipped 2/2 because neither
-  provider credential is present. **P3 (not fixed):** that failed-startup path
-  also exposed a test-harness cleanup defect in both breaker-store integration
+  provider tests initially skipped 2/2 because credentials were absent, then
+  passed 2/2 against the real Groq and NVIDIA Build endpoints after both keys
+  were supplied in `.env`. **P3 (not fixed):** that failed-startup path also
+  exposed a test-harness cleanup defect in both breaker-store integration
   suites: `afterAll` called `pool.end()` after `beforeAll` failed, producing a
   secondary `Cannot read properties of undefined (reading 'end')` error that
   obscures diagnostics. This does not affect application runtime or the
@@ -1754,11 +1755,11 @@ Add dated entries here rather than leaving important context only in chat.
   route — only `/api/v1/register` was confirmed reachable), so no alert
   rule was actually created through it. MCP capabilities and Slack
   workspace remain unselected.
-- No real LLM provider credentials (`GROQ_API_KEY`/`NVIDIA_API_KEY`) are
-  available in this environment; the live-optional provider tests
-  (`packages/sdk/src/providers/*.live.test.ts`) are written and will run
-  automatically the moment either is supplied — no code changes needed.
-  The complete mock path is built and verified in the meantime.
+- **Resolved (2026-07-23):** both real LLM provider credentials are available
+  locally. `set -a; source .env; set +a; pnpm --filter @fuse/sdk run test:live`
+  passed both live smoke tests (Groq: 184 ms; NVIDIA Build: 481 ms), each
+  returning non-empty content and positive token usage. Keys remain ignored
+  local configuration and were not printed or committed.
 - `docs/threat-model.md` (§1.2) surfaced two security gaps, both now fixed:
   token-to-tenant binding (ADR-004 — opt-in, so a deployment that never
   migrates to `tenant:token` config entries remains exactly as exposed as

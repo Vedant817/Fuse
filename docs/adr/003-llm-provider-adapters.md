@@ -66,9 +66,10 @@ providers/openai-compatible-mock.ts`) and exercises the full
 
 ## Consequences
 
-- Real-provider verification remains blocked until `GROQ_API_KEY` and/or
-  `NVIDIA_API_KEY` are supplied; this is a documented, tracked gap
-  (task.md §2.2, §12), not a silent shortcut.
+- Real-provider verification completed on 2026-07-23: with both credentials
+  exported from the local `.env`, `pnpm --filter @fuse/sdk run test:live`
+  passed 2/2 tests against the real Groq and NVIDIA Build endpoints. The tests
+  remain optional and self-skip when their corresponding key is absent.
 - The demo/broken-agent fixture (task.md §3.1) will choose one of these
   two providers (or both) for its default non-mocked path and must apply
   its own hard safety ceilings (call/runtime/token/spend limits) on top of

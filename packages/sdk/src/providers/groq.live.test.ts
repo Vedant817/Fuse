@@ -4,9 +4,9 @@ import { createGroqProvider } from './groq.js';
 /**
  * Live smoke test against the real Groq API — the "one controlled
  * integration test against a real provider" task.md §2.2 asks for.
- * Skipped automatically when GROQ_API_KEY is not set (which is the case
- * in this build environment); requires zero code changes to run once a
- * key is exported. Run with: GROQ_API_KEY=... pnpm --filter @fuse/sdk run test:live
+ * Skipped automatically when GROQ_API_KEY is not set; requires zero code
+ * changes to run once a key is exported. Run with:
+ * GROQ_API_KEY=... pnpm --filter @fuse/sdk run test:live
  */
 const apiKey = process.env['GROQ_API_KEY'];
 
