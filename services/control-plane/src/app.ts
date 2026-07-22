@@ -96,7 +96,15 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   registerPermitRoute(app, deps.store, deps.config.storeOutageMode);
   registerBreakerRoutes(app, deps.store);
   registerWebhookRoutes(app, deps.store, deps.config);
-  registerPreflightRoutes(app, deps.preflightStore);
+  registerPreflightRoutes(app, deps.preflightStore, {
+    windowMs: deps.config.preflightWindowMs,
+    blindCoverageThreshold: deps.config.preflightBlindCoverageThreshold,
+    blindOrphanRateThreshold: deps.config.preflightBlindOrphanRateThreshold,
+    blindTokenMissingRateThreshold: deps.config.preflightBlindTokenMissingRateThreshold,
+    heartbeatGraceMs: deps.config.preflightHeartbeatGraceMs,
+    maxEvidenceStalenessMs: deps.config.preflightMaxEvidenceStalenessMs,
+    minRecoveryDwellMs: deps.config.preflightMinRecoveryDwellMs,
+  });
 
   app.setErrorHandler((err, request, reply) => {
     if (reply.sent) return;

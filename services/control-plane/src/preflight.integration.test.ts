@@ -19,6 +19,10 @@ const CONFIG: ControlPlaneConfig = {
   logLevel: 'silent',
   deploymentEnvironment: 'test',
   databaseUrl: '',
+  dbPoolMax: 10,
+  dbPoolIdleTimeoutMs: 30_000,
+  dbPoolConnectionTimeoutMs: 2_000,
+  dbStatementTimeoutMs: 5_000,
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],
   agentApiTokens: [AGENT_TOKEN],
@@ -27,6 +31,13 @@ const CONFIG: ControlPlaneConfig = {
   webhookDefaultCooldownSeconds: 300,
   webhookMaxAlertAgeMs: 600_000,
   webhookMaxClockSkewAheadMs: 60_000,
+  preflightWindowMs: 5 * 60_000,
+  preflightBlindCoverageThreshold: 0.5,
+  preflightBlindOrphanRateThreshold: 0.5,
+  preflightBlindTokenMissingRateThreshold: 0.3,
+  preflightHeartbeatGraceMs: 2 * 60_000,
+  preflightMaxEvidenceStalenessMs: 5 * 60_000,
+  preflightMinRecoveryDwellMs: 60_000,
 };
 
 function healthySpan(timestampMs: number) {
@@ -46,6 +57,10 @@ describe('Preflight API (real Postgres + control plane)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  // Same store/pool, but built with a widened preflightMaxEvidenceStalenessMs
+  // — proves the configured Preflight thresholds are actually wired into the
+  // live HTTP route, not just parsed correctly in config.ts isolation.
+  let appWidenedStaleness: FastifyInstance;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -59,10 +74,18 @@ describe('Preflight API (real Postgres + control plane)', () => {
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
+    appWidenedStaleness = await buildApp({
+      store,
+      preflightStore,
+      pool,
+      config: { ...CONFIG, preflightMaxEvidenceStalenessMs: 20 * 60_000 },
+    });
+    await appWidenedStaleness.ready();
   }, 120_000);
 
   afterAll(async () => {
     await app.close();
+    await appWidenedStaleness.close();
     await pool.end();
     await container.stop();
   });
@@ -238,5 +261,32 @@ describe('Preflight API (real Postgres + control plane)', () => {
       payload: { scope: s, spans: [healthySpan(Date.now())], disabled: false },
     });
     expect(reenable.json().result.state).toBe('protected');
+  });
+
+  it('a configured, non-default preflightMaxEvidenceStalenessMs changes evaluator behavior end-to-end through the real HTTP route', async () => {
+    // 6 minutes old: stale under the 5-minute DEFAULT_PREFLIGHT_CONFIG
+    // window, but current under a 20-minute operator-configured override —
+    // this is the exact scenario the fix targets (a low-traffic/bursty
+    // agent that would otherwise always read `blind` under a fixed window).
+    const staleSpanTimestamp = Date.now() - 6 * 60_000;
+
+    const defaultScope = scope();
+    const defaultRes = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: defaultScope, spans: [healthySpan(staleSpanTimestamp)] },
+    });
+    expect(defaultRes.json().result.state).toBe('blind');
+    expect(defaultRes.json().result.reasonCode).toBe('stale-evidence');
+
+    const widenedScope = scope();
+    const widenedRes = await appWidenedStaleness.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: widenedScope, spans: [healthySpan(staleSpanTimestamp)] },
+    });
+    expect(widenedRes.json().result.state).toBe('protected');
   });
 });

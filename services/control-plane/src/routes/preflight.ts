@@ -5,7 +5,7 @@ import {
   ScopeSchema,
 } from '@fuse/contracts';
 import { StoreUnavailableError, type PreflightStore } from '@fuse/breaker-store';
-import { DEFAULT_PREFLIGHT_CONFIG } from '@fuse/preflight';
+import type { PreflightEvaluatorConfig } from '@fuse/preflight';
 
 function correlationIdOf(request: FastifyRequest): string {
   const header = request.headers['x-correlation-id'];
@@ -32,6 +32,7 @@ function handleStoreError(
 export function registerPreflightRoutes(
   app: FastifyInstance,
   store: PreflightStore,
+  config: PreflightEvaluatorConfig,
 ): void {
   app.post('/v1/preflight/report', async (request, reply) => {
     const correlationId = correlationIdOf(request);
@@ -50,7 +51,7 @@ export function registerPreflightRoutes(
         scope: parsed.data.scope,
         spans: parsed.data.spans,
         heartbeat: parsed.data.heartbeat,
-        config: DEFAULT_PREFLIGHT_CONFIG,
+        config,
         disabled: parsed.data.disabled,
         disabledReason: parsed.data.disabledReason,
       });

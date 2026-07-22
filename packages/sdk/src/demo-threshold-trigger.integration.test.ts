@@ -60,6 +60,17 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
         webhookDefaultCooldownSeconds: 300,
         webhookMaxAlertAgeMs: 600_000,
         webhookMaxClockSkewAheadMs: 60_000,
+        dbPoolMax: 10,
+        dbPoolIdleTimeoutMs: 30_000,
+        dbPoolConnectionTimeoutMs: 2_000,
+        dbStatementTimeoutMs: 5_000,
+        preflightWindowMs: 5 * 60_000,
+        preflightBlindCoverageThreshold: 0.5,
+        preflightBlindOrphanRateThreshold: 0.5,
+        preflightBlindTokenMissingRateThreshold: 0.3,
+        preflightHeartbeatGraceMs: 2 * 60_000,
+        preflightMaxEvidenceStalenessMs: 5 * 60_000,
+        preflightMinRecoveryDwellMs: 60_000,
       },
     });
     await controlPlane.listen({ port: 0, host: '127.0.0.1' });

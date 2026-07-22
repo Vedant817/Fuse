@@ -37,6 +37,15 @@ const ConfigSchema = z.object({
    * identifies the AGENT's environment, not the control plane's own. */
   deploymentEnvironment: z.string().min(1).default('development'),
   databaseUrl: z.string().min(1),
+  /** Postgres pool sizing/timeouts for the pool that gates every /v1/permit
+   * check. Defaults below are byte-for-byte the hardcoded values
+   * `@fuse/breaker-store`'s `createPool` falls back to on its own — set
+   * here only to give operators an env-var override without editing source,
+   * not to change default behavior. */
+  dbPoolMax: z.number().int().positive().default(10),
+  dbPoolIdleTimeoutMs: z.number().int().positive().default(30_000),
+  dbPoolConnectionTimeoutMs: z.number().int().positive().default(2_000),
+  dbStatementTimeoutMs: z.number().int().positive().default(5_000),
   /** Behavior for the /permit fast path only, when the store cannot be
    * reached. Mutating endpoints (trip/resume/disable/enable) always fail
    * with 503 on store outage regardless of this setting — a control
@@ -88,6 +97,31 @@ const ConfigSchema = z.object({
    * (clock skew between SigNoz and the control plane) before it is
    * treated as suspicious/malformed rather than merely fresh. */
   webhookMaxClockSkewAheadMs: z.number().int().nonnegative().default(60_000),
+  /** Preflight evaluator thresholds for the /v1/preflight/report route.
+   * Defaults below are byte-for-byte `@fuse/preflight`'s own
+   * `DEFAULT_PREFLIGHT_CONFIG` — set here only to give operators an
+   * env-var override (e.g. a legitimately low-traffic/bursty agent needing
+   * a wider freshness window) without editing source, not to change
+   * default behavior. */
+  preflightWindowMs: z
+    .number()
+    .int()
+    .positive()
+    .default(5 * 60_000),
+  preflightBlindCoverageThreshold: z.number().min(0).max(1).default(0.5),
+  preflightBlindOrphanRateThreshold: z.number().min(0).max(1).default(0.5),
+  preflightBlindTokenMissingRateThreshold: z.number().min(0).max(1).default(0.3),
+  preflightHeartbeatGraceMs: z
+    .number()
+    .int()
+    .positive()
+    .default(2 * 60_000),
+  preflightMaxEvidenceStalenessMs: z
+    .number()
+    .int()
+    .positive()
+    .default(5 * 60_000),
+  preflightMinRecoveryDwellMs: z.number().int().positive().default(60_000),
 });
 export type ControlPlaneConfig = z.infer<typeof ConfigSchema>;
 
@@ -125,6 +159,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     logLevel: env['LOG_LEVEL'],
     deploymentEnvironment: env['CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT'],
     databaseUrl: env['DATABASE_URL'],
+    dbPoolMax: env['CONTROL_PLANE_DB_POOL_MAX']
+      ? Number(env['CONTROL_PLANE_DB_POOL_MAX'])
+      : undefined,
+    dbPoolIdleTimeoutMs: env['CONTROL_PLANE_DB_POOL_IDLE_TIMEOUT_MS']
+      ? Number(env['CONTROL_PLANE_DB_POOL_IDLE_TIMEOUT_MS'])
+      : undefined,
+    dbPoolConnectionTimeoutMs: env['CONTROL_PLANE_DB_POOL_CONNECTION_TIMEOUT_MS']
+      ? Number(env['CONTROL_PLANE_DB_POOL_CONNECTION_TIMEOUT_MS'])
+      : undefined,
+    dbStatementTimeoutMs: env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS']
+      ? Number(env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS'])
+      : undefined,
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,
     agentApiTokens,
@@ -138,6 +184,35 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
       : undefined,
     webhookMaxClockSkewAheadMs: env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS']
       ? Number(env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS'])
+      : undefined,
+    preflightWindowMs: env['CONTROL_PLANE_PREFLIGHT_WINDOW_MS']
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_WINDOW_MS'])
+      : undefined,
+    preflightBlindCoverageThreshold: env[
+      'CONTROL_PLANE_PREFLIGHT_BLIND_COVERAGE_THRESHOLD'
+    ]
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_BLIND_COVERAGE_THRESHOLD'])
+      : undefined,
+    preflightBlindOrphanRateThreshold: env[
+      'CONTROL_PLANE_PREFLIGHT_BLIND_ORPHAN_RATE_THRESHOLD'
+    ]
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_BLIND_ORPHAN_RATE_THRESHOLD'])
+      : undefined,
+    preflightBlindTokenMissingRateThreshold: env[
+      'CONTROL_PLANE_PREFLIGHT_BLIND_TOKEN_MISSING_RATE_THRESHOLD'
+    ]
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_BLIND_TOKEN_MISSING_RATE_THRESHOLD'])
+      : undefined,
+    preflightHeartbeatGraceMs: env['CONTROL_PLANE_PREFLIGHT_HEARTBEAT_GRACE_MS']
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_HEARTBEAT_GRACE_MS'])
+      : undefined,
+    preflightMaxEvidenceStalenessMs: env[
+      'CONTROL_PLANE_PREFLIGHT_MAX_EVIDENCE_STALENESS_MS'
+    ]
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_MAX_EVIDENCE_STALENESS_MS'])
+      : undefined,
+    preflightMinRecoveryDwellMs: env['CONTROL_PLANE_PREFLIGHT_MIN_RECOVERY_DWELL_MS']
+      ? Number(env['CONTROL_PLANE_PREFLIGHT_MIN_RECOVERY_DWELL_MS'])
       : undefined,
   });
   if (!parsed.success) {

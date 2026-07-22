@@ -35,7 +35,13 @@ async function main(): Promise<void> {
   // whole server) and connection/statement timeouts that @fuse/breaker-store
   // documents and tests — previously only test/CLI code paths constructed
   // pools this way; the actual server built its own, unguarded pool.
-  const pool = createPool({ connectionString: config.databaseUrl });
+  const pool = createPool({
+    connectionString: config.databaseUrl,
+    max: config.dbPoolMax,
+    idleTimeoutMillis: config.dbPoolIdleTimeoutMs,
+    connectionTimeoutMillis: config.dbPoolConnectionTimeoutMs,
+    statementTimeoutMillis: config.dbStatementTimeoutMs,
+  });
   await assertSchemaReady(pool);
 
   const store = new BreakerStore(pool);
