@@ -1,14 +1,15 @@
 import type { SafetyCeilingsConfig } from './types.js';
 
 /**
- * Hard, unconditional demo safety ceilings (task.md §3.1). These are
- * absolute in-code maximums, not defaults — `clampCeilings` only ever
- * *tightens* a caller-configured value, never loosens past these numbers.
- * A misconfigured `maxCalls: 999_999` cannot produce more than
- * `ABSOLUTE_MAX_CALLS` real dispatches; there is no environment variable
- * or config path that raises these ceilings. This is a backstop
- * independent of the breaker itself — even if enforcement were somehow
- * bypassed or misconfigured, the fixture still cannot run away.
+ * Unconditional demo stop thresholds (task.md §3.1). `maxCalls` is a true
+ * pre-dispatch hard cap: a misconfigured `maxCalls: 999_999` cannot produce
+ * more than `ABSOLUTE_MAX_CALLS` dispatches. Runtime, cumulative tokens, and
+ * estimated spend are checked before dispatch and again after a completed
+ * call where applicable, but an already-dispatched provider call cannot be
+ * cancelled or retroactively made cheaper. Those three thresholds may
+ * therefore be exceeded by at most one call's duration/usage; they are not
+ * strict upper bounds on provider-side consumption. There is no environment
+ * variable or config path that raises any configured threshold.
  */
 export const ABSOLUTE_MAX_CALLS = 60;
 export const ABSOLUTE_MAX_RUNTIME_MS = 30_000;
@@ -59,6 +60,7 @@ export function clampCeilings(configured: SafetyCeilingsConfig): Ceilings {
   };
 }
 
-/** A demo-only, clearly-labeled synthetic price — NOT any real provider's
- * actual pricing. The versioned real price table is task.md §3.2's job. */
+/** A demo-only, clearly-labeled synthetic price — NOT actual provider spend.
+ * This threshold is a deterministic safety proxy; provider billing remains
+ * authoritative. The versioned estimate table lives in @fuse/otel. */
 export const DEMO_PRICE_PER_TOKEN_USD = 0.000002;

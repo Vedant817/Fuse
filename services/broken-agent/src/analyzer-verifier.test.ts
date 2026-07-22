@@ -1,7 +1,11 @@
 import { FuseGuard } from '@fuse/sdk';
 import { describe, expect, it, vi } from 'vitest';
 import { runAnalyzerVerifier } from './analyzer-verifier.js';
-import { ABSOLUTE_MAX_CALLS, ABSOLUTE_MAX_TOTAL_TOKENS } from './safety.js';
+import {
+  ABSOLUTE_MAX_CALLS,
+  ABSOLUTE_MAX_SPEND_USD,
+  ABSOLUTE_MAX_TOTAL_TOKENS,
+} from './safety.js';
 import type { Model } from './types.js';
 
 function allowingGuard(): FuseGuard {
@@ -193,6 +197,29 @@ describe('runAnalyzerVerifier', () => {
     });
     expect(result.stopReason).toBe('safety-ceiling');
     expect(result.totalCalls).toBe(1); // caught right after the offending call, not on round 2
+  });
+
+  it('documents the one-in-flight-call token/spend overshoot limitation', async () => {
+    const model: Model = {
+      call: vi.fn().mockResolvedValue({
+        content: 'Needs revision.',
+        inputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      }),
+    };
+    const result = await runAnalyzerVerifier({
+      scenario: 'loop',
+      seed: 1,
+      guard: allowingGuard(),
+      model,
+      maxCalls: 999_999,
+      maxTotalTokens: 999_999_999,
+      maxSpendUsd: 999_999,
+    });
+    expect(result.stopReason).toBe('safety-ceiling');
+    expect(result.totalCalls).toBe(1);
+    expect(result.totalTokens).toBeGreaterThan(ABSOLUTE_MAX_TOTAL_TOKENS);
+    expect(result.estimatedSpendUsd).toBeGreaterThan(ABSOLUTE_MAX_SPEND_USD);
   });
 
   it('a NaN maxTotalTokens config does not disable the token ceiling', async () => {

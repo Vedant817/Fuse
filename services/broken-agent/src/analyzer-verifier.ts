@@ -16,9 +16,10 @@ const DEFAULT_REQUEST_MODEL = 'mock-model-v1';
  * Runs a generic Analyzer↔Verifier reflection loop (Analyzer drafts,
  * Verifier critiques or approves) through `FuseGuard`, so every model call
  * is subject to the same pre-call permit check any real agent would be.
- * Hard safety ceilings (`safety.ts`) are checked before every single call,
- * unconditionally — independent of the breaker's own state — so this
- * fixture cannot run away even if the breaker were somehow bypassed.
+ * Safety thresholds (`safety.ts`) are checked before every single call,
+ * unconditionally and independently of breaker state. Call count is a strict
+ * pre-dispatch cap; runtime/token/estimated-spend thresholds can overshoot by
+ * the one provider call already in flight, which cannot be cancelled here.
  *
  * The whole run is one `invoke_agent` gen_ai span; each round is a nested
  * `chat` span underneath it (task.md §3.2: "preserve trace context...

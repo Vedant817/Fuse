@@ -529,7 +529,7 @@ Acceptance criteria:
   has the same approve-quickly shape as `normal` but is paced with
   near-zero inter-round delay, producing an abnormally high calls/time
   rate.
-- [x] Add hard demo safety ceilings for calls, runtime, tokens, and actual
+- [~] Add hard demo safety ceilings for calls, runtime, tokens, and actual
   spend that cannot be disabled accidentally in a real-provider run.
   Evidence: `safety.ts`'s `clampCeilings` — every configured ceiling is
   `Math.min(configured, ABSOLUTE_MAX_*)`, so it can only ever be
@@ -547,7 +547,18 @@ Acceptance criteria:
   Fixed with a symmetric post-call token check; regression test "stops
   immediately (not one round late) when a single call pushes total tokens
   past the ceiling" configures a call that returns 100k tokens against an
-  80k ceiling and asserts `totalCalls === 1`, not 2.
+  80k ceiling and asserts `totalCalls === 1`, not 2. **Independent audit
+  correction (2026-07-23):** only `maxCalls` is a strict pre-dispatch hard
+  cap. Runtime, token, and synthetic estimated-spend thresholds can exceed
+  their in-code maxima by one already-dispatched call: a custom model returning
+  1M input + 1M output tokens produced 2M total tokens / $4 synthetic spend
+  before stopping, over the advertised 300k / $2 values. A provider call can
+  likewise run past the runtime threshold because this fixture has no
+  provider-cancellation contract. The spend value is explicitly estimated,
+  not actual provider billing. This remains `[~]` until provider adapters can
+  accept enforceable per-call token/time budgets; comments and regression
+  tests now state the one-call exposure honestly rather than claiming an
+  impossible strict bound after dispatch.
 - [x] Make the fixture deterministic with seed, scenario, iteration delay, and
   reset controls. Evidence: `RunConfig.{scenario, seed, iterationDelayMs}`
   fully determine output (no real randomness anywhere in `mock-model.ts`);
