@@ -33,9 +33,18 @@ export interface Ceilings {
  * input outright" reasoning rather than relying on that being incidental.
  * Any non-finite `configured` value is treated as absent (falls back to
  * the absolute maximum), never as "no limit."
+ *
+ * The same "treated as absent" rule applies to `configured <= 0`: a zero or
+ * negative value is a genuinely unusable ceiling (not a valid, tighter
+ * limit), so it falls back to `absoluteMax` too rather than passing through
+ * `Math.min` unmodified. Without this, a negative or zero ceiling would
+ * silently produce a 0-dispatch run reported as `stopReason:
+ * 'safety-ceiling'`, indistinguishable from genuine ceiling exhaustion. A
+ * real, positive configured value can only ever tighten the ceiling, never
+ * loosen it past `absoluteMax`.
  */
 function clampCeiling(configured: number | undefined, absoluteMax: number): number {
-  if (configured === undefined || !Number.isFinite(configured)) {
+  if (configured === undefined || !Number.isFinite(configured) || configured <= 0) {
     return absoluteMax;
   }
   return Math.min(configured, absoluteMax);

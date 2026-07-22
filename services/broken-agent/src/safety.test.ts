@@ -79,4 +79,39 @@ describe('clampCeilings', () => {
       maxSpendUsd: ABSOLUTE_MAX_SPEND_USD,
     });
   });
+
+  // Regression: a negative or zero `configured` value passed `Number.isFinite`
+  // and went straight into `Math.min(configured, absoluteMax)`, returning the
+  // negative/zero value unmodified instead of falling back to the absolute
+  // maximum — silently producing a 0-dispatch run indistinguishable from
+  // genuine ceiling exhaustion.
+  it('treats a negative configured value in every ceiling field as absent, not as a tighter limit', () => {
+    const result = clampCeilings({
+      maxCalls: -5,
+      maxRuntimeMs: -1,
+      maxTotalTokens: -100,
+      maxSpendUsd: -0.5,
+    });
+    expect(result).toEqual({
+      maxCalls: ABSOLUTE_MAX_CALLS,
+      maxRuntimeMs: ABSOLUTE_MAX_RUNTIME_MS,
+      maxTotalTokens: ABSOLUTE_MAX_TOTAL_TOKENS,
+      maxSpendUsd: ABSOLUTE_MAX_SPEND_USD,
+    });
+  });
+
+  it('treats a zero configured value in every ceiling field as absent, not as a tighter limit', () => {
+    const result = clampCeilings({
+      maxCalls: 0,
+      maxRuntimeMs: 0,
+      maxTotalTokens: 0,
+      maxSpendUsd: 0,
+    });
+    expect(result).toEqual({
+      maxCalls: ABSOLUTE_MAX_CALLS,
+      maxRuntimeMs: ABSOLUTE_MAX_RUNTIME_MS,
+      maxTotalTokens: ABSOLUTE_MAX_TOTAL_TOKENS,
+      maxSpendUsd: ABSOLUTE_MAX_SPEND_USD,
+    });
+  });
 });
