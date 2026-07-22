@@ -117,6 +117,21 @@ describe('control-plane HTTP API (Postgres integration)', () => {
     expect(res.json().error).toBe('invalid_request');
   });
 
+  it('rejects an oversized request body with 413, not a generic 500 (regression: Fastify framework errors were forced to internal_error)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      headers: authed(),
+      payload: {
+        scope: scopeFor('oversized'),
+        correlationId: 'c1',
+        padding: 'x'.repeat(128 * 1024), // well past MAX_BODY_BYTES (64KB)
+      },
+    });
+    expect(res.statusCode).toBe(413);
+    expect(res.json().error).toBe('invalid_request');
+  });
+
   it('trips a breaker via the operational API and denies the next permit', async () => {
     const scope = scopeFor('trip-http');
     const tripRes = await app.inject({

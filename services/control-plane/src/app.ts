@@ -105,6 +105,26 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       reply.code(err.httpStatus).send(err.toBody());
       return;
     }
+
+    // Fastify's own framework errors (oversized body past `bodyLimit`,
+    // malformed JSON, unsupported content-type, ...) carry a genuine
+    // client-error `statusCode` before ever reaching a route handler.
+    // Forcing every non-`FuseHttpError` to a generic 500 hid these real
+    // 4xx failures as "internal error" — e.g. a body over MAX_BODY_BYTES
+    // was reported as a server fault instead of the caller's mistake.
+    const frameworkErr = err as { statusCode?: number; message?: string };
+    const fastifyStatus = frameworkErr.statusCode;
+    if (fastifyStatus !== undefined && fastifyStatus >= 400 && fastifyStatus < 500) {
+      const httpErr = new FuseHttpError(
+        'invalid_request',
+        frameworkErr.message ?? 'invalid request',
+        fastifyStatus,
+        correlationId,
+      );
+      reply.code(httpErr.httpStatus).send(httpErr.toBody());
+      return;
+    }
+
     request.log.error({ err }, 'unhandled error');
     const httpErr = new FuseHttpError(
       'internal_error',
