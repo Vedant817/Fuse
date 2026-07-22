@@ -63,6 +63,8 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        rateLimitMax: 120,
+        rateLimitWindowMs: 60_000,
         preflightWindowMs: 5 * 60_000,
         preflightBlindCoverageThreshold: 0.5,
         preflightBlindOrphanRateThreshold: 0.5,

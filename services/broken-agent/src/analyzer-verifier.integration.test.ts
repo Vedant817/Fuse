@@ -53,6 +53,8 @@ describe('runAnalyzerVerifier against a real control plane: breaker trip mid-run
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        rateLimitMax: 120,
+        rateLimitWindowMs: 60_000,
         preflightWindowMs: 5 * 60_000,
         preflightBlindCoverageThreshold: 0.5,
         preflightBlindOrphanRateThreshold: 0.5,
