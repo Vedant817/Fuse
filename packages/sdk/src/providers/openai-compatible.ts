@@ -6,6 +6,8 @@
  * Never imported by `@fuse/breaker-core` or `@fuse/breaker-store` — these
  * types stay entirely within the SDK's provider layer (ADR-002/ADR-003).
  */
+import { z } from 'zod';
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -37,6 +39,25 @@ export interface ChatCompletionResponse {
   usage: ChatCompletionUsage;
 }
 
+const ChatCompletionResponseSchema: z.ZodType<ChatCompletionResponse> = z.object({
+  id: z.string().min(1),
+  model: z.string().min(1),
+  choices: z
+    .array(
+      z.object({
+        index: z.number().int().nonnegative(),
+        message: z.object({ role: z.string().min(1), content: z.string() }),
+        finish_reason: z.string().min(1),
+      }),
+    )
+    .min(1),
+  usage: z.object({
+    prompt_tokens: z.number().int().nonnegative(),
+    completion_tokens: z.number().int().nonnegative(),
+    total_tokens: z.number().int().nonnegative(),
+  }),
+});
+
 export interface OpenAiCompatibleProviderOptions {
   baseUrl: string;
   apiKey: string;
@@ -54,6 +75,16 @@ export class ProviderHttpError extends Error {
   ) {
     super(message);
     this.name = 'ProviderHttpError';
+  }
+}
+
+export class ProviderResponseValidationError extends Error {
+  constructor(
+    message: string,
+    readonly issues: readonly string[],
+  ) {
+    super(message);
+    this.name = 'ProviderResponseValidationError';
   }
 }
 
@@ -91,7 +122,26 @@ export class OpenAiCompatibleProvider {
           body.slice(0, 2000),
         );
       }
-      return (await res.json()) as ChatCompletionResponse;
+      let payload: unknown;
+      try {
+        payload = await res.json();
+      } catch {
+        throw new ProviderResponseValidationError(
+          'provider returned a successful response that was not valid JSON',
+          ['response: invalid JSON'],
+        );
+      }
+      const parsed = ChatCompletionResponseSchema.safeParse(payload);
+      if (!parsed.success) {
+        const issues = parsed.error.issues.map(
+          (issue) => `${issue.path.join('.') || 'response'}: ${issue.message}`,
+        );
+        throw new ProviderResponseValidationError(
+          'provider returned a successful response with an invalid chat-completion shape',
+          issues,
+        );
+      }
+      return parsed.data;
     } finally {
       clearTimeout(timer);
     }

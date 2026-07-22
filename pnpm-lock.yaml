@@ -179,6 +179,9 @@ importers:
       '@fuse/contracts':
         specifier: workspace:*
         version: link:../contracts
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       '@fuse/breaker-store':
         specifier: workspace:*

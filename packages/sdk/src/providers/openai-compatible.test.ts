@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createGroqProvider, GROQ_BASE_URL } from './groq.js';
 import { createNvidiaBuildProvider, NVIDIA_BUILD_BASE_URL } from './nvidia-build.js';
-import { extractUsage, ProviderHttpError } from './openai-compatible.js';
+import {
+  extractUsage,
+  ProviderHttpError,
+  ProviderResponseValidationError,
+} from './openai-compatible.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -82,6 +86,39 @@ describe.each([
       expect(httpErr.httpStatus).toBe(429);
       expect(httpErr.body).toContain('rate limited');
     }
+  });
+
+  it('rejects a 2xx JSON response whose runtime shape is not a chat completion', async () => {
+    const provider = create({
+      apiKey: 'k',
+      fetchImpl: vi.fn().mockResolvedValue(jsonResponse({ garbage: true })),
+    });
+    await expect(
+      provider.chatCompletion({
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    ).rejects.toBeInstanceOf(ProviderResponseValidationError);
+  });
+
+  it('rejects a 2xx response whose body is not valid JSON with the same typed error', async () => {
+    const provider = create({
+      apiKey: 'k',
+      fetchImpl: vi
+        .fn()
+        .mockResolvedValue(
+          new Response('not-json', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        ),
+    });
+    await expect(
+      provider.chatCompletion({
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    ).rejects.toBeInstanceOf(ProviderResponseValidationError);
   });
 
   it('aborts and rejects on timeout', async () => {

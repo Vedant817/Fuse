@@ -1,6 +1,7 @@
 export {
   OpenAiCompatibleProvider,
   ProviderHttpError,
+  ProviderResponseValidationError,
   extractUsage,
 } from './openai-compatible.js';
 export type {

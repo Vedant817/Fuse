@@ -32,7 +32,8 @@
     "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'"
   },
   "dependencies": {
-    "@fuse/contracts": "workspace:*"
+    "@fuse/contracts": "workspace:*",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
     "@fuse/breaker-store": "workspace:*",

@@ -1680,6 +1680,16 @@ Add dated entries here rather than leaving important context only in chat.
   @fuse/otel run test` (15 tests), build, and typecheck pass; direct post-fix
   execution returns `{costUsd:0,priced:false,...}` and the span regression test
   confirms the estimated-cost attribute is absent.
+- 2026-07-23 (provider-boundary audit): fixed a P2 runtime-validation gap in
+  the OpenAI-compatible adapter. A 200 response containing only
+  `{garbage:true}` was previously returned successfully because
+  `res.json()` was cast to `ChatCompletionResponse` without validation.
+  Successful responses now pass through a bounded Zod schema and malformed
+  JSON/shape failures raise exported `ProviderResponseValidationError`
+  instances without echoing the provider body. Evidence: `pnpm --filter
+  @fuse/sdk run test` (38 tests), build, and typecheck pass; the exact direct
+  malformed-response repro now returns the typed error with missing-field
+  issue paths instead of resolving arbitrary JSON.
 
 ### Open blockers and risks
 
