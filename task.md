@@ -600,8 +600,10 @@ Acceptance criteria:
   end-to-end against a real Postgres + real control-plane process (not just
   `app.inject()`) — output verified to be accurate and legible. Re-run with
   real credentials on 2026-07-23: Act 6 returned a Groq
-  `llama-3.1-8b-instant` response with 47 total tokens; Postgres independently
-  recorded the generated `agent-real-llm-*` guard scope as `armed`, epoch 0.
+  `llama-3.1-8b-instant` response; Postgres independently recorded the
+  generated `agent-real-llm-*` guard scope as `armed`, epoch 0. A follow-up
+  instrumentation fix also made the call visible in ClickHouse and its scope
+  `protected` in Preflight, as detailed in the dated audit entry below.
   Found and fixed one real bug during this verification: the OTel
   shutdown/flush at the end originally threw uncaught when no OTLP
   collector was reachable (a fully valid, unconfigured-by-default state —
@@ -1718,8 +1720,8 @@ Add dated entries here rather than leaving important context only in chat.
   config execution reports port 8090 and 120/60000 limiter defaults.
 - 2026-07-23 (final independent-audit gate): deleted all workspace `dist`
   directories and `.tsbuildinfo` files, then ran `pnpm install` (`Already up
-  to date`), `pnpm run check` (format, lint, all 9 builds/typechecks, 258/258
-  unit tests across 27 files), and `pnpm run test:integration` (83/83 tests
+  to date`), `pnpm run check` (format, lint, all 9 builds/typechecks, 259/259
+  unit tests across 28 files), and `pnpm run test:integration` (83/83 tests
   across 10 files against Testcontainers Postgres). The first integration
   attempt after the clean build found that the local OrbStack daemon had
   stopped (`Could not find a working container runtime strategy`); after
@@ -1742,6 +1744,18 @@ Add dated entries here rather than leaving important context only in chat.
   on cleanup failure. Evidence: 2 focused shutdown tests, the 57-test
   control-plane unit suite, build/typecheck, and a real start/Ctrl-C cycle that
   logged one shutdown and exited 0 without a stack trace.
+- 2026-07-23 (real-call telemetry follow-up): the first credentialed demo run
+  proved the real Groq call was permit-guarded, but a direct ClickHouse query
+  found only `fuse-mock` spans — Act 6 did not use `withGenAiSpan`, so the call
+  was invisible to SigNoz and its separate scope had no telemetry evidence.
+  Act 6 now composes the permit check with the same OTel/Preflight observation
+  path used by the analyzer/verifier loop. Evidence: the new focused test
+  asserts one permit, one provider dispatch, one `gen_ai` span, and one
+  telemetry observation; the repeated real demo returned a 45-token Groq
+  response; ClickHouse then contained `chat llama-3.1-8b-instant`, provider
+  `groq`, 42 input/3 output tokens, scoped to the generated real-agent ID; and
+  the control-plane Preflight API returned HTTP 200 `protected`, 100% required
+  field coverage and 0% orphan rate for that exact scope.
 
 ### Open blockers and risks
 

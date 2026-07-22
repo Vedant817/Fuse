@@ -20,6 +20,7 @@ import {
   parsePermitTimeoutMs,
   permitTimeoutOption,
 } from './demo-config.js';
+import { runGuardedInstrumentedChat } from './guarded-chat.js';
 
 const CONTROL_PLANE_URL = (
   process.env['FUSE_CONTROL_PLANE_URL'] ?? 'http://localhost:8090'
@@ -325,6 +326,7 @@ async function main(): Promise<void> {
     const nvidiaKey = process.env['NVIDIA_API_KEY'];
     if (groqKey || nvidiaKey) {
       const providerName = groqKey ? 'Groq' : 'NVIDIA Build';
+      const providerAttribute = groqKey ? 'groq' : 'nvidia';
       fmt.act(
         `Real LLM call — ${providerName}, guarded exactly like any other provider call`,
       );
@@ -341,17 +343,22 @@ async function main(): Promise<void> {
         ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
         outageMode: SDK_OUTAGE_MODE,
       });
-      const real = await guard4.guard(() =>
-        provider.chatCompletion({
-          model,
-          messages: [{ role: 'user', content: 'Reply with exactly one word: pong' }],
-          max_tokens: 10,
-        }),
-      );
+      const real = await runGuardedInstrumentedChat({
+        guard: guard4,
+        providerName: providerAttribute,
+        requestModel: model,
+        dispatch: () =>
+          provider.chatCompletion({
+            model,
+            messages: [{ role: 'user', content: 'Reply with exactly one word: pong' }],
+            max_tokens: 10,
+          }),
+      });
       fmt.ok(
         `Real response from ${providerName} (${model}): "${real.choices[0]?.message.content}"`,
       );
       fmt.kv('Tokens used', real.usage.total_tokens);
+      await guard4.flushPreflightTelemetry();
       guard4.stopPreflightReporting();
       summary.push(
         `A real ${providerName} call was made and guarded like any other provider call.`,
