@@ -1,5 +1,5 @@
-import pg from 'pg';
-import { BreakerStore, PreflightStore } from '@fuse/breaker-store';
+import type pg from 'pg';
+import { BreakerStore, PreflightStore, createPool } from '@fuse/breaker-store';
 import { bootstrapOtel, type FuseOtelHandle } from '@fuse/otel';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
@@ -29,7 +29,13 @@ async function main(): Promise<void> {
     deploymentEnvironment: config.deploymentEnvironment,
   });
 
-  const pool = new pg.Pool({ connectionString: config.databaseUrl });
+  // `createPool` (not a raw `new pg.Pool(...)`) so this real, long-running
+  // process gets the same idle-client-error safety net (`pool.on('error',
+  // ...)`, preventing an idle pooled connection failure from crashing the
+  // whole server) and connection/statement timeouts that @fuse/breaker-store
+  // documents and tests — previously only test/CLI code paths constructed
+  // pools this way; the actual server built its own, unguarded pool.
+  const pool = createPool({ connectionString: config.databaseUrl });
   await assertSchemaReady(pool);
 
   const store = new BreakerStore(pool);

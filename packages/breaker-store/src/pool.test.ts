@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { withStoreErrors } from './pool.js';
+import { createPool, withStoreErrors } from './pool.js';
 import { StoreUnavailableError } from './errors.js';
 
 function errorWithCode(code: string): Error {
@@ -56,6 +56,57 @@ describe('withStoreErrors', () => {
           withStoreErrors(() => Promise.reject(errorWithCode(code))),
         ).rejects.toThrow(StoreUnavailableError);
       });
+    }
+  });
+});
+
+describe('createPool', () => {
+  it('attaches an idle-client "error" listener so it does not crash the process', async () => {
+    const pool = createPool({
+      connectionString: 'postgres://fuse:fuse@localhost:5432/fuse',
+    });
+    try {
+      expect(pool.listenerCount('error')).toBeGreaterThan(0);
+      // Emitting 'error' with zero listeners is what crashes a Node
+      // process; asserting a listener exists confirms an idle-client
+      // failure surfaces as a logged error, not an unhandled crash.
+      expect(() =>
+        pool.emit('error', new Error('simulated idle-client error')),
+      ).not.toThrow();
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it('applies documented defaults when no overrides are given', async () => {
+    const pool = createPool({
+      connectionString: 'postgres://fuse:fuse@localhost:5432/fuse',
+    });
+    try {
+      expect(pool.options.max).toBe(10);
+      expect(pool.options.idleTimeoutMillis).toBe(30_000);
+      expect(pool.options.connectionTimeoutMillis).toBe(2_000);
+      expect(pool.options.statement_timeout).toBe(5_000);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it('lets a caller override every tunable', async () => {
+    const pool = createPool({
+      connectionString: 'postgres://fuse:fuse@localhost:5432/fuse',
+      max: 3,
+      idleTimeoutMillis: 1_000,
+      connectionTimeoutMillis: 500,
+      statementTimeoutMillis: 250,
+    });
+    try {
+      expect(pool.options.max).toBe(3);
+      expect(pool.options.idleTimeoutMillis).toBe(1_000);
+      expect(pool.options.connectionTimeoutMillis).toBe(500);
+      expect(pool.options.statement_timeout).toBe(250);
+    } finally {
+      await pool.end();
     }
   });
 });
