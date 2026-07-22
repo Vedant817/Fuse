@@ -28,4 +28,18 @@ describe('estimateCostUsd', () => {
     );
     expect(result.priced).toBe(false);
   });
+
+  it('reports priced:false for a documented model whose provider has no per-token list price', () => {
+    const result = estimateCostUsd(
+      'nvidia',
+      'meta/llama-3.1-8b-instruct',
+      1_000_000,
+      1_000_000,
+    );
+    expect(result).toEqual({
+      costUsd: 0,
+      priced: false,
+      priceTableVersion: 'fuse-price-table-v1',
+    });
+  });
 });

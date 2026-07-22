@@ -9,6 +9,10 @@
 export interface PriceEntry {
   provider: string;
   model: string;
+  /** False when the row exists only to document that no defensible
+   * per-token list price is available. Such rows must never emit a $0
+   * estimate as though the provider were free. */
+  pricingAvailable: boolean;
   inputPricePerMillionTokensUsd: number;
   outputPricePerMillionTokensUsd: number;
   /** ISO date this entry's figures were last checked against the
@@ -25,6 +29,7 @@ export const PRICE_TABLE: readonly PriceEntry[] = [
   {
     provider: 'groq',
     model: 'llama-3.1-8b-instant',
+    pricingAvailable: true,
     inputPricePerMillionTokensUsd: 0.05,
     outputPricePerMillionTokensUsd: 0.08,
     effectiveDate: '2026-07-21',
@@ -32,6 +37,7 @@ export const PRICE_TABLE: readonly PriceEntry[] = [
   {
     provider: 'groq',
     model: 'llama-3.3-70b-versatile',
+    pricingAvailable: true,
     inputPricePerMillionTokensUsd: 0.59,
     outputPricePerMillionTokensUsd: 0.79,
     effectiveDate: '2026-07-21',
@@ -43,6 +49,7 @@ export const PRICE_TABLE: readonly PriceEntry[] = [
   {
     provider: 'nvidia',
     model: 'meta/llama-3.1-8b-instruct',
+    pricingAvailable: false,
     inputPricePerMillionTokensUsd: 0,
     outputPricePerMillionTokensUsd: 0,
     effectiveDate: '2026-07-21',
@@ -65,7 +72,7 @@ export function estimateCostUsd(
   outputTokens: number,
 ): CostEstimate {
   const entry = PRICE_TABLE.find((e) => e.provider === provider && e.model === model);
-  if (!entry) {
+  if (!entry || !entry.pricingAvailable) {
     return { costUsd: 0, priced: false, priceTableVersion: PRICE_TABLE_VERSION };
   }
   const costUsd =

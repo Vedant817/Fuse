@@ -82,7 +82,7 @@ describe('withGenAiSpan', () => {
     expect(span.attributes[ATTR_FUSE_OUTCOME]).toBe('success');
   });
 
-  it('records the estimated cost attribute only when the price table has a matching entry', async () => {
+  it('records estimated cost only when a matching entry has real per-token pricing', async () => {
     await withGenAiSpan({ ...BASE_CTX, stepIndex: 0 }, async () => ({
       result: 'ok',
       outcome: { inputTokens: 1_000_000, outputTokens: 1_000_000, outcome: 'success' },
@@ -94,11 +94,28 @@ describe('withGenAiSpan', () => {
         outcome: { inputTokens: 100, outputTokens: 100, outcome: 'success' },
       }),
     );
+    await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        stepIndex: 2,
+        providerName: 'nvidia',
+        requestModel: 'meta/llama-3.1-8b-instruct',
+      },
+      async () => ({
+        result: 'ok',
+        outcome: {
+          inputTokens: 1_000_000,
+          outputTokens: 1_000_000,
+          outcome: 'success',
+        },
+      }),
+    );
     await provider.forceFlush();
 
-    const [priced, unpriced] = exporter.getFinishedSpans();
+    const [priced, unknownModel, noPublishedPrice] = exporter.getFinishedSpans();
     expect(priced!.attributes['fuse.estimated_cost.usd']).toBeCloseTo(0.05 + 0.08, 5);
-    expect(unpriced!.attributes['fuse.estimated_cost.usd']).toBeUndefined();
+    expect(unknownModel!.attributes['fuse.estimated_cost.usd']).toBeUndefined();
+    expect(noPublishedPrice!.attributes['fuse.estimated_cost.usd']).toBeUndefined();
   });
 
   it('nested spans (a second withGenAiSpan called inside the first) become a child, not an orphan', async () => {

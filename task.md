@@ -1670,6 +1670,16 @@ Add dated entries here rather than leaving important context only in chat.
   build, and typecheck pass; a direct post-fix probe returned `fired:true` at
   exactly 100,000 tokens on the first call and identical `$0.60` fired results
   for ordered/reordered cost records.
+- 2026-07-23 (cost-telemetry audit): fixed a P1 misleading-zero estimate for
+  NVIDIA Build. Its price-table row intentionally contains zero placeholders
+  because no per-token list price is available, but `estimateCostUsd` returned
+  `{costUsd:0, priced:true}`; `withGenAiSpan` consequently emitted a real
+  `fuse.estimated_cost.usd=0` attribute. Price entries now explicitly state
+  whether pricing is available, and unpriced documented models return
+  `priced:false` just like unknown models. Evidence: `pnpm --filter
+  @fuse/otel run test` (15 tests), build, and typecheck pass; direct post-fix
+  execution returns `{costUsd:0,priced:false,...}` and the span regression test
+  confirms the estimated-cost attribute is absent.
 
 ### Open blockers and risks
 
