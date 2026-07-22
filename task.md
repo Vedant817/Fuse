@@ -317,11 +317,17 @@ listed was independently verified by reading the actual code (not assumed).
   Not started (§5.1).
 - [x] Define trip/permit/resume API requests, responses, idempotency keys,
   stable error codes, and compatibility rules. Evidence:
-  `packages/contracts/src/breaker-api.ts` and `errors.ts` — fully
-  implemented, contract-tested (11 tests covering valid fixtures and
-  malformed input: oversized reason, negative cooldown, wrong actor type,
-  missing idempotency key, wrong types), and exercised end-to-end through
-  real HTTP in the control-plane and SDK integration suites.
+  `packages/contracts/src/breaker-api.ts` — fully implemented,
+  contract-tested (11 tests in `breaker-api.test.ts` covering valid
+  fixtures and malformed input: oversized reason, negative cooldown, wrong
+  actor type, missing idempotency key, wrong types), and exercised
+  end-to-end through real HTTP in the control-plane and SDK integration
+  suites. Correction (audit, 2026-07-22): `errors.ts` (stable error codes,
+  `FuseHttpError`) has no dedicated contract test file of its own — it was
+  previously bundled into this same "11 tests" claim, which overstated its
+  coverage. It is exercised indirectly (every integration test asserting a
+  specific `error` code/status touches it), but has no fixture/malformed-
+  input tests of its own the way `breaker-api.ts` does.
 - [x] Define structured breaker audit event and required correlation fields.
   Evidence: `packages/contracts/src/audit.ts` `BreakerAuditEventSchema` —
   scope, from/to state, epoch before/after, actor, reason, correlationId,
@@ -422,8 +428,14 @@ already existed to test it against realistically.
   while controlling cardinality. Done: `onDecision` hook fires for every
   permit check with `{scope, correlationId, allowed, state, degraded,
   latencyMs, reason}` (tested in `guard.test.ts`). Not done: not yet wired
-  to an actual OTel metrics/span exporter — that wiring belongs to §3.2 and
-  will consume this same hook rather than replacing it.
+  to an actual OTel metrics/span exporter. Correction (audit, 2026-07-22):
+  this previously predicted §3.2's OTel-metric wiring would "consume this
+  same hook" client-side. That is not what happened — §3.2 wired
+  `fuse.breaker.permit.decisions` server-side in
+  `services/control-plane/src/routes/permit.ts` instead, the one place a
+  permit decision is authoritative network-wide across every SDK/agent
+  caller, not per `FuseGuard` instance. This SDK-side `onDecision` hook
+  remains unwired to any exporter.
 - [x] Implement configured behavior for control-plane timeout/unavailability
   and expose that degraded protection state. Evidence: SDK `outageMode`
   (default `fail-closed`; `fail-open` requires explicit opt-in) tested for
@@ -832,19 +844,29 @@ Acceptance criteria:
   than the global 64KB default) and `SignozAlertmanagerWebhookPayloadSchema`
   validation (bounded to 1-200 alerts per delivery); malformed payloads
   return 400 `invalid_request`, tested.
-- [~] Verify signature/authentication, timestamp freshness, and replay nonce or
+- [x] Verify signature/authentication, timestamp freshness, and replay nonce or
   idempotency key before any state change. Done: bearer-token authentication
   (SigNoz has no HMAC-signing option for webhooks — verified against its
   current docs; it authenticates via HTTP Basic Auth or, with an empty
   configured username, a bearer token, so Fuse's webhook uses the same
   bearer mechanism as the rest of the API, with its own least-privilege
-  token tier — see below) and idempotency via a key derived from the
-  alert's own stable identity (`fingerprint`+`startsAt`), tested for
-  duplicate delivery. Not done: no timestamp-freshness/replay-window check
-  (Alertmanager's webhook payload doesn't carry a signed timestamp to
-  check freshness against the way an HMAC scheme would — the fingerprint-
-  based idempotency key is the actual replay defense here); genuinely
-  deferred, not silently dropped.
+  token tier — see below); idempotency via a key derived from the alert's
+  own stable identity (`fingerprint`+`startsAt`), tested for duplicate
+  delivery; and timestamp-freshness/replay-window rejection via
+  `isStaleAlert` (`services/control-plane/src/routes/webhook.ts`), which
+  rejects any alert whose `startsAt` is older than `webhookMaxAlertAgeMs`
+  (default 10 min) or too far in the future (`webhookMaxClockSkewAheadMs`,
+  default 1 min), fail-closed on an unparseable timestamp — proven in 4
+  `webhook.integration.test.ts` cases (stale, future-skewed, unparseable,
+  still-fresh-and-tripping). Correction (audit, 2026-07-22): this item was
+  previously left `[~]`/"not done" here after the replay-window check
+  shipped in §1.2's follow-up slice — that characterization was stale.
+  Residual, honestly scoped and unchanged: a *fresh* forgery from a
+  genuinely valid webhook token remains possible (SigNoz has no payload
+  signing), assessed low severity (a trip is fail-safe, not
+  data-exposing) and tracked as further follow-up (recommended fix: a
+  per-webhook-token trip-rate limit) — see §1.2 and `docs/threat-model.md`
+  §3.
 - [x] Map external payloads to the normalized alert contract and reject unknown
   tenant/environment/agent scope. Evidence:
   `services/control-plane/src/signoz-alert-mapper.ts`'s
@@ -954,10 +976,22 @@ get 403, not a silent pass, tested).
   recovery, store outage (`StoreUnavailableError` → 503), duplicate
   delivery (webhook + operational API), and concurrency (10-way/8-way
   concurrent writer races) — all tested in §2/§5.1's integration suites.
-  Not done: no explicit clock-skew test (the store's `now` is always
-  server-supplied, so client clock skew doesn't reach it, but this hasn't
-  been tested directly) and no multi-instance (two control-plane processes
-  against one Postgres) test — single-instance-per-test-run so far.
+  Additional evidence (audit, 2026-07-22): a real `fuse-postgres` Docker
+  container was killed (`docker kill`) while the real control-plane
+  process (not testcontainers) was live and serving `/v1/permit`. Observed:
+  in-flight requests already past the store call completed normally; new
+  requests during the outage got `allowed: false, state: "unknown",
+  degraded: true` (the documented fail-closed behavior) and `/readyz`
+  correctly returned 503; the process itself stayed up throughout (no
+  crash from the resulting `ECONNREFUSED`/idle-client errors — the
+  `createPool` idle-error safety net fix above proven under a real kill,
+  not just a unit test); once Postgres was restarted, `/readyz` returned
+  200 and a fresh `/v1/permit` succeeded immediately, with no restart of
+  the control-plane process required. Not done: no explicit clock-skew
+  test (the store's `now` is always server-supplied, so client clock skew
+  doesn't reach it, but this hasn't been tested directly) and no
+  multi-instance (two control-plane processes against one Postgres) test
+  — single-instance-per-test-run so far.
 - [ ] Define backup/restore, migration, rollback, and retention procedures.
   Not done — tracked for the production-hardening pass (§9.3 runbooks).
 
