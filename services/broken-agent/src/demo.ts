@@ -15,6 +15,11 @@ import type { Scope } from '@fuse/contracts';
 import { runAnalyzerVerifier, defaultMockModel } from './index.js';
 import type { Model } from './types.js';
 import * as fmt from './demo-format.js';
+import {
+  parseOutageMode,
+  parsePermitTimeoutMs,
+  permitTimeoutOption,
+} from './demo-config.js';
 
 const CONTROL_PLANE_URL = (
   process.env['FUSE_CONTROL_PLANE_URL'] ?? 'http://localhost:8080'
@@ -27,6 +32,12 @@ const SIGNOZ_URL = (process.env['SIGNOZ_URL'] ?? 'http://localhost:8080').replac
   /\/+$/,
   '',
 );
+
+// Wired from .env.example's "--- SDK ---" section so an operator who sets
+// these before a real deployment actually changes this demo's FuseGuard
+// behavior, instead of the values being silently ignored.
+const PERMIT_TIMEOUT_MS = parsePermitTimeoutMs(process.env['FUSE_PERMIT_TIMEOUT_MS']);
+const SDK_OUTAGE_MODE = parseOutageMode(process.env['FUSE_SDK_OUTAGE_MODE']);
 
 function firstToken(envVar: string): string | undefined {
   const raw = process.env[envVar];
@@ -150,7 +161,8 @@ async function main(): Promise<void> {
       scope: scopeFor(`agent-normal-${randomUUID().slice(0, 8)}`),
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
-      timeoutMs: 2000,
+      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+      outageMode: SDK_OUTAGE_MODE,
     });
     const result1 = await runAnalyzerVerifier({
       scenario: 'normal',
@@ -172,7 +184,8 @@ async function main(): Promise<void> {
       scope: scopeFor(`agent-loop-${randomUUID().slice(0, 8)}`),
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
-      timeoutMs: 2000,
+      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+      outageMode: SDK_OUTAGE_MODE,
     });
     const result2 = await runAnalyzerVerifier({
       scenario: 'loop',
@@ -201,7 +214,8 @@ async function main(): Promise<void> {
       scope: scope3,
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
-      timeoutMs: 2000,
+      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+      outageMode: SDK_OUTAGE_MODE,
     });
 
     let dispatchCount = 0;
@@ -324,7 +338,8 @@ async function main(): Promise<void> {
         scope: scopeFor(`agent-real-llm-${randomUUID().slice(0, 8)}`),
         controlPlaneUrl: CONTROL_PLANE_URL,
         apiToken: AGENT_TOKEN!,
-        timeoutMs: 2000,
+        ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+        outageMode: SDK_OUTAGE_MODE,
       });
       const real = await guard4.guard(() =>
         provider.chatCompletion({
