@@ -1729,7 +1729,12 @@ Add dated entries here rather than leaving important context only in chat.
   stopped (`Could not find a working container runtime strategy`); after
   restarting OrbStack, the unchanged suite passed in full. Optional live
   provider tests were also executed and honestly skipped 2/2 because neither
-  provider credential is present.
+  provider credential is present. **P3 (not fixed):** that failed-startup path
+  also exposed a test-harness cleanup defect in both breaker-store integration
+  suites: `afterAll` called `pool.end()` after `beforeAll` failed, producing a
+  secondary `Cannot read properties of undefined (reading 'end')` error that
+  obscures diagnostics. This does not affect application runtime or the
+  container-available test path.
 
 ### Open blockers and risks
 
