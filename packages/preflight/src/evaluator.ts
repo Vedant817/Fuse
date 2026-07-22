@@ -172,16 +172,24 @@ export function evaluatePreflight(args: EvaluatePreflightArgs): PreflightResult 
   }
 
   const raw = evaluateRaw(args.spans, args.heartbeat, nowMs, args.config);
-  const lastGoodAt =
-    raw.rawState === 'protected' ? nowIso : (args.previous?.lastGoodAt ?? null);
 
+  // `lastGoodAt` must reflect the last time `protected` was actually
+  // COMMITTED as the reported state — not merely proposed by this call's
+  // raw evaluation. `buildCommitted()` always reports `raw.rawState` as
+  // the committed state, so bumping it here on `raw.rawState ===
+  // 'protected'` is correct for that path specifically (previously this
+  // was computed once, upfront, and reused for the "recovering" hold
+  // path below too — where the committed state is `previous.state`, NOT
+  // protected — falsely advancing `lastGoodAt` to "now" while the
+  // officially reported state was still `blind`/`degraded`).
   const buildCommitted = (): PreflightResult => ({
     scope: args.scope,
     state: raw.rawState,
     reasonCode: raw.reasonCode,
     reason: raw.reason,
     evaluatedAt: nowIso,
-    lastGoodAt,
+    lastGoodAt:
+      raw.rawState === 'protected' ? nowIso : (args.previous?.lastGoodAt ?? null),
     requiredFieldCoveragePercent: raw.coveragePct,
     orphanRatePercent: raw.orphanPct,
     freshnessMs: raw.freshnessMs,
@@ -222,7 +230,13 @@ export function evaluatePreflight(args: EvaluatePreflightArgs): PreflightResult 
     reasonCode: 'recovering',
     reason: `telemetry looks healthy again, confirming before recovering: ${raw.reason}`,
     evaluatedAt: nowIso,
-    lastGoodAt,
+    // NOT bumped to `now` here: the committed `state` above is still the
+    // previous (worse) one, not `protected`, however healthy this call's
+    // raw evaluation looks — `lastGoodAt` must only ever advance when
+    // `protected` is actually the reported state, or an operator reading
+    // it mid-dwell would see a just-now timestamp while the scope is
+    // still officially unprotected.
+    lastGoodAt: previous.lastGoodAt,
     requiredFieldCoveragePercent: raw.coveragePct,
     orphanRatePercent: raw.orphanPct,
     freshnessMs: raw.freshnessMs,

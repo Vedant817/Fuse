@@ -162,6 +162,13 @@ describe('evaluatePreflight', () => {
     expect(soon.state).toBe('blind'); // still held
     expect(soon.reasonCode).toBe('recovering');
     expect(soon.pendingRecoveryState).toBe('protected');
+    // Regression: `lastGoodAt` must NOT advance to "now" just because this
+    // call's raw telemetry looks healthy — the officially reported state
+    // above is still `blind`, so a `lastGoodAt` of "moments ago" would
+    // mislead an operator into thinking this scope was just confirmed
+    // protected when it wasn't.
+    expect(soon.lastGoodAt).toBe(broken.lastGoodAt);
+    expect(soon.lastGoodAt).toBeNull(); // never actually protected yet
 
     // After the dwell period elapses with continued healthy evidence, it commits.
     const laterMs = NOW_MS + DEFAULT_PREFLIGHT_CONFIG.minRecoveryDwellMs + 5_000;
@@ -173,6 +180,8 @@ describe('evaluatePreflight', () => {
       previous: soon,
     });
     expect(later.state).toBe('protected');
+    // Only now, once `protected` is actually committed, does it advance.
+    expect(later.lastGoodAt).toBe(new Date(laterMs).toISOString());
   });
 
   it('resets the recovery dwell timer if health regresses mid-dwell', () => {
