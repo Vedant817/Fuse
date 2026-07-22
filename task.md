@@ -1651,9 +1651,9 @@ Add dated entries here rather than leaving important context only in chat.
     exact behavior, so it reads as a known, accepted characteristic rather
     than an undiscovered surprise.
   Full clean-slate verification after all fixes (`dist`/`.tsbuildinfo`
-  removed, real Postgres via testcontainers): `pnpm run check` — 243 unit
-  tests across 9 packages (up from 214); `pnpm run test:integration` — 80
-  integration tests (up from 75). Both P1 fixes were additionally
+  removed, real Postgres via testcontainers): `pnpm run check` — 256 unit
+  tests across 9 packages; `pnpm run test:integration` — 83 integration
+  tests. Both P1 fixes were additionally
   re-verified live against the real running control plane (not just the
   test suite) with the exact repro steps that first found them, both now
   behaving correctly.
@@ -1720,6 +1720,16 @@ Add dated entries here rather than leaving important context only in chat.
   build/typecheck, and `app.integration.test.ts` (21, real Postgres) pass; a
   sourced `.env.example` migration returns `no pending migrations`; direct
   config execution reports port 8090 and 120/60000 limiter defaults.
+- 2026-07-23 (final independent-audit gate): deleted all workspace `dist`
+  directories and `.tsbuildinfo` files, then ran `pnpm install` (`Already up
+  to date`), `pnpm run check` (format, lint, all 9 builds/typechecks, 256/256
+  unit tests across 26 files), and `pnpm run test:integration` (83/83 tests
+  across 10 files against Testcontainers Postgres). The first integration
+  attempt after the clean build found that the local OrbStack daemon had
+  stopped (`Could not find a working container runtime strategy`); after
+  restarting OrbStack, the unchanged suite passed in full. Optional live
+  provider tests were also executed and honestly skipped 2/2 because neither
+  provider credential is present.
 
 ### Open blockers and risks
 
