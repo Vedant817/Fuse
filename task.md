@@ -1790,3 +1790,26 @@ Add dated entries here rather than leaving important context only in chat.
   option — assessed low-severity (a trip is fail-safe, not data-exposing);
   recommended fix is a per-webhook-token trip-rate limit, tracked as
   follow-up work.
+
+### Decisions (2026-07-23, gap-closure session)
+
+Following a full gap review against this file (see chat), the user made three
+explicit scope decisions before work resumed:
+
+- **Git remote/push stays deferred.** Stay local for now; every slice below is
+  still committed locally with the required `Vedant817` identity, but not
+  pushed anywhere. This remains a standing, tracked blocker (§0.1, §12 "Open
+  blockers"), not silently dropped.
+- **§7.3 Slack gets a real integration, not a stub.** Build real Slack Web
+  API/webhook posting (bot token or incoming-webhook URL read from env) now;
+  the user will supply the actual token later. Per existing conventions in
+  this codebase (`PreflightReporter`, OTel shutdown), the integration must
+  degrade safely — never throw, never block enforcement — when the token is
+  absent or Slack is unreachable, and a local no-network renderer/snapshot
+  path is built alongside it for demo rehearsal without live Slack.
+- **Sequencing: full production rigor, top-to-bottom through task.md's own
+  section order** (§4 → §7 → §8 → §9 → §10 → §11), explicitly accepting the
+  later sections may not be reached before the 2026-07-26 hackathon deadline.
+  Each slice still goes through the full AGENTS.md work cycle (define
+  acceptance criteria → implement → test → gap review → update this file →
+  commit) rather than being rushed unverified to cover more ground.
