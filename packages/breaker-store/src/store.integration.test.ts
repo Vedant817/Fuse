@@ -299,6 +299,143 @@ describe('BreakerStore (Postgres integration)', () => {
     expect(auditRows.rows[0].noop).toBe(false);
   });
 
+  it('concurrent trips with distinct actors/reasons/correlationIds: every response and every persisted audit row reflects its OWN caller, not the winner (regression for actor/reason/correlationId mismatch bug)', async () => {
+    const scope = scopeFor('actor-mismatch');
+    await store.permit(scope, 'corr-0');
+
+    const callers = ['A', 'B', 'C'].map((label) => ({
+      label,
+      actor: { type: 'system', id: `system:detector-${label}` } as Actor,
+      reason: `unique reason ${label}`,
+      correlationId: `corr-${label}`,
+      idempotencyKey: `idem-mismatch-${label}`,
+    }));
+
+    const results = await Promise.all(
+      callers.map((c) =>
+        store.trip({
+          scope,
+          reason: c.reason,
+          policyVersion: 'v1',
+          cooldownSeconds: 60,
+          actor: c.actor,
+          correlationId: c.correlationId,
+          idempotencyKey: c.idempotencyKey,
+        }),
+      ),
+    );
+
+    const applied = results.filter((r) => r.kind === 'applied');
+    expect(applied).toHaveLength(3);
+    const realTransitions = applied.filter((r) => r.kind === 'applied' && !r.noop);
+    expect(realTransitions).toHaveLength(1); // exactly one real transition wins the race
+
+    for (let i = 0; i < callers.length; i++) {
+      const c = callers[i]!;
+      const r = results[i]!;
+      if (r.kind !== 'applied') throw new Error('unreachable');
+      // The response over the wire must match THIS caller's own submitted
+      // identity, never a co-racer's, whether this caller won or lost.
+      expect(r.auditEvent.actor).toEqual(c.actor);
+      expect(r.auditEvent.reason).toBe(c.reason);
+      expect(r.auditEvent.correlationId).toBe(c.correlationId);
+      if (r.noop) {
+        expect(r.auditEvent.fromState).toBe(r.auditEvent.toState);
+        expect(r.auditEvent.epochBefore).toBe(r.auditEvent.epochAfter);
+      } else {
+        expect(r.auditEvent.fromState).not.toBe(r.auditEvent.toState);
+        expect(r.auditEvent.epochAfter).toBe(r.auditEvent.epochBefore + 1);
+      }
+    }
+
+    // Confirm the SAME is true of what's actually persisted, independent of
+    // what was handed back over the wire.
+    const auditRows = await pool.query<{
+      actor_type: string;
+      actor_id: string;
+      reason: string;
+      correlation_id: string;
+      from_state: string;
+      to_state: string;
+      noop: boolean;
+    }>(
+      `SELECT actor_type, actor_id, reason, correlation_id, from_state, to_state, noop
+       FROM breaker_audit_log
+       WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    expect(auditRows.rows).toHaveLength(3);
+    for (const c of callers) {
+      const row = auditRows.rows.find((r) => r.correlation_id === c.correlationId);
+      expect(row).toBeDefined();
+      expect(row!.actor_type).toBe(c.actor.type);
+      expect(row!.actor_id).toBe(c.actor.id);
+      expect(row!.reason).toBe(c.reason);
+    }
+
+    const finalRecord = await store.getRecord(scope);
+    expect(finalRecord?.state).toBe('tripped');
+    expect(finalRecord?.epoch).toBe(1);
+  });
+
+  it('noopReason is populated for no-op transitions (already-tripped, breaker-disabled) and absent for a genuine transition', async () => {
+    const scope = scopeFor('noop-reason');
+
+    const realTrip = await store.trip({
+      scope,
+      reason: 'first alert',
+      policyVersion: 'v1',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-1',
+      idempotencyKey: 'idem-real-trip',
+    });
+    expect(realTrip.kind).toBe('applied');
+    if (realTrip.kind !== 'applied') throw new Error('unreachable');
+    expect(realTrip.noop).toBe(false);
+    expect(realTrip.noopReason).toBeUndefined();
+
+    const alreadyTripped = await store.trip({
+      scope,
+      reason: 'second alert, different detector',
+      policyVersion: 'v1',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-2',
+      idempotencyKey: 'idem-noop-already-tripped',
+    });
+    expect(alreadyTripped.kind).toBe('applied');
+    if (alreadyTripped.kind !== 'applied') throw new Error('unreachable');
+    expect(alreadyTripped.noop).toBe(true);
+    expect(alreadyTripped.noopReason).toBe('already-tripped');
+
+    const disableResult = await store.disable({
+      scope,
+      reason: 'maintenance window',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-3',
+      idempotencyKey: 'idem-disable',
+    });
+    expect(disableResult.kind).toBe('applied');
+    if (disableResult.kind !== 'applied') throw new Error('unreachable');
+    expect(disableResult.noop).toBe(false);
+    expect(disableResult.noopReason).toBeUndefined();
+
+    const tripWhileDisabled = await store.trip({
+      scope,
+      reason: 'alert fires while disabled',
+      policyVersion: 'v1',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-4',
+      idempotencyKey: 'idem-noop-disabled',
+    });
+    expect(tripWhileDisabled.kind).toBe('applied');
+    if (tripWhileDisabled.kind !== 'applied') throw new Error('unreachable');
+    expect(tripWhileDisabled.noop).toBe(true);
+    expect(tripWhileDisabled.noopReason).toBe('breaker-disabled');
+  });
+
   it('restart recovery: a new BreakerStore instance against the same database sees the persisted state', async () => {
     const scope = scopeFor('restart-recovery');
     await store.trip({

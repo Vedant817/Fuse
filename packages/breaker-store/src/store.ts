@@ -6,6 +6,7 @@ import {
   applyResume,
   applyTrip,
   permit as permitPure,
+  type NoopReason,
 } from '@fuse/breaker-core';
 import type {
   Actor,
@@ -33,6 +34,7 @@ export type TransitionResult =
       record: BreakerRecord;
       auditEvent: BreakerAuditEvent;
       noop: boolean;
+      noopReason?: NoopReason;
     }
   | {
       kind: 'rejected';
@@ -52,6 +54,8 @@ interface ExecuteTransitionArgs {
   scope: Scope;
   idempotencyKey: string;
   correlationId: string;
+  actor: Actor;
+  reason: string;
   policyVersionForInit: string;
   expectedEpoch?: number | undefined;
   requestForHash: unknown;
@@ -275,9 +279,9 @@ export class BreakerStore {
                   finalRecord.state,
                   current.epoch,
                   finalRecord.epoch,
-                  finalRecord.updatedBy.type,
-                  finalRecord.updatedBy.id,
-                  finalRecord.reason,
+                  args.actor.type,
+                  args.actor.id,
+                  args.reason,
                   args.correlationId,
                   finalRecord.policyVersion,
                   outcome.noop,
@@ -288,6 +292,7 @@ export class BreakerStore {
                 record: finalRecord,
                 auditEvent: rowToAuditEvent(auditRes.rows[0]!),
                 noop: outcome.noop,
+                ...(outcome.noop ? { noopReason: outcome.noopReason } : {}),
               };
 
               // Under the advisory lock held since the top of this method,
@@ -359,6 +364,8 @@ export class BreakerStore {
       scope: req.scope,
       idempotencyKey: req.idempotencyKey,
       correlationId: req.correlationId,
+      actor: req.actor,
+      reason: req.reason,
       policyVersionForInit: req.policyVersion,
       expectedEpoch: req.expectedEpoch,
       requestForHash: req,
@@ -380,6 +387,8 @@ export class BreakerStore {
       scope: req.scope,
       idempotencyKey: req.idempotencyKey,
       correlationId: req.correlationId,
+      actor: req.actor,
+      reason: req.reason,
       policyVersionForInit: 'unversioned',
       expectedEpoch: req.expectedEpoch,
       requestForHash: req,
@@ -395,6 +404,8 @@ export class BreakerStore {
       scope: req.scope,
       idempotencyKey: req.idempotencyKey,
       correlationId: req.correlationId,
+      actor: req.actor,
+      reason: req.reason,
       policyVersionForInit: 'unversioned',
       requestForHash: req,
       now,
@@ -409,6 +420,8 @@ export class BreakerStore {
       scope: req.scope,
       idempotencyKey: req.idempotencyKey,
       correlationId: req.correlationId,
+      actor: req.actor,
+      reason: req.reason,
       policyVersionForInit: 'unversioned',
       requestForHash: req,
       now,
