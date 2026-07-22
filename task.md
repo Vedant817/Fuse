@@ -566,6 +566,28 @@ Acceptance criteria:
   treat a negated rejection ('not approved') as approval" injects a
   custom model whose verifier text starts with "This draft is not
   approved..." and asserts no round is ever marked approved.
+- [x] Add a runnable, narrated live demo against a real running control
+  plane (not a test suite). Evidence: `services/broken-agent/src/demo.ts`
+  (`pnpm --filter @fuse/broken-agent run demo`) — a normal run, a loop
+  scenario capped by the fixture's own ceiling, an external trip via the
+  real `/v1/breaker/trip` API stopping dispatch mid-run with an exact
+  before/after dispatch count, an operator resume, and the resulting
+  Preflight status; optionally a real Groq/NVIDIA call when
+  `GROQ_API_KEY`/`NVIDIA_API_KEY` is set. Fails fast with setup
+  instructions if the control plane isn't reachable. Manually run
+  end-to-end against a real Postgres + real control-plane process (not
+  just `app.inject()`) — output verified to be accurate and legible.
+  Found and fixed one real bug during this verification: the OTel
+  shutdown/flush at the end originally threw uncaught when no OTLP
+  collector was reachable (a fully valid, unconfigured-by-default state —
+  SigNoz not running), crashing the whole demo with a stack trace after a
+  clean summary; fixed to degrade to an informational message instead,
+  matching the same "telemetry failure must never look like a product
+  failure" principle already applied to `PreflightReporter`. Distinct
+  from, and does not itself satisfy, the still-open Preflight-specific
+  "remove a token field, detect blind, restore, show recovery" demo beat
+  above — this demo covers the breaker/Preflight-status loop generally,
+  not that specific telemetry-regression scenario.
 
 ### 3.2 OTel instrumentation
 
