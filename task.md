@@ -1641,6 +1641,22 @@ Add dated entries here rather than leaving important context only in chat.
   re-verified live against the real running control plane (not just the
   test suite) with the exact repro steps that first found them, both now
   behaving correctly.
+- 2026-07-23 (independent audit follow-up): fixed a P1 role-boundary escape in
+  Preflight/control-plane authentication. `app.ts` incorrectly included
+  webhook-only credentials in the allowlists for `/v1/permit` and
+  `/v1/preflight/*`; additionally, any agent token could submit
+  `disabled: true|false` and persist an `operator-disabled` verdict. Live
+  reproduction against the real server confirmed all three unauthorized
+  operations returned HTTP 200 before the fix. The allowlists now exclude
+  webhook credentials from agent routes, and any report carrying the
+  operator control fields `disabled`/`disabledReason` requires an operator
+  token. Evidence: `pnpm --filter @fuse/control-plane run test` (52 unit
+  tests) and `TESTCONTAINERS_RYUK_DISABLED=true pnpm --filter
+  @fuse/control-plane exec vitest run src/preflight.integration.test.ts`
+  (13 integration tests) pass. Live post-fix requests returned 403 for an
+  agent disable, webhook permit, and webhook Preflight report; an ordinary
+  agent report remained 200/protected and an operator disable remained
+  200/disabled.
 
 ### Open blockers and risks
 

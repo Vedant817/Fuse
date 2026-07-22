@@ -42,6 +42,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   registerHealthRoutes(app, deps.pool);
 
   const operatorTokens = deps.config.apiTokens;
+  const agentAllowedTokens = [...deps.config.apiTokens, ...deps.config.agentApiTokens];
   const webhookAllowedTokens = [...deps.config.apiTokens, ...deps.config.webhookTokens];
   const allKnownTokens = [
     ...deps.config.apiTokens,
@@ -55,7 +56,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       // token bound to a specific tenant (not the '*' wildcard) may only
       // check permits for that tenant's own scope.
       await requireBearerAuth(
-        allKnownTokens,
+        agentAllowedTokens,
         allKnownTokens,
         extractTenantFromRequest,
       )(request, reply);
@@ -63,8 +64,15 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       // An agent reports and reads its own telemetry-health evidence —
       // same trust tier as the permit check, not the operator-only
       // enforcement API — and the same tenant-scoping rule applies.
+      const body = request.body;
+      const changesDisabledState =
+        request.method === 'POST' &&
+        typeof body === 'object' &&
+        body !== null &&
+        (Object.prototype.hasOwnProperty.call(body, 'disabled') ||
+          Object.prototype.hasOwnProperty.call(body, 'disabledReason'));
       await requireBearerAuth(
-        allKnownTokens,
+        changesDisabledState ? operatorTokens : agentAllowedTokens,
         allKnownTokens,
         extractTenantFromRequest,
       )(request, reply);

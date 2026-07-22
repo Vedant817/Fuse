@@ -12,6 +12,7 @@ import type { ControlPlaneConfig } from './config.js';
 
 const OPERATOR_TOKEN = 'operator-'.padEnd(32, '0');
 const AGENT_TOKEN = 'agent-'.padEnd(32, '0');
+const WEBHOOK_TOKEN = 'webhook-'.padEnd(32, '0');
 
 const CONFIG: ControlPlaneConfig = {
   port: 0,
@@ -26,7 +27,7 @@ const CONFIG: ControlPlaneConfig = {
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],
   agentApiTokens: [AGENT_TOKEN],
-  webhookTokens: [],
+  webhookTokens: [WEBHOOK_TOKEN],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
   webhookMaxAlertAgeMs: 600_000,
@@ -212,6 +213,60 @@ describe('Preflight API (real Postgres + control plane)', () => {
       payload: { scope: s, spans: [], disabled: true, disabledReason: 'maintenance' },
     });
     expect(res.json().result.state).toBe('disabled');
+  });
+
+  it('rejects an agent token attempting to set or clear the operator-only disabled state', async () => {
+    const setScope = scope();
+    const setDisabled = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: {
+        scope: setScope,
+        spans: [],
+        disabled: true,
+        disabledReason: 'agent must not suppress its own monitoring',
+      },
+    });
+    expect(setDisabled.statusCode).toBe(403);
+    expect(setDisabled.json().error).toBe('unauthorized');
+
+    const clearDisabled = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: setScope, spans: [healthySpan(Date.now())], disabled: false },
+    });
+    expect(clearDisabled.statusCode).toBe(403);
+    expect(clearDisabled.json().error).toBe('unauthorized');
+
+    const status = await app.inject({
+      method: 'GET',
+      url: `/v1/preflight/status?tenant=${setScope.tenant}&environment=${setScope.environment}&agentId=${setScope.agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(status.statusCode).toBe(404);
+  });
+
+  it('keeps a webhook-only token confined to the webhook route', async () => {
+    const s = scope();
+    const permit = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: { scope: s, correlationId: 'webhook-role-escape-permit' },
+    });
+    expect(permit.statusCode).toBe(403);
+    expect(permit.json().error).toBe('unauthorized');
+
+    const report = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: { scope: s, spans: [healthySpan(Date.now())] },
+    });
+    expect(report.statusCode).toBe(403);
+    expect(report.json().error).toBe('unauthorized');
   });
 
   it('a disabled scope stays disabled when an agent reports ordinary telemetry that omits `disabled` entirely', async () => {
