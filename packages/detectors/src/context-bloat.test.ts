@@ -64,7 +64,7 @@ describe('detectContextBloat', () => {
     expect(result.fired).toBe(false);
   });
 
-  it('does not fire on too few steps even if tokens look large (minStepsRequired safeguard)', () => {
+  it('does not fire growth heuristics on too few steps below the absolute ceiling', () => {
     const steps: StepRecord[] = [
       {
         timestampMs: NOW_MS - 1000,
@@ -83,6 +83,49 @@ describe('detectContextBloat', () => {
     ];
     const result = detectContextBloat(SCOPE, steps, DEFAULT_CONTEXT_BLOAT_CONFIG, NOW);
     expect(result.fired).toBe(false);
+  });
+
+  it('fires the absolute ceiling immediately on the first observed step', () => {
+    const result = detectContextBloat(
+      SCOPE,
+      [
+        {
+          timestampMs: NOW_MS,
+          canonicalShape: 'single-expensive-call',
+          inputTokens: DEFAULT_CONTEXT_BLOAT_CONFIG.absoluteCeilingTokens,
+          outputTokens: 100,
+          estimatedCostUsd: 0.5,
+        },
+      ],
+      DEFAULT_CONTEXT_BLOAT_CONFIG,
+      NOW,
+    );
+    expect(result.fired).toBe(true);
+    expect(result.score).toBe(DEFAULT_CONTEXT_BLOAT_CONFIG.absoluteCeilingTokens);
+  });
+
+  it('is invariant to delayed/out-of-order step delivery', () => {
+    const ordered = [1000, 2000, 3000, 4000, 5000].map((inputTokens, i) => ({
+      timestampMs: NOW_MS - (5 - i) * 1000,
+      canonicalShape: `s${i}`,
+      inputTokens,
+      outputTokens: 10,
+      estimatedCostUsd: 0.001,
+    }));
+    const reordered = [ordered[0]!, ordered[4]!, ordered[2]!, ordered[1]!, ordered[3]!];
+    const expected = detectContextBloat(
+      SCOPE,
+      ordered,
+      DEFAULT_CONTEXT_BLOAT_CONFIG,
+      NOW,
+    );
+    const actual = detectContextBloat(
+      SCOPE,
+      reordered,
+      DEFAULT_CONTEXT_BLOAT_CONFIG,
+      NOW,
+    );
+    expect(actual).toEqual(expected);
   });
 
   it('fires immediately on an absolute ceiling breach even without a long growth run', () => {

@@ -124,6 +124,31 @@ describe('detectCostVelocity', () => {
     expect(result.fired).toBe(false);
   });
 
+  it('is invariant to delayed/out-of-order delivery of the same calls', () => {
+    const ordered: StepRecord[] = [-3000, -1500, 0].map((offset, i) => ({
+      timestampMs: NOW_MS + offset,
+      canonicalShape: `call-${i}`,
+      inputTokens: 100,
+      outputTokens: 100,
+      estimatedCostUsd: 0.2,
+    }));
+    const reordered = [ordered[0]!, ordered[2]!, ordered[1]!];
+    const expected = detectCostVelocity(
+      SCOPE,
+      ordered,
+      DEFAULT_COST_VELOCITY_CONFIG,
+      NOW,
+    );
+    const actual = detectCostVelocity(
+      SCOPE,
+      reordered,
+      DEFAULT_COST_VELOCITY_CONFIG,
+      NOW,
+    );
+    expect(expected.fired).toBe(true);
+    expect(actual).toEqual(expected);
+  });
+
   it('documents (does not fix): a burst split evenly across the trailing-window boundary can hide real spend from a single evaluation — inherent to the fixed window, see task.md §4.4', () => {
     const windowStartMs = NOW_MS - DEFAULT_COST_VELOCITY_CONFIG.windowMs;
     const steps: StepRecord[] = [

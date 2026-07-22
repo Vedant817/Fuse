@@ -90,6 +90,27 @@ describe('detectLoopSignature', () => {
     expect(result.score).toBe(0);
   });
 
+  it('is invariant to delayed/out-of-order delivery of the same steps', () => {
+    const ordered = buildLoopFixture(NOW_MS, 5);
+    const reordered = [...ordered].sort((a, b) =>
+      a.timestampMs === b.timestampMs ? 0 : a.timestampMs < b.timestampMs ? 1 : -1,
+    );
+    const expected = detectLoopSignature(
+      SCOPE,
+      ordered,
+      DEFAULT_LOOP_SIGNATURE_CONFIG,
+      NOW,
+    );
+    const actual = detectLoopSignature(
+      SCOPE,
+      reordered,
+      DEFAULT_LOOP_SIGNATURE_CONFIG,
+      NOW,
+    );
+    expect(expected.fired).toBe(true);
+    expect(actual).toEqual(expected);
+  });
+
   it('handles a high-volume window without misclassifying noisy-but-distinct steps as a loop', () => {
     const steps = Array.from({ length: 100 }, (_, i) => ({
       timestampMs: NOW_MS - (100 - i) * 100,

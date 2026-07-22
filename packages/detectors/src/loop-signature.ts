@@ -37,7 +37,9 @@ export function detectLoopSignature(
   config: LoopSignatureConfig,
   now: Date,
 ): DetectorResult {
-  const window = steps.slice(-config.windowSize);
+  const window = [...steps]
+    .sort((a, b) => a.timestampMs - b.timestampMs)
+    .slice(-config.windowSize);
   const windowStart =
     window.length > 0
       ? new Date(window[0]!.timestampMs).toISOString()

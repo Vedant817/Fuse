@@ -14,8 +14,8 @@ export interface ContextBloatConfig {
    * even without a perfectly monotonic run (catches noisy-but-growing
    * traces the consecutive-run check might miss). */
   minGrowthRatio: number;
-  /** Minimum steps in the window before evaluating at all — avoids
-   * flagging a session that has only just started. */
+  /** Minimum steps before evaluating growth trends — the absolute ceiling
+   * remains immediate even on the first observed call. */
   minStepsRequired: number;
 }
 
@@ -32,8 +32,11 @@ export function detectContextBloat(
   config: ContextBloatConfig,
   now: Date,
 ): DetectorResult {
+  const orderedSteps = [...steps].sort((a, b) => a.timestampMs - b.timestampMs);
   const windowStart =
-    steps.length > 0 ? new Date(steps[0]!.timestampMs).toISOString() : now.toISOString();
+    orderedSteps.length > 0
+      ? new Date(orderedSteps[0]!.timestampMs).toISOString()
+      : now.toISOString();
   const base: Omit<DetectorResult, 'fired' | 'score' | 'evidence'> = {
     detector: 'context-bloat',
     detectorVersion: CONTEXT_BLOAT_DETECTOR_VERSION,
@@ -44,11 +47,10 @@ export function detectContextBloat(
     dedupeKey: `context-bloat:${scope.tenant}/${scope.environment}/${scope.agentId}`,
   };
 
-  if (steps.length < config.minStepsRequired) {
-    return { ...base, fired: false, score: 0, evidence: [] };
-  }
-
-  const maxInputTokens = Math.max(...steps.map((s) => s.inputTokens));
+  const maxInputTokens =
+    orderedSteps.length > 0
+      ? Math.max(...orderedSteps.map((s) => s.inputTokens))
+      : Number.NEGATIVE_INFINITY;
   if (maxInputTokens >= config.absoluteCeilingTokens) {
     return {
       ...base,
@@ -60,7 +62,13 @@ export function detectContextBloat(
     };
   }
 
-  const consecutiveGrowth = longestTrailingIncreasingRun(steps.map((s) => s.inputTokens));
+  if (orderedSteps.length < config.minStepsRequired) {
+    return { ...base, fired: false, score: 0, evidence: [] };
+  }
+
+  const consecutiveGrowth = longestTrailingIncreasingRun(
+    orderedSteps.map((s) => s.inputTokens),
+  );
   if (consecutiveGrowth >= config.minConsecutiveGrowthSteps) {
     return {
       ...base,
@@ -73,8 +81,8 @@ export function detectContextBloat(
     };
   }
 
-  const first = steps[0]!.inputTokens;
-  const last = steps[steps.length - 1]!.inputTokens;
+  const first = orderedSteps[0]!.inputTokens;
+  const last = orderedSteps[orderedSteps.length - 1]!.inputTokens;
   // A zero-token first step (e.g. a cold-start step with no prompt yet)
   // makes the growth ratio mathematically undefined, not merely large.
   // This used to report `Infinity`, which `JSON.stringify` silently turns

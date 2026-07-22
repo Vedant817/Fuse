@@ -1657,6 +1657,19 @@ Add dated entries here rather than leaving important context only in chat.
   agent disable, webhook permit, and webhook Preflight report; an ordinary
   agent report remained 200/protected and an operator disable remained
   200/disabled.
+- 2026-07-23 (detector boundary audit): fixed two false-negative paths found
+  with executable threshold probes. `context-bloat` checked
+  `minStepsRequired` before its documented immediate absolute-token ceiling,
+  so even a one-step 1,000,000-token observation returned `fired:false`.
+  `cost-velocity` derived elapsed time from array-first/array-last without
+  ordering by timestamp, so the same three $0.20 calls returned `fired:true`
+  chronologically and `fired:false` when delayed delivery reordered them.
+  All detectors now evaluate a timestamp-ordered copy (without mutating caller
+  input), and the absolute context ceiling is evaluated before growth-sample
+  safeguards. Evidence: `pnpm --filter @fuse/detectors run test` (36 tests),
+  build, and typecheck pass; a direct post-fix probe returned `fired:true` at
+  exactly 100,000 tokens on the first call and identical `$0.60` fired results
+  for ordered/reordered cost records.
 
 ### Open blockers and risks
 

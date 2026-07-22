@@ -49,9 +49,9 @@ export function detectCostVelocity(
   now: Date,
 ): DetectorResult {
   const windowStartMs = now.getTime() - config.windowMs;
-  const inWindow = steps.filter(
-    (s) => s.timestampMs >= windowStartMs && s.timestampMs <= now.getTime(),
-  );
+  const inWindow = steps
+    .filter((s) => s.timestampMs >= windowStartMs && s.timestampMs <= now.getTime())
+    .sort((a, b) => a.timestampMs - b.timestampMs);
   const dedupeKey = `cost-velocity:${scope.tenant}/${scope.environment}/${scope.agentId}`;
   const base = {
     detector: 'cost-velocity' as const,
