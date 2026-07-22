@@ -12,6 +12,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getBreakerDecisionCounter,
+  getDetectorScoreGauge,
   getOperationDurationHistogram,
   getTokenUsageHistogram,
 } from './metrics.js';
@@ -80,5 +81,29 @@ describe('metrics instruments', () => {
       (m) => m.descriptor.name === 'fuse.breaker.permit.decisions',
     );
     expect(metric).toBeDefined();
+  });
+
+  it('records the latest detector score as a gauge, by detector type and scope', async () => {
+    getDetectorScoreGauge().record(3, {
+      'fuse.detector': 'loop-signature',
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+    });
+    getDetectorScoreGauge().record(7, {
+      'fuse.detector': 'loop-signature',
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+    });
+    await provider.forceFlush();
+    const [resourceMetrics] = exporter.getMetrics();
+    const metric = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (m) => m.descriptor.name === 'fuse.detector.score',
+    );
+    expect(metric).toBeDefined();
+    // a gauge reports the latest value, not an accumulated sum
+    const dataPoints = metric!.dataPoints as Array<{ value: number }>;
+    expect(dataPoints[0]?.value).toBe(7);
   });
 });

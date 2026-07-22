@@ -5,9 +5,11 @@ import {
   type PermitResponse,
   type Scope,
   type SpanTelemetrySampleWire,
+  type StepObservationWire,
 } from '@fuse/contracts';
 import { BreakerTrippedError } from './errors.js';
 import { PreflightReporter } from './preflight-reporter.js';
+import { StepObservationReporter } from './step-observation-reporter.js';
 
 export interface PermitDecisionTelemetry {
   scope: Scope;
@@ -40,18 +42,29 @@ export interface FuseGuardOptions {
   preflightFlushIntervalMs?: number;
   preflightMaxBatchSize?: number;
   onPreflightReportError?: (err: unknown) => void;
+  /** Whether step observations passed to `recordStepObservation` are
+   * reported for detector evaluation (task.md §4). Defaults to true. */
+  reportStepObservations?: boolean;
+  stepObservationFlushIntervalMs?: number;
+  stepObservationMaxBatchSize?: number;
+  onStepObservationReportError?: (err: unknown) => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 300;
 
 export class FuseGuard {
   private readonly options: Required<
-    Omit<FuseGuardOptions, 'onDecision' | 'onPreflightReportError'>
+    Omit<
+      FuseGuardOptions,
+      'onDecision' | 'onPreflightReportError' | 'onStepObservationReportError'
+    >
   > & {
     onDecision: FuseGuardOptions['onDecision'];
     onPreflightReportError: FuseGuardOptions['onPreflightReportError'];
+    onStepObservationReportError: FuseGuardOptions['onStepObservationReportError'];
   };
   private preflightReporter: PreflightReporter | undefined;
+  private stepObservationReporter: StepObservationReporter | undefined;
 
   constructor(options: FuseGuardOptions) {
     this.options = {
@@ -66,6 +79,10 @@ export class FuseGuard {
       preflightFlushIntervalMs: options.preflightFlushIntervalMs ?? 5_000,
       preflightMaxBatchSize: options.preflightMaxBatchSize ?? 200,
       onPreflightReportError: options.onPreflightReportError,
+      reportStepObservations: options.reportStepObservations ?? true,
+      stepObservationFlushIntervalMs: options.stepObservationFlushIntervalMs ?? 5_000,
+      stepObservationMaxBatchSize: options.stepObservationMaxBatchSize ?? 200,
+      onStepObservationReportError: options.onStepObservationReportError,
     };
   }
 
@@ -113,6 +130,41 @@ export class FuseGuard {
    * reporting was never started. */
   stopPreflightReporting(): void {
     this.preflightReporter?.stop();
+  }
+
+  /**
+   * Feeds one step observation into this guard's detector reporter
+   * (task.md §4), so real telemetry — not just synthetic fixtures — drives
+   * the `fuse.detector.score` gauge a SigNoz alert rule thresholds on.
+   * No-ops if `reportStepObservations` was set to false. Lazily created,
+   * same as `recordSpanTelemetry`.
+   */
+  recordStepObservation(step: StepObservationWire): void {
+    if (!this.options.reportStepObservations) return;
+    if (!this.stepObservationReporter) {
+      this.stepObservationReporter = new StepObservationReporter({
+        scope: this.options.scope,
+        controlPlaneUrl: this.options.controlPlaneUrl,
+        apiToken: this.options.apiToken,
+        fetchImpl: this.options.fetchImpl,
+        flushIntervalMs: this.options.stepObservationFlushIntervalMs,
+        maxBatchSize: this.options.stepObservationMaxBatchSize,
+        onFlushError: this.options.onStepObservationReportError,
+      });
+      this.stepObservationReporter.start();
+    }
+    this.stepObservationReporter.record(step);
+  }
+
+  /** Forces an immediate flush of any buffered step observations. */
+  async flushStepObservations(): Promise<void> {
+    await this.stepObservationReporter?.flush();
+  }
+
+  /** Stops the background flush timer. Safe to call even if step
+   * observation reporting was never started. */
+  stopStepObservationReporting(): void {
+    this.stepObservationReporter?.stop();
   }
 
   /**

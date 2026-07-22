@@ -15,6 +15,8 @@ export const ATTR_FUSE_OUTCOME = 'fuse.outcome';
 export const ATTR_FUSE_ESTIMATED_COST_USD = 'fuse.estimated_cost.usd';
 export const ATTR_FUSE_POLICY_VERSION = 'fuse.policy_version';
 export const ATTR_FUSE_CORRELATION_ID = 'fuse.correlation_id';
+export const ATTR_FUSE_DETECTOR = 'fuse.detector';
+export const ATTR_FUSE_DETECTOR_FIRED = 'fuse.detector.fired';
 
 /** Bumped whenever the shape of Fuse's emitted attributes changes in a way
  * that could break a detector or dashboard — lets Preflight (task.md §6)

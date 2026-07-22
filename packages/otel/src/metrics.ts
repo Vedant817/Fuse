@@ -1,4 +1,4 @@
-import { metrics, type Counter, type Histogram } from '@opentelemetry/api';
+import { metrics, type Counter, type Gauge, type Histogram } from '@opentelemetry/api';
 import {
   METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
   METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
@@ -14,6 +14,7 @@ function meter() {
 let tokenUsageHistogram: Histogram | undefined;
 let operationDurationHistogram: Histogram | undefined;
 let breakerDecisionCounter: Counter | undefined;
+let detectorScoreGauge: Gauge | undefined;
 
 /** `{token}` unit histogram, dimensioned by `gen_ai.token.type` (input/
  * output) plus operation/provider/model — deliberately NOT by
@@ -53,4 +54,26 @@ export function getBreakerDecisionCounter(): Counter {
     description: 'Count of breaker permit decisions, by scope/state/allowed/degraded.',
   });
   return breakerDecisionCounter;
+}
+
+/**
+ * A **gauge**, deliberately not a counter — a detector's `score` (task.md
+ * §4) is a point-in-time evaluation result recomputed on every new step
+ * observation, not something that accumulates. This matters for how a
+ * SigNoz alert rule reads it: a gauge lets the rule use
+ * `timeAggregation: "latest"` / `spaceAggregation: "max"` (trivially
+ * correct — "is the most recent reported score above threshold"), where a
+ * monotonic counter would need `"increase"`/`"rate"` and return 0 for a
+ * brand-new series until it has at least two samples to diff against (see
+ * `docs/adr/006-signoz-alert-rule-provisioning.md`). Dimensioned by
+ * detector type + scope (tenant/environment/agent_id) — bounded cardinality
+ * in any real deployment, same reasoning as `getBreakerDecisionCounter`.
+ */
+export function getDetectorScoreGauge(): Gauge {
+  detectorScoreGauge ??= meter().createGauge('fuse.detector.score', {
+    unit: '1',
+    description:
+      'Most recent detector evaluation score, by detector type and scope. Compare against the threshold configured in the corresponding SigNoz alert rule.',
+  });
+  return detectorScoreGauge;
 }

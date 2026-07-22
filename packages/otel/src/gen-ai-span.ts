@@ -48,6 +48,10 @@ export interface GenAiSpanContext {
    * structural observation of what this span actually recorded — the
    * live-wiring path Preflight reporting hangs off of (task.md §6.2). */
   onTelemetryObserved?: (observation: SpanTelemetryObservation) => void;
+  /** Fired once, after a successful call whose `outcome.canonicalShape` is
+   * set, with the numeric data the loop-signature/context-bloat/cost-
+   * velocity detectors need (task.md §4). */
+  onStepObserved?: (step: StepObservation) => void;
 }
 
 export interface GenAiSpanOutcome {
@@ -56,6 +60,17 @@ export interface GenAiSpanOutcome {
   outputTokens: number;
   finishReasons?: string[];
   outcome: 'success' | 'denied' | 'error';
+  /** A caller-computed, already-canonicalized label for this step's
+   * "shape" — e.g. a hash of the model output, excluding volatile IDs/
+   * timestamps/token counts (see `packages/detectors/src/types.ts`'s
+   * `StepRecord.canonicalShape` doc comment; this is the same contract).
+   * Only the caller knows what makes two steps "the same shape" for its
+   * own agent loop, so this package never invents one — and only the
+   * caller's `fn` knows it, since it depends on the call's own result, not
+   * anything known before dispatch. Leave undefined for calls that aren't a
+   * detectable "step" (e.g. the root `invoke_agent` span's own outcome) —
+   * `onStepObserved` only fires when this is set. */
+  canonicalShape?: string;
 }
 
 /**
@@ -75,6 +90,19 @@ export interface SpanTelemetryObservation {
   hasValidTimestamps: boolean;
   isRootSpan: boolean;
   hasParent: boolean;
+}
+
+/**
+ * The numeric shape `@fuse/detectors`' `StepRecord` needs, field for field
+ * (kept as a locally-owned type for the same reason `SpanTelemetryObservation`
+ * is — this package stays free of a dependency on the wire-contract layer).
+ */
+export interface StepObservation {
+  timestampMs: number;
+  canonicalShape: string;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostUsd: number;
 }
 
 /**
@@ -161,6 +189,16 @@ export async function withGenAiSpan<T>(
           [ATTR_GEN_AI_TOKEN_TYPE]: 'output',
         });
         getOperationDurationHistogram().record(durationSeconds, metricAttributes);
+
+        if (outcome.canonicalShape !== undefined && outcome.outcome === 'success') {
+          ctx.onStepObserved?.({
+            timestampMs: observedAtMs,
+            canonicalShape: outcome.canonicalShape,
+            inputTokens: outcome.inputTokens,
+            outputTokens: outcome.outputTokens,
+            estimatedCostUsd: cost.priced ? cost.costUsd : 0,
+          });
+        }
 
         if (outcome.outcome === 'error') {
           span.setStatus({ code: SpanStatusCode.ERROR });

@@ -10,15 +10,15 @@ A prior gap review found that `packages/detectors` (loop-signature, context-bloa
 cost-velocity) existed as a well-tested pure-function library, but nothing in
 `services/control-plane` ever called it, and no real SigNoz alert rule had
 ever been created — task.md §4.5 was entirely unchecked. The brief's stated
-architecture is explicit: *"SigNoz alerting is the trigger — wire alert rules
-to the enforcement webhook."* The webhook itself (§5.1) was already built and
+architecture is explicit: _"SigNoz alerting is the trigger — wire alert rules
+to the enforcement webhook."_ The webhook itself (§5.1) was already built and
 tested, but only ever driven by synthetic, hand-crafted Alertmanager-shaped
 HTTP payloads — never by a real SigNoz alert rule evaluating real ingested
 telemetry.
 
-A previous session's open-blockers note recorded this as stuck: *"the SigNoz
+A previous session's open-blockers note recorded this as stuck: _"the SigNoz
 UI's session-based auth API was not reverse-engineered (tried `/api/v1/login`
-and `/api/v2/sessions`, both fell through to the SPA route)."* That blocker is
+and `/api/v2/sessions`, both fell through to the SPA route)."_ That blocker is
 now resolved — see below — which unblocks rule-as-code provisioning.
 
 There is also a known, real upstream bug worth naming explicitly:

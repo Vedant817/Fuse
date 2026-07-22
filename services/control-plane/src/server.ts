@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import { BreakerStore, PreflightStore, createPool } from '@fuse/breaker-store';
+import { DetectorRunner } from './detector-runner.js';
 import { bootstrapOtel, type FuseOtelHandle } from '@fuse/otel';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
@@ -47,7 +48,8 @@ async function main(): Promise<void> {
 
   const store = new BreakerStore(pool);
   const preflightStore = new PreflightStore(pool);
-  const app = await buildApp({ store, preflightStore, pool, config });
+  const detectorRunner = new DetectorRunner();
+  const app = await buildApp({ store, preflightStore, detectorRunner, pool, config });
 
   const shutdown = createShutdownHandler({
     log: app.log,

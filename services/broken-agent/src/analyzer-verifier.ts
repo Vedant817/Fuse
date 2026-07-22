@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { withGenAiSpan } from '@fuse/otel';
 import { BreakerTrippedError } from '@fuse/sdk';
 import { defaultMockModel } from './mock-model.js';
@@ -98,6 +98,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
                   correlationId: `${correlationPrefix}-${i}`,
                   conversationId: sessionId,
                   onTelemetryObserved: (obs) => config.guard.recordSpanTelemetry(obs),
+                  onStepObserved: (step) => config.guard.recordStepObservation(step),
                 },
                 async () => {
                   const r = await model.call({
@@ -107,12 +108,25 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
                     scenario: config.scenario,
                     seed: config.seed,
                   });
+                  // Canonicalized per task.md §4.2's "excluding volatile IDs,
+                  // timestamps, and token counts": a hash of the actual
+                  // output content, not the content itself (avoids an
+                  // unbounded-cardinality/oversized attribute value), plus
+                  // the role — a real fix in the loop scenario produces
+                  // byte-identical content every round by design, so this
+                  // hash is identical round over round exactly when the
+                  // draft genuinely never changes.
+                  const shapeHash = createHash('sha256')
+                    .update(r.content)
+                    .digest('hex')
+                    .slice(0, 16);
                   return {
                     result: r,
                     outcome: {
                       inputTokens: r.inputTokens,
                       outputTokens: r.outputTokens,
                       outcome: 'success',
+                      canonicalShape: `${role}:${shapeHash}`,
                     },
                   };
                 },

@@ -29,7 +29,9 @@ export const LoopSignatureDetectorConfigSchema = z.object({
   minRepetitions: z.number().int().positive().default(3),
   maxCycleLength: z.number().int().positive().default(4),
 });
-export type LoopSignatureDetectorConfig = z.infer<typeof LoopSignatureDetectorConfigSchema>;
+export type LoopSignatureDetectorConfig = z.infer<
+  typeof LoopSignatureDetectorConfigSchema
+>;
 
 export const ContextBloatDetectorConfigSchema = z.object({
   absoluteCeilingTokens: z.number().int().positive().default(100_000),

@@ -1756,6 +1756,44 @@ Add dated entries here rather than leaving important context only in chat.
   `groq`, 42 input/3 output tokens, scoped to the generated real-agent ID; and
   the control-plane Preflight API returned HTTP 200 `protected`, 100% required
   field coverage and 0% orphan rate for that exact scope.
+- 2026-07-22/23 (§4 gap-closure, slice 1 of 3 — detector-runner built and
+  wired to real telemetry): the previous session's biggest documented gap —
+  `packages/detectors`'s three pure functions existed and were unit-tested,
+  but nothing in `services/control-plane` ever called them, and no real
+  SigNoz alert rule had ever been created — is now partially closed. Built:
+  a `DetectorRunner` (`services/control-plane/src/detector-runner.ts`) that
+  maintains a bounded, TTL-pruned in-memory step buffer per scope and
+  evaluates all three real `@fuse/detectors` functions on every new
+  observation; a new authenticated route (`POST /v1/detectors/observe`,
+  agent-tier auth, wired into `app.ts`); a new `fuse.detector.score` OTel
+  **gauge** (not counter — `packages/otel/src/metrics.ts`, see ADR-006 for
+  why) emitted per detector/scope; a new `onStepObserved`/`canonicalShape`
+  hook on `withGenAiSpan`'s outcome (`packages/otel/src/gen-ai-span.ts`),
+  live-wired through a new `StepObservationReporter` on `FuseGuard`
+  (mirroring `PreflightReporter`'s off-critical-path, swallow-on-failure
+  design exactly) into `services/broken-agent`'s analyzer/verifier loop,
+  which now derives each round's `canonicalShape` from a hash of the
+  model's actual output content, not an invented label. Evidence: 256 unit
+  tests pass across the touched packages (contracts 43, otel 19,
+  detectors 39, control-plane 66, sdk 50, broken-agent 33) plus 83
+  integration tests against real Postgres via testcontainers — both from a
+  fully clean workspace state (`pnpm run check`, `pnpm run test:integration`).
+  A dedicated `detector-runner.test.ts` proves real fixtures (a genuine
+  Analyzer/Verifier ping-pong, a token count crossing the absolute ceiling,
+  a real cost burst) fire the correct detector, that two scopes' buffers
+  never cross-contaminate, and that a stale scope's buffer is pruned rather
+  than growing unbounded. A new `analyzer-verifier.test.ts` case spies on
+  `guard.recordStepObservation` during a real `loop` scenario run and
+  confirms the hash-based `canonicalShape` actually produces a small,
+  bounded, *repeating* set of shapes — the literal property the
+  loop-signature detector depends on — not just "some hash was computed."
+  **Not yet done** (tracked as the next two slices, per task.md's own §4.5
+  and the newly-added `docs/adr/006-signoz-alert-rule-provisioning.md`):
+  no real SigNoz alert rule has been created against this new metric yet,
+  and the `fuse.detector.score` gauge has not yet been confirmed arriving
+  in the self-hosted SigNoz instance from a live run. §4's checkboxes are
+  deliberately left unchecked until that end-to-end proof exists — this
+  entry documents genuine, tested progress, not claimed completion.
 
 ### Open blockers and risks
 

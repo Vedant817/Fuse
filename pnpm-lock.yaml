@@ -274,6 +274,9 @@ importers:
       '@fuse/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@fuse/detectors':
+        specifier: workspace:*
+        version: link:../../packages/detectors
       '@fuse/otel':
         specifier: workspace:*
         version: link:../../packages/otel

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Scope, SpanTelemetrySampleWire } from '@fuse/contracts';
+import type {
+  Scope,
+  SpanTelemetrySampleWire,
+  StepObservationWire,
+} from '@fuse/contracts';
 import { BreakerTrippedError } from './errors.js';
 import { FuseGuard, type PermitDecisionTelemetry } from './guard.js';
 
@@ -15,6 +19,16 @@ function healthySample(): SpanTelemetrySampleWire {
     hasValidTimestamps: true,
     isRootSpan: true,
     hasParent: false,
+  };
+}
+
+function healthyStep(): StepObservationWire {
+  return {
+    timestampMs: Date.now(),
+    canonicalShape: 'analyzer:abc123',
+    inputTokens: 200,
+    outputTokens: 50,
+    estimatedCostUsd: 0.001,
   };
 }
 
@@ -300,6 +314,67 @@ describe('FuseGuard', () => {
     });
     guard.recordSpanTelemetry(healthySample());
     await guard.flushPreflightTelemetry();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('never reports step observations (and never touches fetch for it) unless recordStepObservation is called', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse({
+        allowed: true,
+        state: 'armed',
+        reason: 'armed',
+        epoch: 0,
+        degraded: false,
+        correlationId: 'c1',
+      }),
+    );
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    await guard.guard(() => Promise.resolve('x'), 'c1');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    guard.stopStepObservationReporting();
+  });
+
+  it('recordStepObservation forwards steps to POST /v1/detectors/observe on flush', async () => {
+    const fetchImpl = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith('/v1/detectors/observe'))
+        return new Response(null, { status: 200 });
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp.internal',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    guard.recordStepObservation(healthyStep());
+    await guard.flushStepObservations();
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://cp.internal/v1/detectors/observe',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const [, init] = fetchImpl.mock.calls[0]!;
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.scope).toEqual(SCOPE);
+    expect(body.steps).toHaveLength(1);
+    guard.stopStepObservationReporting();
+  });
+
+  it('does not report step observations when reportStepObservations is false', async () => {
+    const fetchImpl = vi.fn();
+    const guard = new FuseGuard({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+      reportStepObservations: false,
+    });
+    guard.recordStepObservation(healthyStep());
+    await guard.flushStepObservations();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

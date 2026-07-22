@@ -64,6 +64,32 @@ describe('runAnalyzerVerifier', () => {
     expect(new Set(analyzerContents).size).toBe(1); // byte-identical every round: the loop signature
   });
 
+  it('loop scenario reports a small, bounded, repeating set of canonicalShapes to the detector reporter', async () => {
+    const guard = allowingGuard();
+    const observed: string[] = [];
+    vi.spyOn(guard, 'recordStepObservation').mockImplementation((step) => {
+      observed.push(step.canonicalShape);
+    });
+
+    const result = await runAnalyzerVerifier({
+      scenario: 'loop',
+      seed: 1,
+      guard,
+      maxCalls: 12,
+    });
+
+    expect(observed).toHaveLength(result.totalCalls);
+    // Byte-identical analyzer content + one of two verifier phrases means
+    // at most 3 distinct shapes ever appear, never a fresh one per round —
+    // exactly the "canonicalizable repeat" a loop-signature detector needs.
+    expect(new Set(observed).size).toBeLessThanOrEqual(3);
+    // Every shape actually recurs (this is what makes it a *repeat*, not
+    // just a small alphabet of one-off values).
+    const counts = new Map<string, number>();
+    for (const shape of observed) counts.set(shape, (counts.get(shape) ?? 0) + 1);
+    expect(Math.max(...counts.values())).toBeGreaterThan(1);
+  });
+
   it('context-bloat scenario produces strictly growing input tokens round over round', async () => {
     const result = await runAnalyzerVerifier({
       scenario: 'context-bloat',

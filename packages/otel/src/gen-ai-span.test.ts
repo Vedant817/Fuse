@@ -20,6 +20,7 @@ import {
   withGenAiSpan,
   type GenAiSpanContext,
   type SpanTelemetryObservation,
+  type StepObservation,
 } from './gen-ai-span.js';
 
 const BASE_CTX: Omit<GenAiSpanContext, 'stepIndex'> = {
@@ -234,5 +235,62 @@ describe('withGenAiSpan', () => {
       hasOutputTokens: false,
       hasRequestModel: true,
     });
+  });
+
+  it('fires onStepObserved with numeric step data when outcome.canonicalShape is set', async () => {
+    const steps: StepObservation[] = [];
+    await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        stepIndex: 0,
+        onStepObserved: (step) => steps.push(step),
+      },
+      async () => ({
+        result: 'ok',
+        outcome: {
+          inputTokens: 200,
+          outputTokens: 50,
+          outcome: 'success',
+          canonicalShape: 'analyzer:abc123',
+        },
+      }),
+    );
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toMatchObject({
+      canonicalShape: 'analyzer:abc123',
+      inputTokens: 200,
+      outputTokens: 50,
+    });
+    expect(typeof steps[0]?.timestampMs).toBe('number');
+    expect(typeof steps[0]?.estimatedCostUsd).toBe('number');
+  });
+
+  it('never fires onStepObserved when outcome.canonicalShape is not set', async () => {
+    const steps: StepObservation[] = [];
+    await withGenAiSpan(
+      { ...BASE_CTX, stepIndex: 0, onStepObserved: (step) => steps.push(step) },
+      async () => ({
+        result: 'ok',
+        outcome: { inputTokens: 200, outputTokens: 50, outcome: 'success' },
+      }),
+    );
+    expect(steps).toHaveLength(0);
+  });
+
+  it('never fires onStepObserved on error, even when fn would have set canonicalShape', async () => {
+    const steps: StepObservation[] = [];
+    await expect(
+      withGenAiSpan(
+        {
+          ...BASE_CTX,
+          stepIndex: 0,
+          onStepObserved: (step) => steps.push(step),
+        },
+        async () => {
+          throw new Error('provider exploded');
+        },
+      ),
+    ).rejects.toThrow('provider exploded');
+    expect(steps).toHaveLength(0);
   });
 });

@@ -10,12 +10,19 @@ import { registerPermitRoute } from './routes/permit.js';
 import { registerBreakerRoutes } from './routes/breaker.js';
 import { registerWebhookRoutes } from './routes/webhook.js';
 import { registerPreflightRoutes } from './routes/preflight.js';
+import { registerDetectorRoutes } from './routes/detectors.js';
+import { DetectorRunner } from './detector-runner.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
 export interface BuildAppDeps {
   store: BreakerStore;
   preflightStore: PreflightStore;
+  /** Defaults to a fresh in-memory `DetectorRunner` if omitted — most
+   * callers (existing tests, most of the app's own lifecycle) don't need
+   * to observe or control its buffer directly. Pass one explicitly only
+   * when a test needs to assert on it or share it with a fixed clock. */
+  detectorRunner?: DetectorRunner;
   pool: pg.Pool;
   config: ControlPlaneConfig;
 }
@@ -76,6 +83,16 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
         allKnownTokens,
         extractTenantFromRequest,
       )(request, reply);
+    } else if (request.url.startsWith('/v1/detectors/')) {
+      // An agent reports its own step telemetry for detector evaluation —
+      // same trust tier as permit/Preflight reporting (it never mutates
+      // enforcement state, only the in-memory detector buffer), and the
+      // same tenant-scoping rule applies.
+      await requireBearerAuth(
+        agentAllowedTokens,
+        allKnownTokens,
+        extractTenantFromRequest,
+      )(request, reply);
     } else if (request.url.startsWith('/v1/webhooks/')) {
       // The SigNoz alert webhook — its own least-privilege tier: this
       // token can only cause a trip for the scope named in an alert's own
@@ -113,6 +130,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     maxEvidenceStalenessMs: deps.config.preflightMaxEvidenceStalenessMs,
     minRecoveryDwellMs: deps.config.preflightMinRecoveryDwellMs,
   });
+  registerDetectorRoutes(app, deps.detectorRunner ?? new DetectorRunner());
 
   app.setErrorHandler((err, request, reply) => {
     if (reply.sent) return;
