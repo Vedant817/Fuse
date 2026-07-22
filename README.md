@@ -57,9 +57,12 @@ docker compose -f infra/docker-compose.yml up -d postgres
 pnpm --filter @fuse/breaker-store run migrate
 ```
 
-Run the control plane in watch mode:
+Run the control plane in watch mode (pick real random tokens, not these
+examples, if this will be reachable by anyone but you):
 
 ```bash
+CONTROL_PLANE_API_TOKENS=<operator-token> \
+CONTROL_PLANE_AGENT_API_TOKENS=<agent-token> \
 pnpm --filter @fuse/control-plane run dev
 ```
 
@@ -70,6 +73,27 @@ with:
 ```bash
 docker compose -f infra/docker-compose.yml down
 ```
+
+### Live demo
+
+With the control plane running (above), in another terminal:
+
+```bash
+FUSE_CONTROL_PLANE_URL=http://localhost:8080 \
+CONTROL_PLANE_API_TOKENS=<same-operator-token> \
+CONTROL_PLANE_AGENT_API_TOKENS=<same-agent-token> \
+pnpm --filter @fuse/broken-agent run demo
+```
+
+Narrates, against the real running control plane (no mocks): a normal run
+terminating cleanly, a pathological loop capped by the fixture's own hard
+ceiling, an external trip via the real `/v1/breaker/trip` API stopping
+dispatch mid-run with an exact before/after call count, an operator resume,
+and the resulting Preflight status. Set `GROQ_API_KEY` or `NVIDIA_API_KEY`
+to add a real (non-mocked) provider call at the end, guarded exactly like
+any other call. Fails fast with setup instructions if the control plane
+isn't reachable; if SigNoz (below) isn't running either, it says so and
+carries on rather than treating that as an error.
 
 ### Real LLM providers (optional)
 
