@@ -20,6 +20,14 @@ const CONTROL_PLANE_URL = (
   process.env['FUSE_CONTROL_PLANE_URL'] ?? 'http://localhost:8080'
 ).replace(/\/+$/, '');
 
+// Same env var name and default as infra/signoz-up.sh's SIGNOZ_URL, so this
+// message reflects wherever SigNoz was actually told to listen instead of a
+// value hardcoded independently of that script.
+const SIGNOZ_URL = (process.env['SIGNOZ_URL'] ?? 'http://localhost:8080').replace(
+  /\/+$/,
+  '',
+);
+
 function firstToken(envVar: string): string | undefined {
   const raw = process.env[envVar];
   if (!raw) return undefined;
@@ -350,7 +358,13 @@ async function main(): Promise<void> {
       await otel.shutdown();
       console.log(
         fmt.dim(
-          '\nTelemetry flushed. Open SigNoz to see these traces/metrics: http://localhost:8080\n',
+          `\nTelemetry flushed. Open SigNoz to see these traces/metrics: ${SIGNOZ_URL}\n` +
+            (SIGNOZ_URL === CONTROL_PLANE_URL
+              ? '(Note: SIGNOZ_URL and the control plane URL are both set to the same ' +
+                'address — by default both listen on :8080, so at most one can actually ' +
+                'be reachable there. Set SIGNOZ_URL to the port SigNoz is really on if ' +
+                'you run both at once.)\n'
+              : ''),
         ),
       );
     } catch {
