@@ -107,4 +107,51 @@ describe('PreflightStore (Postgres integration)', () => {
     const fetched = await store.getResult(scope);
     expect(fetched?.state).toBe('disabled');
   });
+
+  it('a disabled scope stays disabled across an ordinary telemetry report that omits `disabled` entirely', async () => {
+    // Regression: real agents (packages/sdk/src/preflight-reporter.ts)
+    // never send `disabled` on routine reports. Before this fix, that
+    // omission was treated as "evaluate normally," silently un-disabling
+    // any scope an operator had just disabled.
+    const scope = scopeFor('disabled-stays-sticky');
+    const disabled = await store.evaluate({
+      scope,
+      spans: [],
+      config: DEFAULT_PREFLIGHT_CONFIG,
+      disabled: true,
+      disabledReason: 'planned maintenance window',
+    });
+    expect(disabled.state).toBe('disabled');
+
+    const routineReport = await store.evaluate({
+      scope,
+      spans: buildHealthyFixture(Date.now()),
+      config: DEFAULT_PREFLIGHT_CONFIG,
+      // no `disabled` field at all — an ordinary agent report
+    });
+    expect(routineReport.state).toBe('disabled');
+    expect(routineReport.reason).toBe('planned maintenance window');
+
+    const fetched = await store.getResult(scope);
+    expect(fetched?.state).toBe('disabled');
+  });
+
+  it('an explicit `disabled: false` re-enables a previously-disabled scope', async () => {
+    const scope = scopeFor('disabled-explicit-reenable');
+    await store.evaluate({
+      scope,
+      spans: [],
+      config: DEFAULT_PREFLIGHT_CONFIG,
+      disabled: true,
+      disabledReason: 'maintenance',
+    });
+
+    const reenabled = await store.evaluate({
+      scope,
+      spans: buildHealthyFixture(Date.now()),
+      config: DEFAULT_PREFLIGHT_CONFIG,
+      disabled: false,
+    });
+    expect(reenabled.state).toBe('protected');
+  });
 });

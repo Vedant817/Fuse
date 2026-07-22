@@ -190,4 +190,53 @@ describe('Preflight API (real Postgres + control plane)', () => {
     });
     expect(res.json().result.state).toBe('disabled');
   });
+
+  it('a disabled scope stays disabled when an agent reports ordinary telemetry that omits `disabled` entirely', async () => {
+    // Regression: the real FuseGuard/PreflightReporter path
+    // (packages/sdk/src/preflight-reporter.ts) never sends `disabled` on
+    // its routine reports. This is exactly that real request shape —
+    // POST with `scope`/`spans` only, no `disabled` key at all — and it
+    // must not silently re-enable a scope an operator just disabled.
+    const s = scope();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+      payload: { scope: s, spans: [], disabled: true, disabledReason: 'maintenance' },
+    });
+
+    const routineAgentReport = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: s, spans: [healthySpan(Date.now())] },
+    });
+    expect(routineAgentReport.json().result.state).toBe('disabled');
+    expect(routineAgentReport.json().result.reason).toBe('maintenance');
+
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/preflight/status?tenant=${s.tenant}&environment=${s.environment}&agentId=${s.agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(statusRes.json().result.state).toBe('disabled');
+  });
+
+  it('an explicit `disabled: false` re-enables a previously-disabled scope', async () => {
+    const s = scope();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+      payload: { scope: s, spans: [], disabled: true, disabledReason: 'maintenance' },
+    });
+
+    const reenable = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+      payload: { scope: s, spans: [healthySpan(Date.now())], disabled: false },
+    });
+    expect(reenable.json().result.state).toBe('protected');
+  });
 });

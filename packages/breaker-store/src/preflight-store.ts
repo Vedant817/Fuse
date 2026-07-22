@@ -52,6 +52,27 @@ export class PreflightStore {
         const previous =
           existing.rows.length > 0 ? rowToPreflightResult(existing.rows[0]!) : undefined;
 
+        // Sticky disable: an operator's explicit `disabled: true` must
+        // persist across ordinary telemetry reports that don't mention
+        // `disabled` at all — which is what every real agent's routine
+        // report looks like (packages/sdk/src/preflight-reporter.ts never
+        // sends this field). `evaluatePreflight` itself is a pure function
+        // that correctly treats an omitted `disabled` as "evaluate
+        // normally" for THAT call (tested, intentional) — it has no
+        // concept of persistence, so it's this store's job to carry
+        // forward "still disabled" when the caller didn't say otherwise.
+        // Only an explicit `disabled: true`/`false` in this specific
+        // request changes the disabled status; omitting it must never
+        // silently re-enable evaluation for a scope an operator disabled.
+        const disabled =
+          args.disabled !== undefined ? args.disabled : previous?.state === 'disabled';
+        const disabledReason =
+          args.disabled !== undefined
+            ? args.disabledReason
+            : previous?.state === 'disabled'
+              ? previous.reason
+              : undefined;
+
         const result = evaluatePreflight({
           scope: args.scope,
           spans: args.spans,
@@ -59,8 +80,8 @@ export class PreflightStore {
           now: this.clock(),
           config: args.config,
           previous,
-          disabled: args.disabled,
-          disabledReason: args.disabledReason,
+          disabled,
+          disabledReason,
         });
 
         await client.query(
