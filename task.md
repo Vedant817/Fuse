@@ -1537,6 +1537,110 @@ Add dated entries here rather than leaving important context only in chat.
   workspace state. SigNoz alert-rule-as-code translation (§4.5) and live
   SigNoz ingestion (§3.3) remain explicitly deferred/blocked per the
   user's decision, not silently dropped.
+- 2026-07-23: Independent adversarial audit of the full system as actually
+  deployed — clean-slate build, real self-hosted SigNoz + Postgres +
+  control-plane brought up and hit with real HTTP traffic (not just the
+  test suite), the `broken-agent` demo run against the real stack and
+  independently re-verified via direct Postgres/ClickHouse queries rather
+  than trusted from its own printed output, and targeted attacks against
+  live concurrency, idempotency, tenant-token boundaries, webhook
+  staleness/replay, Preflight hysteresis, detector boundary values, and
+  `broken-agent` safety ceilings. Two P1 bugs and four lower-severity gaps
+  were found, all fixed and independently re-verified live the same day
+  (not just re-tested in isolation):
+  - **P1 (fixed)**: `packages/breaker-store/src/store.ts`'s
+    `executeTransition` misattributed the `breaker_audit_log` row's
+    `actor`/`reason` on every no-op transition (already-tripped/-armed/
+    -disabled/-enabled, across `trip`/`resume`/`disable`/`enable` alike):
+    it sourced those columns from `finalRecord` — for a no-op, the
+    *pre-existing* record, i.e. whichever earlier caller's data was
+    already persisted — while still stamping the *current* caller's own
+    `correlationId`, fabricating a hybrid record that misattributed one
+    caller's action to a different caller's identity. Live-reproduced
+    against the real running control plane before fixing: 3 concurrent
+    `POST /v1/breaker/trip` requests with distinct actor/reason/
+    correlationId/idempotencyKey on one scope produced two persisted
+    audit rows carrying the winning caller's actor/reason but the losing
+    callers' own correlationIds. The existing "10 concurrent trips ...
+    exactly one real transition, rest no-op" test (§2.1) only asserted
+    aggregate counts, never per-response actor/reason/correlationId
+    fields, so this was invisible to it. Fixed by threading the calling
+    request's own `actor`/`reason` through `ExecuteTransitionArgs` and
+    using them (never `finalRecord`'s) for the audit-log INSERT and
+    returned `auditEvent`, for both no-op and real transitions; the
+    top-level `record` field is unchanged and still reflects true current
+    state. Also added `noopReason` to `TransitionResult` (sourced from
+    breaker-core's already-existing `NoopReason`), consumed by the next
+    fix. New regression test in `store.integration.test.ts` asserts every
+    concurrent caller's own auditEvent *and* the corresponding persisted
+    row match that caller's own submitted values, win or lose; re-verified
+    live post-fix with the identical 3-way-concurrent repro above —
+    every response and every persisted row now correctly reflects its own
+    caller.
+  - **P1 (fixed)**: the SigNoz webhook route
+    (`services/control-plane/src/routes/webhook.ts`) collapsed every
+    no-op reason into the single per-alert outcome `'already-tripped'`,
+    including `breaker-disabled`. Live-reproduced: disabled a scope for a
+    maintenance window, sent a fresh valid alert for it, and the webhook
+    response read `{"outcome":"already-tripped"}` even though nothing was
+    ever tripped — enforcement itself was correct (disabled truly resists
+    tripping), but the reported outcome would mislead an operator or any
+    webhook-response-driven automation into believing a detector had
+    already caught the pathology during a period when nothing was
+    enforced. Fixed by branching on the now-exposed `noopReason` and
+    adding a distinct `'breaker-disabled'` outcome value; re-verified live
+    post-fix with the identical repro — the webhook now correctly reports
+    `'breaker-disabled'` and the scope is confirmed unchanged.
+  - **P2 (fixed)**: `services/control-plane/src/server.ts` built the
+    Postgres pool with no operator-overridable options, silently capping
+    the `/v1/permit` hot path at a hardcoded `max: 10` with no env var to
+    raise it. Added `CONTROL_PLANE_DB_POOL_MAX`/`_IDLE_TIMEOUT_MS`/
+    `_CONNECTION_TIMEOUT_MS`/`_STATEMENT_TIMEOUT_MS`, defaulting to the
+    exact previously-hardcoded values (behavior unchanged unless
+    explicitly configured), documented in `.env.example`.
+  - **P2 (fixed)**: `.env.example` documented `FUSE_PERMIT_TIMEOUT_MS` and
+    `FUSE_SDK_OUTAGE_MODE` as SDK config, but nothing anywhere read either
+    — an operator setting them would see zero effect with no warning.
+    `services/broken-agent/src/demo.ts` (the one runnable `FuseGuard`
+    construction site) now reads and validates both at startup via a new
+    `demo-config.ts` helper, with a logged warning and safe fallback
+    (SDK default / `fail-closed`) on an invalid value, covered by 12 new
+    unit tests.
+  - **P2 (fixed)**: Preflight evaluator thresholds
+    (`DEFAULT_PREFLIGHT_CONFIG`) were hardcoded in
+    `services/control-plane/src/routes/preflight.ts` with no override,
+    even though `evaluatePreflight` itself already accepted a configurable
+    argument. Added 7 `CONTROL_PLANE_PREFLIGHT_*` env vars defaulting to
+    the exact prior values; a new integration test proves the wiring is
+    live end-to-end (a stale-evidence span that reports `blind` under
+    default config reports `protected` when `preflightMaxEvidenceStalenessMs`
+    is widened via config, same store, same Postgres).
+  - **P3 (fixed)**: `services/broken-agent/src/safety.ts`'s `clampCeiling`
+    treated `undefined`/`NaN`/`±Infinity` as invalid (falls back to
+    `ABSOLUTE_MAX_*`) but let a negative or zero configured value pass
+    through unmodified — not a safety bypass (only ever made a run *more*
+    restrictive), but inconsistent with the function's own stated
+    contract and capable of silently producing a misleadingly-labeled
+    zero-call "successful" run. Now treated identically to the other
+    invalid-input cases.
+  - **P3, informational (documented, not fixed — not a defect)**:
+    adversarial boundary testing of `packages/detectors/src/
+    cost-velocity.ts` found that a burst of real spend straddling the
+    trailing-window boundary can be under-counted by a single evaluation
+    (up to just-under-2x threshold spend split evenly across the edge can
+    evade detection) — an inherent property of any fixed, non-overlapping
+    window, already implicitly covered by §4.4's deferred learned-baseline
+    item but not previously named this precisely. Added an explicit doc
+    comment and one named regression test locking in and describing this
+    exact behavior, so it reads as a known, accepted characteristic rather
+    than an undiscovered surprise.
+  Full clean-slate verification after all fixes (`dist`/`.tsbuildinfo`
+  removed, real Postgres via testcontainers): `pnpm run check` — 243 unit
+  tests across 9 packages (up from 214); `pnpm run test:integration` — 80
+  integration tests (up from 75). Both P1 fixes were additionally
+  re-verified live against the real running control plane (not just the
+  test suite) with the exact repro steps that first found them, both now
+  behaving correctly.
 
 ### Open blockers and risks
 
