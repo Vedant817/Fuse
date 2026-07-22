@@ -175,8 +175,9 @@ Acceptance criteria:
   tripped, disabled, and protection-degraded) with authorized actors and
   guards. Evidence: `packages/breaker-core/src/transitions.ts` — armed/
   tripped/disabled states, `system`/`policy`/`manual` actor types, guards for
-  cooldown and disabled-overrides-trip; 16 unit tests +  2 property-based
-  invariant tests, all passing (`pnpm --filter @fuse/breaker-core run test`).
+  cooldown and disabled-overrides-trip; 16 total tests, including 2
+  property-based invariant tests, all passing
+  (`pnpm --filter @fuse/breaker-core run test`).
   Note: "protection-degraded" here refers to a distinct concept — Preflight's
   telemetry-health status (§6), not yet built; the enforcement-state enum
   intentionally does not conflate the two (see `breaker-state.ts` comment).
@@ -385,9 +386,12 @@ Acceptance criteria:
   `breaker-core`'s unit tests and `breaker-store`/`control-plane`'s
   integration tests.
 - [x] Add unit/property tests for every valid and invalid transition.
-  Evidence: 16 unit tests + 2 `fast-check` property tests (epoch
+  Evidence: 16 total tests, including 2 `fast-check` property tests (epoch
   monotonicity; a disabled breaker can never be moved to tripped by
   `applyTrip` for any actor/reason) in `transitions.test.ts`, all passing.
+  Audit correction (2026-07-23): earlier wording said "16 unit + 2 property"
+  (18 implied), but the executable suite contains 14 example tests and 2
+  property tests; `vitest` reports exactly 16.
 
 Section 2.1 acceptance criteria (races/bypass/restart/store-failure/status)
 were folded into the combined gap review recorded under §2.3 below, since
