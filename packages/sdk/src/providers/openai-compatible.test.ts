@@ -104,14 +104,12 @@ describe.each([
   it('rejects a 2xx response whose body is not valid JSON with the same typed error', async () => {
     const provider = create({
       apiKey: 'k',
-      fetchImpl: vi
-        .fn()
-        .mockResolvedValue(
-          new Response('not-json', {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          }),
-        ),
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response('not-json', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
     });
     await expect(
       provider.chatCompletion({
