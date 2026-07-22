@@ -48,6 +48,11 @@ pnpm workspaces, one package/service per concern:
 ```bash
 pnpm install
 cp .env.example .env   # then fill in real values — see comments in the file
+# The CLIs intentionally do not parse dotenv files themselves. Export the
+# file in every terminal that will run a Fuse process (bash/zsh):
+set -a
+source .env
+set +a
 ```
 
 Start local Postgres and apply migrations:
@@ -61,8 +66,6 @@ Run the control plane in watch mode (pick real random tokens, not these
 examples, if this will be reachable by anyone but you):
 
 ```bash
-CONTROL_PLANE_API_TOKENS=<operator-token> \
-CONTROL_PLANE_AGENT_API_TOKENS=<agent-token> \
 pnpm --filter @fuse/control-plane run dev
 ```
 
@@ -79,9 +82,6 @@ docker compose -f infra/docker-compose.yml down
 With the control plane running (above), in another terminal:
 
 ```bash
-FUSE_CONTROL_PLANE_URL=http://localhost:8080 \
-CONTROL_PLANE_API_TOKENS=<same-operator-token> \
-CONTROL_PLANE_AGENT_API_TOKENS=<same-agent-token> \
 pnpm --filter @fuse/broken-agent run demo
 ```
 

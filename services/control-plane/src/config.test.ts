@@ -95,6 +95,34 @@ describe('loadConfig Postgres pool options', () => {
   });
 });
 
+describe('loadConfig listener and rate-limit options', () => {
+  it('defaults to the non-conflicting local control-plane port and existing limiter behavior', () => {
+    const config = loadConfig({ ...BASE_ENV });
+    expect(config.port).toBe(8090);
+    expect(config.rateLimitMax).toBe(120);
+    expect(config.rateLimitWindowMs).toBe(60_000);
+  });
+
+  it('parses explicit rate-limit overrides', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_RATE_LIMIT_MAX: '5000',
+      CONTROL_PLANE_RATE_LIMIT_WINDOW_MS: '10000',
+    });
+    expect(config.rateLimitMax).toBe(5000);
+    expect(config.rateLimitWindowMs).toBe(10_000);
+  });
+
+  it('rejects invalid rate-limit overrides', () => {
+    expect(() => loadConfig({ ...BASE_ENV, CONTROL_PLANE_RATE_LIMIT_MAX: '0' })).toThrow(
+      /invalid control-plane configuration/,
+    );
+    expect(() =>
+      loadConfig({ ...BASE_ENV, CONTROL_PLANE_RATE_LIMIT_WINDOW_MS: 'not-a-number' }),
+    ).toThrow(/invalid control-plane configuration/);
+  });
+});
+
 describe('loadConfig Preflight evaluator thresholds', () => {
   it('defaults match @fuse/preflight DEFAULT_PREFLIGHT_CONFIG when unset', () => {
     const config = loadConfig({ ...BASE_ENV });

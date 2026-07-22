@@ -26,7 +26,10 @@ export function normalizeTokens(entries: readonly TokenConfigEntry[]): ScopedTok
 }
 
 const ConfigSchema = z.object({
-  port: z.coerce.number().int().positive().default(8080),
+  // SigNoz's Foundry stack publishes its UI on host port 8080. Keep the
+  // control-plane default distinct so the documented all-local stack can
+  // actually run both processes at once without hidden overrides.
+  port: z.coerce.number().int().positive().default(8090),
   host: z.string().min(1).default('0.0.0.0'),
   logLevel: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
@@ -46,6 +49,12 @@ const ConfigSchema = z.object({
   dbPoolIdleTimeoutMs: z.number().int().positive().default(30_000),
   dbPoolConnectionTimeoutMs: z.number().int().positive().default(2_000),
   dbStatementTimeoutMs: z.number().int().positive().default(5_000),
+  /** Global authenticated/unauthenticated request limiter. The default is
+   * retained for backward compatibility, but production agents can raise
+   * it based on measured permit throughput instead of being hard-capped in
+   * source at two calls/second per shared token. */
+  rateLimitMax: z.number().int().positive().default(120),
+  rateLimitWindowMs: z.number().int().positive().default(60_000),
   /** Behavior for the /permit fast path only, when the store cannot be
    * reached. Mutating endpoints (trip/resume/disable/enable) always fail
    * with 503 on store outage regardless of this setting — a control
@@ -170,6 +179,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
       : undefined,
     dbStatementTimeoutMs: env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS']
       ? Number(env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS'])
+      : undefined,
+    rateLimitMax: env['CONTROL_PLANE_RATE_LIMIT_MAX']
+      ? Number(env['CONTROL_PLANE_RATE_LIMIT_MAX'])
+      : undefined,
+    rateLimitWindowMs: env['CONTROL_PLANE_RATE_LIMIT_WINDOW_MS']
+      ? Number(env['CONTROL_PLANE_RATE_LIMIT_WINDOW_MS'])
       : undefined,
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,

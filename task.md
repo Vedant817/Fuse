@@ -913,7 +913,8 @@ Acceptance criteria:
   "fast after queuing," not a shortfall.
 - [x] Rate-limit abusive sources and emit safe audit/operational telemetry for
   accepted and rejected requests. Evidence: the webhook inherits the
-  global `@fastify/rate-limit` policy (120/min, keyed by bearer token) from
+  global `@fastify/rate-limit` policy (120/min by default, operator-tunable
+  through `CONTROL_PLANE_RATE_LIMIT_MAX`/`_WINDOW_MS`, keyed by bearer token) from
   `app.ts`, same as every other route; every trip (or no-op/rejection) is
   recorded in `breaker_audit_log` with the `system:signoz-webhook:{detector}`
   actor, same as any other trip source.
@@ -1690,6 +1691,20 @@ Add dated entries here rather than leaving important context only in chat.
   @fuse/sdk run test` (38 tests), build, and typecheck pass; the exact direct
   malformed-response repro now returns the typed error with missing-field
   issue paths instead of resolving arbitrary JSON.
+- 2026-07-23 (live-operability audit): fixed three failures in the documented
+  local path. SigNoz Foundry and the control plane both defaulted to host port
+  8080, so they could not coexist; the control plane/demo now default to 8090
+  while SigNoz remains on 8080. README also now explicitly exports `.env` in
+  each terminal: before this, running its migration command after merely
+  copying `.env` failed with `Error: DATABASE_URL is required`. Finally, the
+  global 120/minute per-token limiter was source-hardcoded: a live 121-permit
+  probe returned 120 HTTP 200 responses then one 429, which the SDK treats as
+  an outage and may fail closed. The default is preserved but can now be sized
+  through `CONTROL_PLANE_RATE_LIMIT_MAX`/`_WINDOW_MS`, with the shared-token
+  availability tradeoff documented. Evidence: control-plane unit tests (55),
+  build/typecheck, and `app.integration.test.ts` (21, real Postgres) pass; a
+  sourced `.env.example` migration returns `no pending migrations`; direct
+  config execution reports port 8090 and 120/60000 limiter defaults.
 
 ### Open blockers and risks
 

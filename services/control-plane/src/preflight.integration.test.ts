@@ -24,6 +24,8 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  rateLimitMax: 120,
+  rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],
   agentApiTokens: [AGENT_TOKEN],

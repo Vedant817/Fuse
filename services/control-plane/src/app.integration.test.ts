@@ -22,6 +22,8 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  rateLimitMax: 120,
+  rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
   apiTokens: [VALID_TOKEN],
   agentApiTokens: [],
@@ -115,6 +117,33 @@ describe('control-plane HTTP API (Postgres integration)', () => {
     const body = res.json();
     expect(body.allowed).toBe(true);
     expect(body.state).toBe('armed');
+  });
+
+  it('applies the configured rate-limit override instead of a source-hardcoded maximum', async () => {
+    const limitedApp = await buildApp({
+      store: new BreakerStore(pool),
+      preflightStore: new PreflightStore(pool),
+      pool,
+      config: { ...CONFIG, rateLimitMax: 2, rateLimitWindowMs: 60_000 },
+    });
+    await limitedApp.ready();
+    try {
+      const target = scopeFor('configured-rate-limit');
+      const request = () =>
+        limitedApp.inject({
+          method: 'POST',
+          url: '/v1/permit',
+          headers: authed(),
+          payload: { scope: target, correlationId: randomUUID() },
+        });
+      expect((await request()).statusCode).toBe(200);
+      expect((await request()).statusCode).toBe(200);
+      const limited = await request();
+      expect(limited.statusCode).toBe(429);
+      expect(limited.json().error).toBe('invalid_request');
+    } finally {
+      await limitedApp.close();
+    }
   });
 
   it('rejects a malformed permit request with 400 invalid_request', async () => {
@@ -306,6 +335,8 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        rateLimitMax: 120,
+        rateLimitWindowMs: 60_000,
         storeOutageMode: 'fail-closed',
         apiTokens: [OPERATOR_TOKEN],
         agentApiTokens: [AGENT_TOKEN],
@@ -437,6 +468,8 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        rateLimitMax: 120,
+        rateLimitWindowMs: 60_000,
         storeOutageMode: 'fail-closed',
         apiTokens: [TENANT_A_TOKEN, TENANT_B_TOKEN, WILDCARD_TOKEN],
         agentApiTokens: [],

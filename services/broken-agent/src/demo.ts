@@ -22,7 +22,7 @@ import {
 } from './demo-config.js';
 
 const CONTROL_PLANE_URL = (
-  process.env['FUSE_CONTROL_PLANE_URL'] ?? 'http://localhost:8080'
+  process.env['FUSE_CONTROL_PLANE_URL'] ?? 'http://localhost:8090'
 ).replace(/\/+$/, '');
 
 // Same env var name and default as infra/signoz-up.sh's SIGNOZ_URL, so this
@@ -376,7 +376,7 @@ async function main(): Promise<void> {
           `\nTelemetry flushed. Open SigNoz to see these traces/metrics: ${SIGNOZ_URL}\n` +
             (SIGNOZ_URL === CONTROL_PLANE_URL
               ? '(Note: SIGNOZ_URL and the control plane URL are both set to the same ' +
-                'address — by default both listen on :8080, so at most one can actually ' +
+                'address, so at most one can actually ' +
                 'be reachable there. Set SIGNOZ_URL to the port SigNoz is really on if ' +
                 'you run both at once.)\n'
               : ''),

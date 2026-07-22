@@ -29,8 +29,8 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   });
 
   await app.register(rateLimit, {
-    max: 120,
-    timeWindow: '1 minute',
+    max: deps.config.rateLimitMax,
+    timeWindow: deps.config.rateLimitWindowMs,
     // Authenticated callers are scoped per-token; unauthenticated ones
     // (health checks) are rate-limited per IP by the plugin default.
     keyGenerator: (request) => {

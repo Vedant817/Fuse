@@ -195,7 +195,8 @@ feature that quotes the offending trace).
 ## 6. Denial of service and rate limiting
 
 `@fastify/rate-limit` is registered globally
-(`services/control-plane/src/app.ts`): **120 requests/minute**, keyed by the
+(`services/control-plane/src/app.ts`): **120 requests/minute by default**
+(`CONTROL_PLANE_RATE_LIMIT_MAX`/`_WINDOW_MS` are operator-configurable), keyed by the
 raw `Authorization` header value when present, else by IP. This applies
 uniformly to every route — `/v1/permit` (cheap, no DB write on the happy
 path), `/v1/preflight/report` (can carry up to 2000 span samples and always
@@ -211,6 +212,13 @@ reflecting that this is a heavier operation than a permit check.
 `/v1/preflight/report`, or accept this as within tolerance for a
 single-tenant-per-deployment demo scale and revisit before any multi-tenant
 production deployment.
+
+The limit also applies to the permit hot path. Agents sharing one token share
+one bucket; an exhausted bucket returns 429, which the SDK correctly treats as
+control-plane unavailability and subjects to its configured outage mode. A
+real deployment must therefore size the configurable limit above measured
+aggregate permit throughput (or issue separate tenant/agent tokens) to avoid
+self-inflicted fail-closed denials.
 
 ## 7. Supply chain
 
