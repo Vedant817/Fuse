@@ -81,21 +81,22 @@ Implemented (`services/control-plane/src/routes/webhook.ts`,
   `fingerprint` and `startsAt` remain entirely attacker-chosen fields with
   no payload signature to verify, since SigNoz offers no signing option
   for its webhook channel. That residual capability (a valid token can
-  still force a trip for any scope it names, as often as it likes, as long
-  as each attempt uses a fresh timestamp) is unchanged and tracked below.
+  still force a trip for any **registered, token-authorized** scope it
+  names, as often as it likes, as long as each attempt uses a fresh
+  timestamp) is unchanged and tracked below.
   **Recommended follow-up** for that residual gap: a per-webhook-token
   trip-rate limit tighter than the global 120 req/min default (§6), since
   the staleness window alone cannot bound how often a valid token is used.
-- **No scope binding on the token itself.** `mapSignozAlertToNormalizedEvent`
-  derives `scope` (tenant/environment/agentId) entirely from the alert
-  payload's own labels. A webhook token is not associated with any specific
-  tenant at the auth layer, so a holder of a valid webhook token can trip
-  **any** tenant/environment/agentId it names in the payload, not only
-  "its own." This is a known, accepted tradeoff already noted in
-  `config.ts`'s own doc comment ("a leaked webhook credential can only cause
-  a trip ... for the scope named in the alert's own labels") — worth
-  restating here explicitly because "only for its own scope" is **not**
-  actually true today; it is "only a trip, for any scope."
+- **Fixed: webhook tenant binding and scope registration.** Webhook token
+  entries support the same `tenant:token` form as operator/agent roles.
+  `extractTenantFromWebhookRequest` requires every alert in a grouped
+  delivery to carry one identical tenant before a tenant-bound credential is
+  accepted; missing/mixed tenants fail with 403. A plain token remains an
+  explicit wildcard for a shared multi-tenant SigNoz channel. Independently,
+  the mapper's full scope must already exist in `registered_scopes`, so a
+  valid webhook credential cannot create arbitrary state or metric label
+  tuples. Integration tests prove wrong-tenant/mixed-tenant denial and
+  wildcard compatibility.
 - **No key-rotation mechanism.** Tokens are static environment variables;
   rotating one requires a control-plane restart with a new `.env` value and,
   during any overlap window, both old and new tokens are simultaneously
@@ -153,12 +154,11 @@ operator to actually configure tenant-scoped tokens. `.env.example`
 documents the format and recommends it once more than one tenant shares a
 deployment.
 
-**Still not covered by this fix:** the SigNoz webhook (`/v1/webhooks/*`) is
-deliberately excluded from tenant binding — see ADR-004's "Scope of this
-decision" section for why (a webhook channel may watch multiple tenants,
-and one delivery can carry alerts for several scopes at once). Its
-authentication remains exactly as described in §3, including the
-still-open replay/timestamp-skew gap.
+The SigNoz webhook is now covered too: tenant-bound webhook credentials
+require a single-tenant batch, while a plain wildcard credential preserves
+the deliberate shared-channel topology. The residual fresh-forgery
+limitation in §3 remains because tenant authorization is not payload
+authenticity.
 
 ## 5. Prompt/tool payload collection, redaction, and retention
 
@@ -231,19 +231,16 @@ attack surface: a compromise of any of the four would achieve local code
 execution during `pnpm install` (developer machine or CI), with the
 installing user's privileges.
 
-**Updated 2026-07-23** (task.md §9.1, `docs/adr/009-supply-chain-scan.md`): a
-real `pnpm audit` + license + secret-scan + SBOM pass was run (still manual,
-not wired into CI — no CI exists at all, see task.md §0/§12). Findings:
-`pnpm-workspace.yaml` now also carries `overrides` pinning `undici`/`uuid`
-past 10 dev-only advisories transitive via `@testcontainers/postgresql`; one
-moderate advisory (`@hono/node-server`, transitive via
-`@modelcontextprotocol/sdk`'s server-side transport, which this codebase
-never instantiates) is an accepted, tracked risk, not fixed. License sweep
-of 533 installed packages found zero copyleft. A CycloneDX SBOM is checked
-in at `docs/sbom.cdx.json`. **Recommended follow-up unchanged:** wire
-`pnpm audit`/license-check/SBOM regeneration into a CI pipeline once one
-exists, and periodically re-justify the `allowBuilds` list against the
-then-current dependency tree.
+**Updated 2026-07-23** (task.md §9.1,
+`docs/adr/009-supply-chain-scan.md`): `pnpm-workspace.yaml` pins
+`undici`/`uuid` past testcontainer advisories and
+`@hono/node-server@2.0.10` past both known moderate advisories inherited
+through the MCP SDK. `pnpm audit --prod --audit-level low` now reports
+`No known vulnerabilities found`. `.github/workflows/ci.yml` repeats the
+production audit and creates a required-only CycloneDX 1.6 SBOM with
+`@cyclonedx/cdxgen`; the same workflow builds and smoke-tests the hardened
+container. Periodically re-justify the `allowBuilds` list and require an
+external registry image scan before release promotion.
 
 ## 8. Abuse-case test inventory
 
@@ -277,13 +274,11 @@ of what this document originally found is still visible):
   5-minute-future alert, and an unparseable timestamp are all rejected
   (`stale-alert`, no trip), while a fresh alert still trips normally.
 
-- ~~Unbounded scope cardinality in `DetectorRunner` via distinct
-  `tenant`/`environment`/`agentId` values in `POST /v1/detectors/observe`
-  (found during task.md §9.2's failure-injection review, not originally
-  listed in this document)~~ — now covered: `detector-runner.test.ts`'s
-  cardinality-cap tests prove a caller sending unbounded distinct scopes is
-  bounded by a 10,000-scope LRU eviction, not unlimited memory growth. See
-  `docs/adr/012-failure-injection-review.md`.
+- ~~Unbounded caller-chosen scope cardinality~~ — now covered at the durable
+  boundary: every permit, Preflight, detector, breaker, and webhook route
+  rejects unregistered scopes. Operator-only registration serializes a
+  per-tenant count under a PostgreSQL advisory lock and enforces the
+  configurable cap even across concurrent replicas.
 
 Still with **no test** (tracked as follow-up work, not silently dropped):
 
@@ -299,18 +294,18 @@ Still with **no test** (tracked as follow-up work, not silently dropped):
 
 ## 9. Summary risk register
 
-| #   | Risk                                                                                                                                              | Severity (given current scale)                                                                                       | Status                                                                                                       |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant                                                                     | High for any multi-tenant deployment; low for the current single-tenant demo                                         | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice                              |
-| 2   | Webhook had no replay-window; a stale captured alert could be replayed indefinitely                                                               | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing)                                         | Fixed — `webhookMaxAlertAgeMs`/`webhookMaxClockSkewAheadMs` (§3)                                             |
-| 2b  | Residual: a _fresh_ forged alert from a valid webhook token is still not prevented                                                                | Medium (same fail-safe-only impact; SigNoz has no payload signing)                                                   | Open — recommended fix is a per-webhook-token trip-rate limit                                                |
-| 3   | Flat rate limit across cheap and heavy endpoints                                                                                                  | Low                                                                                                                  | Open, documented, not yet fixed                                                                              |
-| 4   | No online key rotation                                                                                                                            | Low (env-var restart-based rotation works, just isn't graceful)                                                      | Open, documented                                                                                             |
-| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                                                                                     | Low-medium, narrow scope                                                                                             | Manually audited 2026-07-23 (ADR-009); still no CI to enforce it automatically                               |
-| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it                                                              | None today (nothing populates it with sensitive content yet)                                                         | Monitor, no action needed now                                                                                |
-| 7   | Unbounded scope cardinality in `DetectorRunner` (caller-controlled `agentId` growth)                                                              | Medium (memory exhaustion) before the fix; low after                                                                 | Fixed 2026-07-23 — 10,000-scope LRU cap (ADR-012)                                                            |
-| 8   | Unbounded attacker-controlled `detector` label reaching audit-log/log content                                                                     | Medium before the fix (unbounded TEXT growth + log injection surface); low after                                     | Fixed 2026-07-23 — truncated to 200 chars at the mapper + schema (ADR-013)                                   |
-| 9   | Unbounded permanent Postgres row growth + OTel metric cardinality via arbitrary caller-chosen scope tuples on `/v1/permit`/`/v1/preflight/report` | Medium — a real, distinct DoS/cost vector against both Postgres and the SigNoz backend, not covered by risk #7's fix | Open, found 2026-07-23 (ADR-013) — needs a scope-registration or new-scope-rate design, not a one-line patch |
+| #   | Risk                                                                                 | Severity (given current scale)                                                   | Status                                                                                              |
+| --- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant        | High for any multi-tenant deployment; low for the current single-tenant demo     | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice                     |
+| 2   | Webhook had no replay-window; a stale captured alert could be replayed indefinitely  | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing)     | Fixed — `webhookMaxAlertAgeMs`/`webhookMaxClockSkewAheadMs` (§3)                                    |
+| 2b  | Residual: a _fresh_ forged alert from a valid webhook token is still not prevented   | Medium (same fail-safe-only impact; SigNoz has no payload signing)               | Open — recommended fix is a per-webhook-token trip-rate limit                                       |
+| 3   | Flat rate limit across cheap and heavy endpoints                                     | Low                                                                              | Open, documented, not yet fixed                                                                     |
+| 4   | No online key rotation                                                               | Low (env-var restart-based rotation works, just isn't graceful)                  | Open, documented                                                                                    |
+| 5   | `allowBuilds` supply-chain surface                                                   | Low-medium, narrow scope                                                         | Audit/SBOM/container smoke are in checked-in CI; release still requires registry image scanning     |
+| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it | None today (nothing populates it with sensitive content yet)                     | Monitor, no action needed now                                                                       |
+| 7   | Caller-controlled detector scope cardinality                                         | Medium (memory/metric growth) before the fix; low after                          | Fixed 2026-07-23 — registered-scope allowlist and race-safe per-tenant cap                          |
+| 8   | Unbounded attacker-controlled `detector` label reaching audit-log/log content        | Medium before the fix (unbounded TEXT growth + log injection surface); low after | Fixed 2026-07-23 — truncated to 200 chars at the mapper + schema (ADR-013)                          |
+| 9   | Unbounded permanent Postgres/OTel cardinality via arbitrary scope tuples             | Medium before the fix; low after                                                 | Fixed 2026-07-23 — unknown scopes return 404 and registration has a configurable per-tenant ceiling |
 
 None of these gaps affect the breaker's core guarantee (zero provider calls
 after a committed trip) — that guarantee is enforced independently of the

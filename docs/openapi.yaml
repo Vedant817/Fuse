@@ -2,6 +2,9 @@ openapi: 3.0.3
 info:
   title: Fuse control-plane API
   version: '1'
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
   description: >-
     Hand-authored against the actual route/schema code (task.md §10.1's
     "Contract: ... OpenAPI" item) — every path, method, and status code below
@@ -10,8 +13,12 @@ info:
     OpenAPI spec for this project; no code generation or request validation
     is wired to it yet (see docs/runbooks/limitations.md).
 servers:
-  - url: http://localhost:8090
-    description: Local dev default (CONTROL_PLANE_PORT)
+  - url: https://{host}
+    description: TLS-terminated production endpoint
+    variables:
+      host:
+        default: fuse.example.com
+        description: Replace with the deployed ingress hostname
 
 security:
   - bearerAuth: []
@@ -22,11 +29,10 @@ components:
       type: http
       scheme: bearer
       description: >-
-        One flat token type with three roles (operator/agent/webhook) set by
-        which env-var list it appears in, not by anything in the token
-        itself — see docs/threat-model.md §2 and §4. A token valid for one
-        role but used against a route requiring a different role gets 403
-        (FuseError unauthorized), not a silent pass.
+        Bearer tokens have operator/agent/webhook roles based on their
+        env-var list. A `tenant:token` entry is bound to one tenant; a plain
+        token is an explicit wildcard. A role-correct token used against
+        another tenant or a token used against the wrong role gets 403.
 
   schemas:
     Scope:
@@ -55,6 +61,7 @@ components:
             - unauthenticated
             - unauthorized
             - unknown_scope
+            - scope_capacity_exceeded
             - stale_epoch
             - idempotency_conflict
             - invalid_transition
@@ -90,6 +97,60 @@ components:
         cooldownUntil: { type: string, format: date-time, nullable: true }
         updatedAt: { type: string, format: date-time }
         updatedBy: { $ref: '#/components/schemas/Actor' }
+
+    RegisterScopeRequest:
+      type: object
+      required: [scope, policyVersion, actor, reason, correlationId]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        policyVersion: { type: string, minLength: 1, maxLength: 200 }
+        actor: { $ref: '#/components/schemas/Actor' }
+        reason: { type: string, minLength: 1, maxLength: 2000 }
+        correlationId: { type: string, minLength: 1, maxLength: 200 }
+
+    RegisterScopeResponse:
+      type: object
+      required: [registration, breaker, created]
+      properties:
+        registration:
+          type: object
+          required: [scope, policyVersion, registeredAt, registeredBy, reason]
+          properties:
+            scope: { $ref: '#/components/schemas/Scope' }
+            policyVersion: { type: string }
+            registeredAt: { type: string, format: date-time }
+            registeredBy: { $ref: '#/components/schemas/Actor' }
+            reason: { type: string }
+        breaker: { $ref: '#/components/schemas/BreakerRecord' }
+        created:
+          type: boolean
+          description: false when this exact scope was already registered
+
+    ResolvedDetectorPolicy:
+      type: object
+      required:
+        [
+          policyVersion,
+          cooldownSeconds,
+          storeOutageMode,
+          controlPlaneOutageMode,
+          detectors,
+          notificationRoutes,
+        ]
+      properties:
+        policyVersion: { type: string }
+        cooldownSeconds: { type: integer, minimum: 0 }
+        storeOutageMode: { type: string, enum: [fail-open, fail-closed] }
+        controlPlaneOutageMode: { type: string, enum: [fail-open, fail-closed] }
+        notificationRoutes:
+          type: array
+          items: { type: string, enum: [slack] }
+        detectors:
+          type: object
+          description: Effective detector configuration after defaults and scope specificity are resolved.
+          additionalProperties:
+            type: object
+            additionalProperties: true
 
     PermitRequest:
       type: object
@@ -208,11 +269,23 @@ components:
 
     ObserveStepsResponse:
       type: object
-      required: [results]
+      required: [results, enforcement]
       properties:
         results:
           type: array
           items: { $ref: '#/components/schemas/DetectorResult' }
+        enforcement:
+          type: array
+          items:
+            type: object
+            required: [detector, outcome]
+            properties:
+              detector:
+                type: string
+                enum: [loop-signature, context-bloat, cost-velocity]
+              outcome:
+                type: string
+                enum: [tripped, already-tripped, breaker-disabled]
 
     SpanTelemetrySample:
       type: object
@@ -350,6 +423,7 @@ paths:
             application/json:
               schema:
                 { type: object, properties: { status: { type: string, enum: [ok] } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /readyz:
     get:
@@ -372,6 +446,64 @@ paths:
                 properties:
                   status: { type: string, enum: [not-ready] }
                   reason: { type: string, enum: [store_unavailable] }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/scopes/register:
+    post:
+      operationId: postScopeRegister
+      summary: Register and initialize an allowed scope (operator-only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/RegisterScopeRequest' } }
+      responses:
+        '200':
+          description: Existing registration returned unchanged
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/RegisterScopeResponse' } }
+        '201':
+          description: Scope registered and armed breaker initialized
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/RegisterScopeResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Per-tenant registered-scope capacity reached
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/policies/effective:
+    get:
+      operationId: getEffectivePolicy
+      summary: Inspect the effective detector policy for a registered scope (operator-only)
+      parameters:
+        - { name: tenant, in: query, required: true, schema: { type: string } }
+        - { name: environment, in: query, required: true, schema: { type: string } }
+        - { name: agentId, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Policy loaded by this replica
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scope, policy]
+                properties:
+                  scope: { $ref: '#/components/schemas/Scope' }
+                  policy: { $ref: '#/components/schemas/ResolvedDetectorPolicy' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/permit:
     post:
@@ -389,6 +521,14 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503':
+          description: Breaker store unavailable
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/breaker/trip:
@@ -408,6 +548,10 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
         '409':
           description: idempotency_conflict / stale_epoch / invalid_transition
           content:
@@ -557,6 +701,18 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '409':
+          description: Detector trip contention could not be resolved; retry
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503':
+          description: Scope registry/store unavailable or no active detector policy
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
 
   /v1/webhooks/signoz:
     post:

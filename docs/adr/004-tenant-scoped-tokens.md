@@ -1,6 +1,6 @@
 # ADR-004: Tenant-scoped bearer tokens
 
-- Status: accepted
+- Status: accepted; amended 2026-07-23 to cover grouped webhooks
 - Date: 2026-07-21
 - Deciders: Vedant817 (via delegated senior-engineer agent)
 
@@ -40,9 +40,9 @@ token's tenant, or the request gets the same `403 unauthorized` used for a
 role mismatch — a role-correct token is not sufficient if it was scoped to
 a different tenant.
 
-Wired into `/v1/permit`, `/v1/preflight/*`, and `/v1/breaker/*` in
-`services/control-plane/src/app.ts`. **Deliberately not wired into
-`/v1/webhooks/*`** — see "Scope of this decision" below.
+Wired into `/v1/scopes/*`, `/v1/permit`, `/v1/preflight/*`,
+`/v1/detectors/*`, `/v1/breaker/*`, and `/v1/webhooks/*` in
+`services/control-plane/src/app.ts`.
 
 Chosen specifically so **every existing config, token, and test continues
 to work completely unchanged**: a plain token (the only form that existed
@@ -52,26 +52,24 @@ opt-in, verified in `services/control-plane/src/app.integration.test.ts`
 radius" — proves a tenant-A token cannot trip/resume/read tenant B's scope,
 and that a wildcard token still can act on any tenant).
 
-## Scope of this decision — what is NOT covered
+## Amendment: grouped SigNoz webhooks
 
-The SigNoz alert webhook (`/v1/webhooks/*`) is explicitly excluded from
-tenant binding, even if a `tenant:token` entry is configured for
-`CONTROL_PLANE_WEBHOOK_TOKENS`. Reasons:
+The original decision excluded `/v1/webhooks/*` because one Alertmanager
+delivery may group several tenants. Adversarial review showed that silently
+ignoring an explicitly tenant-scoped webhook token was more surprising and
+dangerous than requiring the operator to choose a topology.
 
-1. A single SigNoz instance/webhook channel may legitimately monitor
-   multiple tenants; forcing one webhook token per tenant would require
-   either multiple SigNoz alert-manager receivers or multiple Fuse
-   deployments for a single-Fuse-instance-many-tenants topology that is
-   otherwise supported everywhere else in this system.
-2. One Alertmanager delivery can already carry a **group** of multiple
-   alerts, each naming its own scope — there is no single "the tenant this
-   request targets" for a webhook delivery the way there is for a `/permit`
-   or `/breaker/trip` call with exactly one `scope`.
-3. The webhook's threat model is already narrower by design (trip-only,
-   never resume/disable/force-arbitrary) — this ADR closes the more severe
-   operator/agent-token gap first. The webhook's own remaining gap (no
-   replay/timestamp-skew window — `docs/threat-model.md` §3) is tracked as
-   a separate, still-open item.
+`extractTenantFromWebhookRequest` now returns a tenant only when every alert
+in the grouped payload names the same tenant. A `tenant:token` webhook
+credential therefore accepts a same-tenant batch and rejects missing,
+wrong-tenant, or mixed-tenant batches with 403. A plain token retains the
+wildcard behavior required by a deliberately shared multi-tenant SigNoz
+channel. This preserves both supported topologies without treating a scoped
+credential as unscoped.
+
+This change does not authenticate the alert body itself. The residual
+fresh-forgery limitation and its fail-safe-only impact remain documented in
+`docs/threat-model.md`.
 
 ## Alternatives considered
 

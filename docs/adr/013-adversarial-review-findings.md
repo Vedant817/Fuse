@@ -4,6 +4,13 @@
 - Date: 2026-07-23
 - Deciders: Vedant817 (explicit choice, via delegated senior-engineer agent)
 
+> Amendment (2026-07-23): the scope-cardinality finding recorded below is
+> fixed. Migration `0003_scope_registry.sql` introduces the authoritative
+> registry; operator-only `/v1/scopes/register` enforces a configurable,
+> advisory-lock-serialized per-tenant cap; every permit, Preflight,
+> detector, breaker, and webhook path rejects unregistered tuples. The
+> original text remains below as the rationale that led to the fix.
+
 ## Context
 
 task.md §11.3 asks for independent adversarial review across correctness/
@@ -66,7 +73,7 @@ token that merely _contains_ "changeme" elsewhere is not falsely rejected.
 distinct failure modes (empty token vs. placeholder token) instead of
 conflating them into one inaccurate row.
 
-### Recorded as an open, real gap — not fixed this slice: unbounded scope-tuple growth in Postgres + OTel cardinality (security review)
+### Fixed in the production-readiness follow-up: unbounded scope-tuple growth in Postgres + OTel cardinality
 
 Distinct from the already-fixed `DetectorRunner` in-memory scope cap
 (ADR-012, which only bounds a buffer used by `/v1/detectors/observe`): a
@@ -83,7 +90,7 @@ combination on `fuse.breaker.permit.decisions`/`fuse.preflight.state` —
 "bounded cardinality by design: ... a finite, pre-registered set in any
 real deployment," which is an assumption, not an enforced invariant.
 
-**Not fixed this slice** — this is a materially bigger design question
+**Original disposition (superseded)** — this was a materially bigger design question
 than the `DetectorRunner` cap (which was a self-contained, in-memory,
 per-process fix): bounding it here would mean either registering valid
 `agentId`s ahead of time (a real onboarding-flow decision, not present in
@@ -91,9 +98,18 @@ this system's design at all) or adding a cap/rate-limit specifically on
 _new_-scope creation distinct from the existing per-token request-rate
 limit — both real feature designs, not a one-line patch, and both would
 need their own test coverage and threat-model update before shipping.
-Recorded honestly here and cross-referenced from
+It was originally recorded honestly here and cross-referenced from
 `docs/threat-model.md` and `docs/runbooks/limitations.md` rather than
 silently left out of both.
+
+The follow-up chose explicit registration. `registered_scopes` is the
+durable allowlist and foreign-key parent for breaker/Preflight state.
+Registration is operator-only, initializes the breaker atomically, and
+serializes count+insert per tenant before enforcing
+`CONTROL_PLANE_MAX_REGISTERED_SCOPES_PER_TENANT` (default 10,000). Existing
+pre-migration breaker/Preflight rows are backfilled. Integration tests cover
+unknown-scope rejection on every path, cap exhaustion, and concurrent
+registration at the boundary.
 
 ### Reviewed, no action needed
 
@@ -127,6 +143,5 @@ silently left out of both.
 - Startup now fails fast and loudly on a forgotten placeholder token
   instead of an operator discovering it later via a leaked/guessable
   credential.
-- The unbounded-scope-cardinality gap is a genuine, undone piece of work —
-  tracked here, in the threat model, and in the limitations runbook, not
-  silently absent from all three.
+- The unbounded-scope-cardinality gap is closed by the registry described in
+  the amendment above.

@@ -4,6 +4,24 @@
 - Date: 2026-07-23
 - Deciders: Vedant817 (explicit choice, via delegated senior-engineer agent)
 
+> Amendment (2026-07-23): the detector transport no longer retains
+> per-process scope buffers. Each SDK request carries its complete bounded
+> trailing window and `DetectorRunner.evaluateWindow` is stateless, so the
+> LRU described below is historical. Durable scope cardinality is now
+> enforced by operator-only registration and a race-safe per-tenant
+> PostgreSQL cap; see ADR-013's amendment and migration
+> `0003_scope_registry.sql`.
+>
+> A later two-process live race found a second side-effect bug: idempotency
+> correctly replayed the original trip result, but both replicas interpreted
+> `noop: false` as permission to post Slack, producing two cards for one
+> audit transition. `TransitionResult.replayed` now distinguishes the
+> invocation that committed from callers receiving its snapshot. Public
+> breaker responses remain identical; diagnosis/Slack runs only for the
+> original. Store, detector-route, and webhook-route regression tests cover
+> this, and the repeated live race produced one audit row and one Slack
+> message timestamp.
+
 ## Context
 
 task.md §9.2 asks for failure-injection tests — Postgres outages, webhook

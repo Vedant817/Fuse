@@ -47,12 +47,13 @@ the single place a new operator or judge should read to know what Fuse does
   requires an env-var change and a process restart
   (`docs/runbooks/operations.md` §5); a leaked token stays valid until an
   operator notices and rotates it.
-- **No automated backup/retention job for the state store.** Neither
-  `breaker_audit_log` nor `idempotency_keys` is ever automatically pruned
-  (`docs/runbooks/operations.md` §6) — both grow unbounded until an
-  operator sets up a retention job. There is also no automated Postgres
-  backup — "restore from backup" in the rollback runbook assumes you built
-  one yourself.
+- **No repository-provided PostgreSQL backup or audit-log retention job.**
+  The Kubernetes base includes an expired-`idempotency_keys` cleanup CronJob,
+  but `breaker_audit_log` intentionally has no default deletion window and
+  the repository cannot define the operator's legal retention policy.
+  Production still requires a managed PostgreSQL backup/PITR policy and a
+  rehearsed restore; "restore from backup" assumes those external controls
+  were provisioned.
 - **No scripted schema rollback.** Migrations are forward-only
   (`docs/runbooks/operations.md` §4) — reverting a bad schema change means
   a manual reverse migration or a backup restore, not a one-command
@@ -68,35 +69,36 @@ the single place a new operator or judge should read to know what Fuse does
   stores histogram sub-metrics (`.sum`/`.count`/`.bucket`) separately; the
   shipped dashboard queries `.sum` (a total), not a computed p95/p99 from
   `.bucket` — an honest simplification, not a hidden gap.
-- **Single-process, single-Postgres-instance capacity, not a production
-  scaling story.** `docs/adr/011-permit-load-test.md`'s load test measured
-  one control-plane process against one local Postgres instance on
-  developer hardware (~6.5–7k permit checks/s, DB pool as the bottleneck at
-  higher concurrency, zero errors observed). No multi-instance horizontal
-  scaling, sustained-hours soak testing, or real network-topology
-  (reverse-proxy, TLS termination, multi-region) testing has been done.
-- **Detector telemetry buffers are in-memory and per-process.**
-  `DetectorRunner`'s trailing-window state (task.md §4) is lost on a
-  control-plane restart — the next few reported steps rebuild it, which is
-  an accepted characteristic, not a durability guarantee. It is bounded
-  (per-scope: 500 steps / 1 hour; total distinct scopes: 10,000 with LRU
-  eviction, `docs/adr/012-failure-injection-review.md`) but not persisted.
-- **A caller can grow `breaker_state`/`preflight_state` and their own
-  metric cardinality without limit.** Unlike `DetectorRunner`'s in-memory
-  buffer (bounded, above) and `idempotency_keys` (has a TTL,
-  `docs/runbooks/operations.md` §8), any agent-scoped token can create a
-  permanent new row per never-seen `agentId` on `/v1/permit` or
-  `/v1/preflight/report`, with no cap — a real, found-not-fixed gap
-  (`docs/adr/013-adversarial-review-findings.md`), tracked in
-  `docs/threat-model.md`'s risk register as risk #9.
-- **No SAST/container-image scanning has been run.** `docs/adr/009-supply-
-chain-scan.md` covers dependency vulnerabilities, licenses, secrets, and
-  an SBOM — but no static-analysis security scan and no container-image
-  scan (this project builds no image of its own; only third-party images
-  referenced in `infra/docker-compose.yml` are used, pinned by tag).
-- **No CI pipeline exists.** Every check in this project (`pnpm run check`,
-  the load test, the security scans) was run manually and evidenced in
-  `docs/adr/*.md` — none of it is automated to run on every change yet.
+- **The checked-in two-replica topology is not a multi-region guarantee.**
+  Detector requests carry their complete bounded window, and PostgreSQL
+  serializes registration and breaker transitions, so either replica can
+  handle a request. The repository has not run a sustained multi-zone soak,
+  regional failover, or disaster-recovery exercise. The earlier local load
+  test remains a capacity input, not a universal sizing promise.
+- **One logical scope needs one authoritative observation stream.** The SDK
+  carries at most 200 trailing observations per detector request. Two
+  independent agent processes reusing the same
+  `tenant/environment/agentId` do not merge their client-side windows;
+  allocate distinct `agentId` values or detect the aggregate in SigNoz.
+- **Scope onboarding is bounded but has no deletion workflow.** Every
+  operational path now rejects unknown scopes, and operator-only
+  `/v1/scopes/register` enforces a race-safe per-tenant cap (10,000 by
+  default). Registered scopes are durable and there is no deregistration
+  endpoint yet; capacity reclamation is an operator/database procedure.
+- **Diagnosis and Slack delivery are best-effort after the durable trip.**
+  A breaker trip commits before diagnosis starts, so Slack/MCP failure can
+  never weaken enforcement. There is no durable notification outbox:
+  terminating a process in the small interval after commit can lose that
+  incident's Slack notification. The audit row remains authoritative and
+  queryable for reconciliation.
+- **Container scanning is a release-environment gate, not a checked-in CI
+  job.** CI performs dependency audit, SBOM generation, container build,
+  hardening checks, and a live container smoke test. A registry scanner must
+  still approve the immutable image digest before promotion.
+- **The CI workflow exists but has not run on GitHub yet.** The local
+  equivalents pass, but `.github/workflows/ci.yml` cannot provide remote
+  evidence until the local commits are pushed to the verified personal
+  repository and GitHub executes it.
 
 ## Where to look for more detail
 

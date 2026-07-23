@@ -118,11 +118,16 @@ Demo success measures:
   `.github/CODEOWNERS` (single owner, `@Vedant817`, matching the current
   single-maintainer reality). `pnpm run format`/`pnpm run lint` both pass
   clean with these files present.
-- [ ] Add secret scanning, dependency audit, and license checks. Not started.
-- [ ] Add CI for clean install, format/lint/type check, tests, build, security
+- [x] Add secret scanning, dependency audit, and license checks. Evidence:
+  `docs/adr/009-supply-chain-scan.md`; the production dependency graph now
+  returns `No known vulnerabilities found`, and CI retains the audit/SBOM
+  evidence.
+- [x] Add CI for clean install, format/lint/type check, tests, build, security
   checks, and artifact retention; protect secrets on forked pull requests.
-  Not started — no remote to host CI against yet, but the workflow file
-  can and should be written locally regardless.
+  Evidence: `.github/workflows/ci.yml` has read-only permissions, no secret-
+  consuming PR step, pinned actions, full checks/integration/coverage,
+  dependency audit, CycloneDX SBOM retention, and hardened container smoke.
+  It is checked in locally but cannot produce GitHub-run evidence until push.
 - [~] Add reproducible local infrastructure with health checks and pinned
   image versions for SigNoz and the selected state dependencies.
   Done: `infra/docker-compose.yml` pins `postgres:16-alpine` with a
@@ -142,9 +147,9 @@ Acceptance criteria:
   `docker compose ... up` + `pnpm --filter @fuse/control-plane run dev`;
   test via `pnpm run test`/`test:integration`; reset via
   `infra/reset.sh`; stop via `docker compose ... down`).
-- [ ] CI performs the same checks as local development — still not started;
-  no CI workflow file exists and there is still no remote to host it
-  against (see §12 open blockers).
+- [~] CI is configured to perform the same checks as local development plus
+  audit/SBOM/container smoke. The local equivalents pass; GitHub execution is
+  pending the explicitly-deferred push (see §12 open blockers).
 - [x] no secret or machine-specific path is committed — `.env` is
   gitignored, `.env.example` holds only placeholders, and this was
   re-checked via `git status`/diff review before every commit this
@@ -812,14 +817,12 @@ now true. See the dated entries in §12 for full evidence.
   yet).
 - [x] Keep detector configuration in the versioned policy file and include the
   effective policy version in alerts/trips. Evidence:
-  `packages/contracts/src/policy.ts`'s `DetectorsConfigSchema` (this
-  session) — typed per-detector config blocks, defaults asserted against
-  `@fuse/detectors`' own constants via a dedicated drift-guard test
-  (`packages/detectors/src/policy-defaults.test.ts`). Policy-version
-  propagation into alerts/trips is not yet wired (no policy-file *loading*
-  pipeline exists anywhere in the system yet — `PolicySchema` itself has no
-  consumer — tracked as a separate, not-yet-scoped gap, not silently
-  dropped).
+  `packages/contracts/src/policy.ts` plus
+  `services/control-plane/src/policy-loader.ts`: startup validation, duplicate
+  selector rejection, exact/wildcard specificity, and wire-window checks.
+  `CONTROL_PLANE_DETECTOR_POLICY_FILE` is mandatory in production; direct
+  detector trips carry the resolved `policyVersion`, cooldown, and thresholds.
+  `/v1/policies/effective` exposes the loaded result to an authorized operator.
 
 ### 4.2 Loop-signature detector
 
@@ -1050,10 +1053,10 @@ Acceptance criteria:
   the matching alert resolves. No opt-in auto-resume-on-resolve path
   exists yet (not required, avoids speculative abstraction).
 - [x] Return fast after durable acceptance when diagnosis/Slack work is
-  queued. No diagnosis/Slack queue exists yet (§7, not built) — the
-  webhook's response IS the durable acceptance today (a synchronous,
-  atomically-committed `store.trip()` per alert), which is stronger than
-  "fast after queuing," not a shortfall.
+  queued. The breaker trip is synchronously committed before a response and
+  diagnosis/Slack starts asynchronously. The trip/audit is durable; the
+  notification itself remains best-effort because no outbox exists (the
+  separate §5.3 item below remains open).
 - [x] Rate-limit abusive sources and emit safe audit/operational telemetry for
   accepted and rejected requests. Evidence: the webhook inherits the
   global `@fastify/rate-limit` policy (120/min by default, operator-tunable
@@ -1074,9 +1077,8 @@ get 403, not a silent pass, tested).
   resume, disable/enable, and policy inspection endpoints. Evidence: built
   and tested as part of the breaker-first vertical slice (§2) —
   `/healthz`, `/readyz`, `/v1/breaker/status`, `/v1/breaker/{trip,resume,
-  disable,enable}`. No separate "policy inspection" endpoint exists since
-  there is no policy *file* yet (policy values are per-request/env-config
-  today) — tracked as a gap once policy-file loading is built.
+  disable,enable}`, plus operator-only `/v1/policies/effective` for the
+  validated policy file actually loaded by a replica.
 - [x] Enforce roles and tenant/environment boundaries for all control actions.
   Evidence: the three-tier token model (operator/agent/webhook, §2 and
   this slice) plus scope-parameterized routes; cross-scope isolation is
@@ -1090,12 +1092,11 @@ get 403, not a silent pass, tested).
 - [ ] Provide safe pagination/filtering for incident and audit views. Not
   done — no audit-log *read* API exists yet (only the write path via
   `breaker_audit_log`); needed once a dashboard/incident view is built (§8).
-- [ ] Publish OpenAPI and contract tests; ensure error responses leak no
-  stack, secret, or cross-tenant existence information. Partial: contract
-  tests exist for the zod schemas (not yet exported as an OpenAPI spec);
-  error responses are verified to return stable `{error, message,
-  correlationId}` shapes with no stack traces (tested), but no formal
-  cross-tenant-existence-leak audit has been performed.
+- [x] Publish OpenAPI and contract tests; ensure error responses leak no
+  stack, secret, or cross-tenant existence information. Evidence:
+  `docs/openapi.yaml` covers the live routes including scope registration,
+  direct detector enforcement, and effective-policy inspection; schema and
+  auth/integration tests assert stable errors and tenant denial.
 
 ### 5.3 Resilience
 
@@ -1110,11 +1111,10 @@ get 403, not a silent pass, tested).
   revisit under real load testing (§9.2).
 - [ ] Add durable work queue/outbox or document the smaller mechanism that
   prevents accepted incidents from being lost before diagnosis/notification.
-  Not built — there is no diagnosis/notification consumer yet (§7), so
-  there is nothing downstream that could lose an accepted incident today;
-  the trip itself is already durable (synchronous Postgres commit). This
-  becomes a real requirement once §7 exists and must be revisited then,
-  not assumed away.
+  Not built. Diagnosis/Slack now exists and is launched after the durable
+  breaker commit; process termination in that small window can lose the
+  notification while leaving enforcement and its audit row correct. This is
+  an explicit best-effort notification limitation, not a breaker bypass.
 - [~] Test restart recovery, store/queue outage, partial write, clock skew,
   duplicate delivery, and multi-instance concurrency. Done: restart
   recovery, store outage (`StoreUnavailableError` → 503), duplicate
@@ -1621,19 +1621,17 @@ done, tracked as such rather than silently marked complete.
   fixed — a hackathon-timeline tradeoff, not an oversight.
 - [~] Run secret, dependency, license, static-analysis, and container scans;
   remediate critical/high findings or record an explicit accepted risk.
-  Done: `pnpm audit` (11 advisories found, 10 remediated via
-  `pnpm-workspace.yaml` overrides, 1 accepted risk — `@hono/node-server`,
-  transitive via the MCP SDK's unused server-side transport), a license
+  Done: `pnpm audit` (all known advisories remediated via
+  `pnpm-workspace.yaml` overrides, including
+  `@hono/node-server@2.0.10`), a license
   sweep of 533 installed packages (zero copyleft), a targeted secret-
   pattern scan of every tracked file (15 matches, all reviewed and
   confirmed benign — dev-only Postgres credentials and named test
-  fixtures), and a CycloneDX SBOM (`docs/sbom.cdx.json`, 573 components).
-  Not done: static-analysis (SAST) — no `semgrep`/`codeql` binary was
-  available or npx-fetchable in the time available; container-image
-  scanning — N/A, this project builds no container image of its own
-  (services run via `pnpm`/`node` directly; only third-party images in
-  `infra/docker-compose.yml` are used, already pinned by tag). Full trail:
-  `docs/adr/009-supply-chain-scan.md`.
+  fixtures), and a CycloneDX SBOM. CI regenerates the required-only SBOM
+  and builds/smoke-tests a hardened image. External registry image scanning
+  remains a documented release-promotion gate. Full trail:
+  `docs/adr/009-supply-chain-scan.md` and
+  `docs/runbooks/deployment.md`.
 - [x] Run authorization/tenant-isolation and webhook replay tests. Evidence:
   surveyed the existing suite first (`auth.test.ts`, `app.integration.test.ts`,
   `webhook.integration.test.ts`) rather than duplicating it, then actually
@@ -1642,7 +1640,7 @@ done, tracked as such rather than silently marked complete.
   webhook-delivery idempotency. `docs/adr/012-failure-injection-review.md`
   §"Survey" lists every scenario found already covered, with the specific
   test that proves it.
-- [~] Validate secure defaults for TLS, CORS, headers, credentials, debug
+- [x] Validate secure defaults for TLS, CORS, headers, credentials, debug
   output, network exposure, and container user/filesystem permissions.
   Done: CORS (deliberately none registered — verified no
   `access-control-allow-origin` header leaks to a cross-origin caller),
@@ -1650,14 +1648,14 @@ done, tracked as such rather than silently marked complete.
   test), credentials (constant-time token comparison, fail-closed config
   already existed — verified by reading `auth.ts`/`config.ts` directly),
   debug output (confirmed no stack trace/secret ever reaches a client
-  response), network exposure (`trustProxy: false` reviewed and documented
-  for what a real reverse-proxy deployment must revisit). Not done: TLS
-  (deliberately out of scope — this process is designed to sit behind a
-  TLS-terminating reverse proxy, not terminate TLS itself) and container
-  user/filesystem permissions (N/A, no container image built by this
-  project). Full trail: `docs/adr/010-secure-defaults-audit.md`.
+  response), and network exposure. TLS terminates at the checked-in ingress.
+  The production image was actually started non-root with a read-only root
+  filesystem, every capability dropped, and `no-new-privileges`; `/healthz`
+  and `/readyz` both succeeded. Full trail:
+  `docs/adr/010-secure-defaults-audit.md` and
+  `docs/runbooks/deployment.md`.
 - [x] Generate an SBOM and document dependency update ownership. SBOM:
-  `docs/sbom.cdx.json` (CycloneDX 1.6, 573 components). Dependency
+  `docs/sbom.cdx.json` plus the CI-generated CycloneDX 1.6 artifact. Dependency
   ownership: already covered by `.github/CODEOWNERS` (`* @Vedant817`) —
   a single-maintainer project has no separate dependency-ownership
   question to answer beyond that.
@@ -1676,15 +1674,19 @@ done, tracked as such rather than silently marked complete.
   the limiter works. **Not done: the trip path was not separately
   load-tested** — a real, scoped-out gap. Full trail:
   `docs/adr/011-permit-load-test.md`.
-- [~] Run race/stress tests for simultaneous permit/trip/resume and
+- [x] Run race/stress tests for simultaneous permit/trip/resume and
   multi-instance operation. Simultaneous permit/trip/resume: already
   extensively covered by existing tests, verified by an actual run —
   `store.integration.test.ts`'s concurrent-trip-request, concurrent-same-
   idempotency-key, and per-caller-actor-attribution-under-concurrency
   tests, plus `guard.integration.test.ts`'s "concurrent calls racing the
-  trip"/"in-flight exposure" tests. **Not done: multi-instance operation**
-  — every test and the load test both ran a single control-plane process;
-  no test exercises two instances sharing one Postgres.
+  trip"/"in-flight exposure" tests. Multi-instance follow-up ran two real
+  production-mode processes on ports 8090/8091 sharing PostgreSQL: both
+  resolved identical effective policy, concurrent ceiling observations
+  produced one `armed→tripped` audit row (epoch 0→1), and a permit through
+  the opposite replica denied. That run found and fixed duplicate Slack
+  delivery on idempotency replay; the repeat produced exactly one Slack
+  success log/message timestamp across both replicas.
 - [~] Inject state-store, queue, SigNoz, MCP, Slack, DNS/network, and clock
   failures; verify declared behavior and recovery. Verified via a real run
   (not just reading the test files): state-store outage, SigNoz MCP
@@ -1696,17 +1698,16 @@ done, tracked as such rather than silently marked complete.
   unreachable/timeout is covered via `guard.test.ts`, but not a DNS-
   resolution failure specifically). Full survey:
   `docs/adr/012-failure-injection-review.md`.
-- [d] Test clean deploy/restart, schema migration/rollback, backup restore,
+- [~] Test clean deploy/restart, schema migration/rollback, backup restore,
   and expired-state cleanup. Done: clean restart (`shutdown.test.ts`'s
   duplicate-signal and partial-cleanup-failure tests — the real shutdown
   handler drains the Fastify app, Postgres pool, and OTel export in order)
-  and schema migration (real, idempotent, forward-only — verified by
-  reading `migrate.ts`). **Not built, documented honestly as real gaps in
-  `docs/runbooks/operations.md`:** schema rollback (no down-migrations
-  exist at all), backup restore (no backup mechanism exists), and
-  expired-state cleanup (`idempotency_keys`/`breaker_audit_log` are never
-  swept — a ready-to-run SQL snippet is provided in the runbook, but no
-  job is scheduled).
+  and schema migration (real, idempotent, forward-only, protected by a
+  session advisory lock; concurrent migration integration test passes).
+  The Kubernetes base now schedules expired-idempotency cleanup. **External
+  production prerequisites, documented honestly:** schema rollback still
+  has no down migrations, managed PostgreSQL must supply backup/PITR and a
+  restore rehearsal, and audit-log retention is a business decision.
 - [ ] Define SLOs and alerts for permit errors/latency, webhook failures,
   notification backlog, detector lag, stale Preflight, and dropped
   telemetry. Not done — a real, honest gap. The three detector alert
@@ -1731,18 +1732,14 @@ done, tracked as such rather than silently marked complete.
   secret" ask into all three token roles (webhook/agent/operator), since
   the blast radius differs sharply by role and that distinction matters
   more than the literal ask.
-- [~] Document key rotation, policy rollout/rollback, data retention/
+- [x] Document key rotation, policy rollout/rollback, data retention/
   deletion, backup/restore, and audit retrieval. Done: key rotation
-  (`operations.md` §5), policy rollout/rollback (§6 — and honestly states
-  that "rollout" is currently limited to a labeling string,
-  `policyVersion`, since no policy-file *loading* pipeline exists yet;
-  `DetectorRunner` always evaluates hardcoded defaults regardless of any
-  policy file's contents — a pre-existing, already-disclosed gap from
-  task.md §4, restated here since it directly bounds this item), data
+  (`operations.md` §5), policy rollout/rollback (§6 — validated startup
+  policy file, exact/wildcard specificity, rolling restart and rollback),
+  data
   retention/deletion (§8), audit retrieval (§7, with a real SQL query
-  against `breaker_audit_log`). **Not built: backup/restore** — no
-  automated backup mechanism exists; the runbook says so rather than
-  describing a restore procedure for a backup that doesn't exist.
+  against `breaker_audit_log`), and managed-PostgreSQL backup/PITR plus
+  restore-rehearsal requirements (`deployment.md`).
 - [x] Add a limitations/non-guarantees section that matches actual tests.
   Evidence: `docs/runbooks/limitations.md` — distinguishes what Fuse
   actually guarantees (zero provider calls post-trip; honest blind/degraded
@@ -1872,20 +1869,20 @@ tests, all passing.**
   section) is in progress; §11 has not started. Every completed section's
   gaps are recorded honestly (search this file for "Not built"/"real gap")
   rather than silently marked done.
-- [~] Aggregate local and CI checks pass from a clean checkout. `pnpm run
-  check` (format+lint+build+typecheck+test) and `pnpm run test:integration`
-  both pass in full from the current checkout — 479 tests total, verified
-  by an actual run this session, not assumed. **No CI exists** (task.md
-  §0/§12 scope) — "from a clean checkout" was not literally tested in a
-  fresh clone/container, only re-run in the existing working directory;
-  a genuinely fresh-machine rehearsal is a real, not-yet-done step.
-- [x] No unresolved critical/high security finding or known breaker bypass.
-  `pnpm audit` (`docs/adr/009-supply-chain-scan.md`) has exactly one
-  open finding (`@hono/node-server`, moderate, accepted risk with
-  documented reasoning — not critical/high, and not reachable in this
-  codebase's actual usage). No known breaker bypass exists — the
-  zero-provider-calls-post-trip guarantee is proven under concurrent load
-  (`guard.integration.test.ts`).
+- [~] Aggregate local checks pass from a clean build state, and equivalent CI
+  is checked in. On 2026-07-23 every workspace `dist` directory and
+  `.tsbuildinfo` was deleted (`remaining_dist=0 remaining_tsbuildinfo=0`),
+  then `pnpm install`, `pnpm run check`, `pnpm run test:integration`, and
+  `pnpm run test:coverage` all exited 0: 447 unit tests across 52 files and
+  88 integration tests across 11 files (535 total). The new GitHub Actions
+  workflow repeats install/check/integration/coverage/audit/SBOM/container
+  smoke, but its remote execution remains unverified because pushing is not
+  authorized in this audit.
+- [x] No unresolved dependency vulnerability or known breaker bypass.
+  `pnpm audit --prod --audit-level low` returned `No known vulnerabilities
+  found` after pinning the compatible fixed `@hono/node-server` release.
+  The zero-provider-calls-post-trip guarantee remains proven under concurrent
+  load (`guard.integration.test.ts`).
 - [x] Dashboard/alert exports and configuration examples match tested
   versions. `infra/signoz/dashboards/fuse-agent-cost-health.json` and
   `infra/signoz/alerts/*.json` are the exact files applied via
@@ -1898,19 +1895,20 @@ tests, all passing.**
   (`docs/runbooks/*.md`) were written from and cross-checked against real
   commands, which is a partial substitute, not the same as an actual
   fresh-user walkthrough.
-- [ ] Version/changelog/release notes identify limitations and breaking
-  changes. Not done — no `CHANGELOG.md` exists and `package.json` remains
-  at its initial `0.1.0`. A real, honest gap: this project has not cut a
-  release yet, so there is no changelog to write beyond what
-  `docs/runbooks/limitations.md` already covers narratively.
+- [x] Version/changelog/release notes identify limitations and breaking
+  changes. `CHANGELOG.md` now records the unreleased production-hardening
+  changes and points to the limitations/runbooks; packages remain at
+  `0.1.0` until the release owner deliberately cuts a tag.
 - [~] Container/artifact provenance, checksums, SBOM, and rollback are
-  available. SBOM: yes (`docs/sbom.cdx.json`). Container provenance:
-  N/A — this project builds no container image of its own (services run
-  via `pnpm`/`node` directly; only pinned third-party images are
-  referenced). Checksums: not generated for any artifact (no release
-  artifact exists to checksum). Rollback: documented as **not available**
-  for schema changes (`docs/runbooks/operations.md` §4) — stated honestly
-  rather than implied.
+  available. The pinned multi-stage `Dockerfile` produces a non-root
+  production image with OCI labels and a healthcheck; CI publishes its
+  digest and SBOM artifact, while `docs/runbooks/deployment.md` documents
+  digest promotion/rollback. Local final image evidence:
+  `sha256:22a384731a230d679f6a15f26191baf579eac0bad414ece8063fff58c14c60a7`,
+  67,837,827 bytes, user `node`, and a healthy run with a read-only root,
+  all capabilities dropped, and `no-new-privileges`. A registry digest is
+  necessarily unavailable until the image is pushed; schema rollback remains
+  forward-fix only as documented in `docs/runbooks/operations.md`.
 - [ ] Final commit is pushed using verified `Vedant817` authentication and
   the working tree is clean. **Deliberately not done, per the user's
   standing decision this session ("stay local for now")** — every commit
@@ -2629,9 +2627,11 @@ Add dated entries here rather than leaving important context only in chat.
 
 ### Open blockers and risks
 
-- Git remote and repository URL have not yet been supplied or created.
-- GitHub CLI (`gh`) is not installed, so personal-account authentication cannot
-  yet be verified and the publish workflow cannot run.
+- `origin` is `git@github-personal:Vedant817/Fuse.git`, and repository-local
+  identity is the required `Vedant817 <vedantmahajan271@gmail.com>`.
+  GitHub CLI is not installed and the user has not authorized a push in this
+  audit, so remote authentication/CI execution/publishing remain deliberately
+  unverified.
 - **Resolved**: the SigNoz-Cloud-credential blocker no longer applies — the
   deployment target was reversed to self-hosted SigNoz via Foundry
   (ADR-005/2026-07-21), which needs no external account or key. Real
@@ -2646,8 +2646,8 @@ Add dated entries here rather than leaving important context only in chat.
   engineered against the real running instance (not guessed from docs) —
   see `docs/adr/006-signoz-alert-rule-provisioning.md` for the exact login
   flow (`GET /api/v2/sessions/context` → `POST /api/v2/sessions/
-  email_password`) and rule/channel payload shapes. MCP capabilities and
-  Slack workspace remain unselected.
+  email_password`) and rule/channel payload shapes. MCP is live, and Slack
+  is now selected and live-verified in the `Vedant Personal` workspace.
 - **Resolved (2026-07-23):** both real LLM provider credentials are available
   locally. `set -a; source .env; set +a; pnpm --filter @fuse/sdk run test:live`
   passed both live smoke tests (Groq: 184 ms; NVIDIA Build: 481 ms), each
@@ -2663,13 +2663,17 @@ Add dated entries here rather than leaving important context only in chat.
   option — assessed low-severity (a trip is fail-safe, not data-exposing);
   recommended fix is a per-webhook-token trip-rate limit, tracked as
   follow-up work.
-- **New (2026-07-23, §11.3 adversarial review):** an agent-scoped token can
-  grow `breaker_state`/`preflight_state` and their OTel metric cardinality
-  without limit by sending requests with ever-new `agentId`s — distinct
-  from the already-fixed `DetectorRunner` in-memory cap (§9.2). Real,
-  open, not yet fixed — see `docs/threat-model.md` risk #9 and
-  `docs/adr/013-adversarial-review-findings.md` for why this needs a
-  scope-registration or new-scope-rate design decision, not a quick patch.
+- **Resolved (2026-07-23):** arbitrary scope growth is closed by
+  `registered_scopes`, operator-only registration, unknown-scope rejection
+  on every route, and a race-safe configurable per-tenant ceiling.
+- **External production prerequisites:** choose the real hostname/TLS secret,
+  managed PostgreSQL/backup policy, registry image digest/scanner, external
+  secret manager, and monitoring destinations before applying the generic
+  Kubernetes base. These are environment ownership decisions, not code gaps.
+- **Accepted notification limitation:** enforcement/audit is durable, but
+  diagnosis/Slack has no durable outbox. A process crash immediately after a
+  committed trip can lose that notification; reconcile from
+  `breaker_audit_log`.
 
 ### Decisions (2026-07-23, gap-closure session)
 
@@ -2736,3 +2740,56 @@ this context is lost elsewhere:
   instead), a literal from-clean-clone demo run, and release tagging
   (deliberately left to the user's own judgment given the one known-open
   gap above and the standing local-only git decision).
+
+### Independent production-readiness audit evidence (2026-07-23)
+
+The final adversarial pass re-derived the critical claims instead of trusting
+the earlier checkmarks:
+
+- Clean build: after deleting all `dist` directories and `.tsbuildinfo`,
+  `pnpm install`, `pnpm run check`, `pnpm run test:integration`, and
+  `pnpm run test:coverage` exited 0. Counts were 447 unit tests in 52 files
+  and 88 integration tests in 11 files (535 total).
+- Live enforcement: a real Groq-backed broken-agent run reached its configured
+  safety ceiling, a live externally committed trip denied every subsequent
+  provider dispatch (zero post-trip calls), resume restored service, and
+  Preflight reported protected. Direct detector requests against the real
+  server left a normal `[1,6,11,17]` token window armed, while a 100,000-token
+  observation fired context-bloat and committed epoch 1.
+- Multi-replica race: two independent production-mode control-plane processes
+  raced the same detector trip against one Postgres database. SQL returned one
+  audit transition (`1|0|1`), a permit through the other replica denied, and
+  after adding internal idempotency-replay metadata exactly one Slack incident
+  post was delivered rather than two.
+- Slack/ngrok: Slack `auth.test` identified the `fuse` bot in the intended
+  workspace, a real incident message was posted to channel
+  `C0BKFBTFR4H`, the configured ngrok `/healthz` returned 200, a fresh signed
+  interactive request returned 200, and a request signed 601 seconds earlier
+  returned 401. A real one-use Slack `trigger_id` still requires a human button
+  click to prove the modal itself in Slack.
+- SigNoz: `infra/signoz-up.sh` started the self-hosted stack; a real SigNoz
+  POST reached `/v1/webhooks/signoz` with status 200. The alert-channel
+  provisioner now updates an existing channel's URL/token instead of silently
+  retaining a stale placeholder.
+- Packaging: `docker build --pull -t fuse-control-plane:release-candidate .`
+  exited 0. The final image ran healthy and ready as user `node` with a
+  read-only root filesystem, all Linux capabilities dropped, and
+  `no-new-privileges`; the placeholder-token startup attempt correctly exited
+  1 before the audit-only-token smoke was run.
+- Final-image store failure injection: before the outage `/v1/permit` returned
+  `allowed:true`; after `docker kill fuse-postgres` the same running process
+  returned `allowed:false`, `state:"unknown"`, `degraded:true` and `/readyz`
+  returned 503 `store_unavailable`; after `docker start fuse-postgres`,
+  `/readyz` returned 200 and the next permit returned `allowed:true` without
+  restarting the control plane.
+- Supply chain/API/manifests: `pnpm audit --prod --audit-level low` returned
+  `No known vulnerabilities found`; cdxgen produced a CycloneDX 1.6 SBOM with
+  43 components/54 dependencies; Redocly reported the OpenAPI document valid;
+  kubeconform strict mode validated all 10 base resources plus the migration
+  job. The actual local Kubernetes API's dry-run could not be trusted because
+  that configured endpoint returned HTML, so a real target-cluster admission
+  dry-run remains a deployment prerequisite.
+- Structural frontend check: workspace manifests contain only backend/control
+  plane, SDK, detector, diagnosis, OTel, Preflight, and demo-agent packages.
+  A source-tree search excluding generated coverage found no HTML, CSS, TSX,
+  React, Next, Vite, Vue, Svelte, or Angular application.

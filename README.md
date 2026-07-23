@@ -77,7 +77,7 @@ pnpm workspaces, one package/service per concern:
 | `packages/detectors`     | Pure detector functions: loop signature, context bloat, cost velocity                                                           |
 | `packages/otel`          | OTel bootstrap + `gen_ai` semantic-convention span/metric instrumentation                                                       |
 | `packages/sdk`           | `FuseGuard` middleware agents wrap provider calls in, plus Groq/NVIDIA Build adapters                                           |
-| `services/control-plane` | Fastify HTTP API: breaker operations, Preflight report/status, SigNoz alert webhook                                             |
+| `services/control-plane` | Fastify HTTP API: scope/policy operations, direct detector enforcement, breaker/Preflight APIs, SigNoz/Slack webhooks           |
 | `services/broken-agent`  | A generic, invented Analyzer↔Verifier agent fixture used to exercise every detector/breaker/Preflight path in integration tests |
 | `docs/adr/`              | Accepted architecture decision records                                                                                          |
 | `infra/`                 | Local Postgres via Docker Compose, a deterministic reset script, and a self-hosted SigNoz stack (Foundry)                       |
@@ -114,6 +114,13 @@ examples, if this will be reachable by anyone but you):
 ```bash
 pnpm --filter @fuse/control-plane run dev
 ```
+
+Every agent scope must be registered once by an operator before permit,
+Preflight, detector, or webhook traffic can use it. The demo scripts do this
+automatically. Other integrations call `POST /v1/scopes/register`; inspect
+the loaded thresholds afterward with operator-only
+`GET /v1/policies/effective?tenant=...&environment=...&agentId=...`.
+Request/response details are in `docs/openapi.yaml`.
 
 `infra/reset.sh` deterministically drops and recreates the local schema —
 useful before a fresh demo run. Stop and remove the local Postgres container
@@ -205,20 +212,20 @@ Three pure, independently-testable detector functions
 reported step telemetry — never raw prompt/tool content, only structural
 shape (token counts, a canonicalized step signature, cost):
 
-| Detector         | Fires when                                                                                                       | Default threshold                                                     |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `loop-signature` | The same cycle of canonicalized step shapes repeats                                                              | 3 repetitions of a cycle (`packages/detectors/src/loop-signature.ts`) |
-| `context-bloat`  | Input tokens hit an absolute ceiling, OR grow for enough consecutive steps, OR grow past a ratio over the window | 100,000 tokens absolute; 5 consecutive growing steps; 3x growth ratio |
-| `cost-velocity`  | Estimated spend in the trailing window crosses a threshold                                                       | See `DEFAULT_COST_VELOCITY_CONFIG`                                    |
+| Detector         | Fires when                                                                                                                          | Default threshold                                                                                                          |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `loop-signature` | The same cycle of canonicalized step shapes repeats                                                                                 | 3 repetitions of a cycle (`packages/detectors/src/loop-signature.ts`)                                                      |
+| `context-bloat`  | Input tokens hit an absolute ceiling, OR (after a minimum meaningful context size) grow for enough consecutive steps / past a ratio | 100,000 tokens absolute; growth signals require at least 8,000 input tokens, then 5 consecutive growing steps or 3x growth |
+| `cost-velocity`  | Estimated spend in the trailing window crosses a threshold                                                                          | See `DEFAULT_COST_VELOCITY_CONFIG`                                                                                         |
 
 Every default is a real, versioned zod schema
 (`packages/contracts/src/policy.ts`'s `DetectorsConfigSchema`) with its own
-drift-guard test (`packages/detectors/src/policy-defaults.test.ts`) — but
-**the live `DetectorRunner` currently always evaluates the hardcoded
-defaults above, regardless of any policy file's contents**; no policy-file
-_loading_ pipeline exists yet (`docs/runbooks/operations.md` §6). Treat the
-table above as the actual live behavior, not a description of a
-configurable-per-deployment system.
+drift-guard test (`packages/detectors/src/policy-defaults.test.ts`). The
+control plane loads an immutable policy file at startup when
+`CONTROL_PLANE_DETECTOR_POLICY_FILE` is set, resolves exact-scope policies
+ahead of wildcard selectors, and refuses to start in `production` without
+one. The checked-in Kubernetes deployment mounts the explicit
+`fuse-production-v1` policy.
 
 **False-positive tradeoffs**: every threshold above is a real design
 tradeoff, not a proven-optimal constant — a legitimately long analysis task
@@ -272,9 +279,11 @@ online key rotation) are recorded there, not silently fixed or hidden.
 Read [`docs/runbooks/limitations.md`](./docs/runbooks/limitations.md) before
 relying on this in anything beyond a demo — it distinguishes what Fuse
 actually guarantees from documented tradeoffs and real, found-during-testing
-gaps (no online key rotation, no automated backup/retention job, no schema
-rollback, single-instance-only load testing, and more), each cited to its
-proving test or ADR.
+gaps (no online key rotation, no repository-provided database backup or
+schema rollback, best-effort notification delivery, and more), each cited to
+its proving test or ADR. The immutable image, Kubernetes base, migration,
+rollback, and promotion gates are documented in
+[`docs/runbooks/deployment.md`](./docs/runbooks/deployment.md).
 
 ## Troubleshooting
 

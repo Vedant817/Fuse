@@ -12,7 +12,7 @@ scanners were present on this machine (`gitleaks`, `trufflehog`, `syft`,
 `osv-scanner` — all confirmed absent via `which`). Rather than skip this
 section, each requirement was met with a tool that either ships with the
 package manager already in use (`pnpm audit`) or is fetchable on demand via
-`npx` (`license-checker`, `@cyclonedx/cyclonedx-npm`), plus a small
+`npx` (`license-checker`, `@cyclonedx/cdxgen`), plus a small
 purpose-written script for secret scanning where no npx-fetchable
 alternative existed.
 
@@ -39,18 +39,14 @@ _after_ reinstall, not assumed: `pnpm audit` dropped from 11 advisories to 1;
 `pnpm run typecheck`, `pnpm run build`, and `pnpm run test` (286 tests across
 all 10 workspace packages) all still pass against the overridden versions.
 
-**Accepted risk, not fixed**: `@hono/node-server`'s path-traversal advisory.
-`packages/diagnosis/src/mcp-client.ts` imports only
-`@modelcontextprotocol/sdk/client/index.js` and
-`.../client/streamableHttp.js` (grepped directly, not assumed) — the
-_client_ half of the SDK. `@hono/node-server` backs the SDK's _server_-side
-HTTP transport, which this codebase never instantiates (Fuse only ever acts
-as an MCP client, connecting outbound to a SigNoz-operated MCP server — see
-ADR-007). The vulnerable code path (`serve-static`'s Windows
-backslash-encoding bug) is consequently unreachable in this codebase, and
-deployment is Linux-only. No compatible pinned-override version was
-available without forcing an unrelated major-version bump of the whole SDK.
-Tracked here rather than silently ignored.
+**Follow-up fix (2026-07-23):** a compatible Hono 2.x override does exist.
+The first patched path-traversal release (`2.0.5`) was itself affected by a
+later WebSocket-handshake memory-leak advisory, so the final override is
+`@hono/node-server@2.0.10`. Its peer range remains `hono@^4` and its engine
+is Node >=20, both compatible with this repository. After install,
+`pnpm why @hono/node-server` reports only `2.0.10`,
+`pnpm audit --prod --audit-level low` reports
+`No known vulnerabilities found`, and all diagnosis/MCP tests pass.
 
 ### 2. License compliance — package.json license fields on disk, not `license-checker` alone
 
@@ -100,40 +96,28 @@ No real `.env` file, private key, or certificate is tracked (confirmed via
 `git ls-files | grep -iE '\.env$|\.env\.|secret|credential|\.pem$|\.key$'` —
 only `.env.example` matched).
 
-### 4. SBOM — CycloneDX 1.6 via `@cyclonedx/cyclonedx-npm --ignore-npm-errors`
+### 4. SBOM — CycloneDX 1.6 via `@cyclonedx/cdxgen`
 
-`npx @cyclonedx/cyclonedx-npm` shells out to `npm ls --all --json`
-internally, which fails on pnpm's isolated `node_modules` tree (pnpm does
-not flatten transitive dev-dependencies of dependencies into `node_modules`
-the way npm does, so `npm ls` reports hundreds of "missing" peer/dev deps of
-packages that were never meant to be installed standalone). `--package-lock-only`
-does not help either — it looks for `package-lock.json`/`npm-shrinkwrap.json`,
-neither of which exists in a pnpm workspace. Fixed with
-`--ignore-npm-errors`, which tolerates `npm ls`'s non-fatal errors and still
-walks the real `node_modules` tree. Output: `docs/sbom.cdx.json`,
-CycloneDX 1.6, 573 components, each with resolved version, declared
-license, and package URL (`purl`) — validated by re-parsing the output file
-and checking `bomFormat`/`specVersion`/`components.length`, not just a
-clean exit code.
+The original `@cyclonedx/cyclonedx-npm --ignore-npm-errors` approach shells
+out to `npm ls` and emits thousands of false pnpm-tree errors. CI now uses
+`@cyclonedx/cdxgen@12.8.1 --type js --required-only --fail-on-error
+--no-install-deps --spec-version 1.6`, which understands the pnpm workspace
+and fails instead of suppressing extractor errors. The generated artifact
+is reparsed and required to have CycloneDX format/version plus a non-empty
+component list. The locally verified run produced 43 required components
+and 54 dependency graph entries.
 
 ## Consequences
 
-- `pnpm-workspace.yaml` now carries two version overrides
-  (`undici@<6.27.0`, `uuid@<11.1.1`) that must be revisited if
+- `pnpm-workspace.yaml` now carries three version overrides
+  (`@hono/node-server@2.0.10`, `undici@<6.27.0`, `uuid@<11.1.1`) that must
+  be revisited if
   `@testcontainers/postgresql` ever bumps its own `undici`/`uuid` floor past
   these pins (they would become redundant, not wrong).
-- `docs/sbom.cdx.json` is a point-in-time snapshot, not regenerated in CI —
-  no CI pipeline exists yet for this project (out of scope; task.md doesn't
-  ask for one). Re-run
-  `npx @cyclonedx/cyclonedx-npm --ignore-npm-errors --output-file docs/sbom.cdx.json --output-format json`
-  after any dependency change to refresh it.
-- The `@hono/node-server` advisory is a real, tracked, accepted risk — not
-  silently dropped. If Fuse ever grows an MCP _server_ role (not just a
-  client), this must be re-evaluated before that code path ships.
-- Not built: a running SAST tool (no `semgrep`/`codeql` binary available or
-  npx-fetchable in this environment within the time available) and
-  container image scanning (this project builds no container image of its
-  own — services run via `pnpm`/`node` directly; only third-party images
-  referenced in `infra/docker-compose.yml` are pinned by tag, already
-  reviewed) — both real, scoped-out gaps, tracked in task.md §9.1, not
-  assumed complete.
+- `.github/workflows/ci.yml` regenerates and retains the SBOM on every
+  change; `docs/sbom.cdx.json` remains a point-in-time human-review snapshot.
+- CI now builds the repository's immutable control-plane image and runs it
+  non-root/read-only with capabilities dropped. A registry image scanner is
+  still a required promotion gate in `docs/runbooks/deployment.md`; it is
+  intentionally external because the checked-in workflow does not publish a
+  digest.

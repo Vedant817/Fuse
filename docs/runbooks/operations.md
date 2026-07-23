@@ -14,9 +14,8 @@ stated plainly rather than assumed away.
 2. Copy `.env.example` to `.env` and replace every `changeme-...` token with
    a real random value (`openssl rand -hex 32` or equivalent) — the control
    plane refuses to start with a missing `CONTROL_PLANE_API_TOKENS`/
-   `DATABASE_URL` (`config.ts`'s `ConfigSchema`, no default for either), so
-   a copy-pasted placeholder either fails closed at startup or, worse, is a
-   guessable credential if left as-is. Never commit the real `.env`.
+   `DATABASE_URL`, and also rejects the shipped `changeme...` values
+   explicitly. Never commit the real `.env`.
 3. Bring up local infrastructure:
    ```bash
    docker compose -f infra/docker-compose.yml up -d postgres
@@ -69,11 +68,13 @@ grounded in this session's actual measurements (not guesses):
 
 ## 3. Upgrade
 
-There is no versioned release process yet (no CI, no published packages —
-task.md §0/§12 scope). Upgrading in place means: pull the new code,
-`pnpm install`, `pnpm --filter @fuse/breaker-store run migrate` (safe to
-re-run — see below), rebuild (`pnpm run build`), restart the control-plane
-process. `createShutdownHandler` (`shutdown.ts`) drains the process on
+There is a checked-in CI and immutable container build, but no published
+release or automated registry promotion yet. Follow
+`docs/runbooks/deployment.md` for the production image/digest path. An
+in-place source upgrade means: pull the new code, `pnpm install`,
+`pnpm --filter @fuse/breaker-store run migrate` (safe to re-run — see
+below), rebuild (`pnpm run build`), and restart the control-plane process.
+`createShutdownHandler` (`shutdown.ts`) drains the process on
 SIGTERM/SIGINT — closes the Fastify app, the Postgres pool, and OTel export
 in that order, idempotently on a duplicate signal (tested,
 `shutdown.test.ts`) — so a plain process restart (not a hard kill) is
@@ -84,13 +85,17 @@ already graceful.
 `packages/breaker-store/migrations/` is applied in filename order exactly
 once, tracked in a `schema_migrations` table, each inside its own
 transaction. Re-running `pnpm run migrate` after a partial or already-
-complete run is safe — already-applied files are skipped.
+complete run is safe — already-applied files are skipped. A PostgreSQL
+session advisory lock covers the entire discovery/apply sequence, so two
+replicas starting the migration command concurrently serialize rather than
+both attempting the same file.
 
 ## 4. Rollback
 
 **Stated plainly: there is no scripted schema rollback.** The migration
 runner has no "down" migrations — only forward `*.sql` files
-(`0001_init.sql`, `0002_preflight.sql` today). Rolling back a bad schema
+(`0001_init.sql`, `0002_preflight.sql`, `0003_scope_registry.sql` today).
+Rolling back a bad schema
 change today means either:
 
 - Restoring Postgres from a backup taken before the migration ran (there is
@@ -129,30 +134,31 @@ env var and the process restarted. This is a known, documented limitation
 
 ## 6. Policy rollout/rollback
 
-**Stated plainly, this is more limited than "policy rollout" implies.**
-`packages/contracts/src/policy.ts`'s `DetectorsConfigSchema` (task.md §4)
-defines what a versioned per-detector policy file _would_ look like, and
-`packages/detectors/src/policy-defaults.test.ts` guards that its defaults
-stay in sync with the detectors' own hardcoded constants — but there is no
-policy-file _loading_ pipeline anywhere in the running system yet.
-`DetectorRunner` (`services/control-plane/src/detector-runner.ts`) always
-evaluates every scope against the hardcoded `DEFAULT_LOOP_SIGNATURE_CONFIG`/
-`DEFAULT_CONTEXT_BLOAT_CONFIG`/`DEFAULT_COST_VELOCITY_CONFIG` constants,
-regardless of any policy file's contents — this was already disclosed when
-built (task.md §4's evidence: "Policy-version propagation into alerts/trips
-is not yet wired — no policy-file loading pipeline exists anywhere in the
-system yet"), not a new finding, but worth restating here since it directly
-bounds what "rollout" can mean today.
+Set `CONTROL_PLANE_DETECTOR_POLICY_FILE` to a JSON array matching
+`PolicySchema`. Production mode refuses to start without this setting.
+`loadDetectorPolicyFile` validates the whole file before the server listens,
+rejects duplicate selectors, rejects thresholds whose required history
+cannot fit in the 200-observation wire window, and resolves the most specific
+exact/wildcard selector for each scope. Direct SDK detector observations use
+the resolved thresholds, cooldown, and `policyVersion`; the committed trip
+and audit row carry that effective version. Diagnosis/Slack runs only when
+the resolved policy includes `"slack"` in `notificationRoutes`.
 
-What **does** exist and can be "rolled out" today: `policyVersion` is a
-plain label (`CONTROL_PLANE_WEBHOOK_POLICY_VERSION`) stamped onto every
-webhook-driven trip and stored in `breaker_audit_log` — changing it (env
-var + restart) changes the label future trips carry, for audit/traceability
-purposes, but changes no actual detector behavior. Rolling out a genuine
-threshold change today means editing the `DEFAULT_*_CONFIG` constants in
-`packages/detectors/src/*.ts` directly and redeploying — there is no
-runtime reload, no A/B rollout, and no automated rollback beyond reverting
-that code change.
+The file is loaded once at process startup. Roll out a policy by mounting the
+new immutable file and performing a normal rolling restart. Roll back by
+restoring the previous file/image and restarting. Keep a final wildcard
+policy unless every possible registered scope has an exact match; a request
+with no matching policy fails with 503 instead of silently using an
+unreviewed threshold.
+
+`storeOutageMode` is resolved from the in-memory scope policy before the
+permit store call, so it remains available even when PostgreSQL is down.
+Without a policy file (development only),
+`CONTROL_PLANE_STORE_OUTAGE_MODE` is the fallback. Each SDK's
+`FUSE_SDK_OUTAGE_MODE` still controls a control-plane/network failure:
+deployment review must keep it consistent with the policy's declared
+`controlPlaneOutageMode`, because the control plane cannot change an SDK's
+behavior while it is unreachable.
 
 ## 7. Audit retrieval
 
@@ -178,16 +184,10 @@ or webhook delivery with its exact resulting transition(s).
 
 ## 8. Retention
 
-**Real, verified gap, not previously documented as a runbook item:**
-neither `breaker_audit_log` nor `idempotency_keys`
-(`packages/breaker-store/migrations/0001_init.sql`) has any automated
-cleanup. `idempotency_keys` has an `expires_at` column and an index on it
-(`idempotency_keys_expires_idx`) — but `expires_at` is only ever _read_ (to
-decide whether a stored response snapshot is still valid,
-`packages/breaker-store/src/store.ts`), never swept. Both tables grow
-without bound as long as the deployment runs. For a real production
-deployment, schedule a periodic job (cron, or a Postgres `pg_cron`
-extension if available) running:
+`idempotency_keys` has an `expires_at` column and an index on it. The
+production Kubernetes base schedules
+`infra/production/kubernetes/idempotency-cleanup-cronjob.yaml` daily; for a
+different platform, schedule the equivalent:
 
 ```sql
 DELETE FROM idempotency_keys WHERE expires_at < now();
