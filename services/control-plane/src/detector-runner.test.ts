@@ -153,4 +153,53 @@ describe('DetectorRunner', () => {
     expect(velocity?.fired).toBe(false);
     expect(velocity?.score).toBe(0);
   });
+
+  it('caps the number of distinct tracked scopes — a caller sending unbounded distinct agentIds cannot grow memory without limit (task.md §9.2)', () => {
+    const runner = new DetectorRunner(3);
+    const now = new Date('2026-07-22T00:00:00.000Z');
+    const scopeFor = (n: number): Scope => ({
+      tenant: 't1',
+      environment: 'test',
+      agentId: `agent-${n}`,
+    });
+
+    for (let i = 0; i < 3; i++) {
+      runner.recordStep(scopeFor(i), step({ timestampMs: now.getTime() }), now);
+    }
+    expect(runner.trackedScopeCount).toBe(3);
+
+    // A 4th distinct scope must evict the least-recently-touched one
+    // (agent-0, inserted first and never touched again), not grow past
+    // the cap.
+    runner.recordStep(scopeFor(3), step({ timestampMs: now.getTime() }), now);
+    expect(runner.trackedScopeCount).toBe(3);
+    expect(runner.hasScope(scopeFor(0))).toBe(false);
+    expect(runner.hasScope(scopeFor(1))).toBe(true);
+    expect(runner.hasScope(scopeFor(2))).toBe(true);
+    expect(runner.hasScope(scopeFor(3))).toBe(true);
+  });
+
+  it('re-touching an existing scope refreshes its LRU position instead of counting as a new one', () => {
+    const runner = new DetectorRunner(2);
+    const now = new Date('2026-07-22T00:00:00.000Z');
+    const a: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-a' };
+    const b: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-b' };
+    const c: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-c' };
+
+    runner.recordStep(a, step({ timestampMs: now.getTime() }), now);
+    runner.recordStep(b, step({ timestampMs: now.getTime() }), now);
+    // Re-touch `a` — it should now be the most-recently-used, so the next
+    // new scope evicts `b` (never touched again), not `a`.
+    runner.recordStep(
+      a,
+      step({ timestampMs: now.getTime(), canonicalShape: 'again' }),
+      now,
+    );
+    runner.recordStep(c, step({ timestampMs: now.getTime() }), now);
+
+    expect(runner.trackedScopeCount).toBe(2);
+    expect(runner.hasScope(a)).toBe(true);
+    expect(runner.hasScope(b)).toBe(false);
+    expect(runner.hasScope(c)).toBe(true);
+  });
 });

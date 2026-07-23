@@ -47,26 +47,26 @@ throughput" — this test result is that measurement.
 
 ### 2. Real throughput/latency at moderate concurrency (50)
 
-| Metric | Value |
-|---|---|
-| Requests | 65,371 in 10.02s |
-| Throughput | 6,538 req/s avg |
-| Latency p50 | 6 ms |
-| Latency p97.5 | 17 ms |
-| Latency p99 | 23 ms |
-| Latency max | 109 ms |
+| Metric                            | Value              |
+| --------------------------------- | ------------------ |
+| Requests                          | 65,371 in 10.02s   |
+| Throughput                        | 6,538 req/s avg    |
+| Latency p50                       | 6 ms               |
+| Latency p97.5                     | 17 ms              |
+| Latency p99                       | 23 ms              |
+| Latency max                       | 109 ms             |
 | 2xx / non-2xx / errors / timeouts | 65,371 / 0 / 0 / 0 |
 
 ### 3. Higher concurrency (200) shows the real bottleneck: the DB pool, not the route logic — and it degrades gracefully
 
-| Metric | c=50 | c=200 |
-|---|---|---|
-| Throughput | 6,538 req/s | 6,999 req/s |
-| Latency p50 | 6 ms | 25 ms |
-| Latency p97.5 | 17 ms | 55 ms |
-| Latency p99 | 23 ms | 85 ms |
-| Latency max | 109 ms | 262 ms |
-| Errors/timeouts | 0 | 0 |
+| Metric          | c=50        | c=200       |
+| --------------- | ----------- | ----------- |
+| Throughput      | 6,538 req/s | 6,999 req/s |
+| Latency p50     | 6 ms        | 25 ms       |
+| Latency p97.5   | 17 ms       | 55 ms       |
+| Latency p99     | 23 ms       | 85 ms       |
+| Latency max     | 109 ms      | 262 ms      |
+| Errors/timeouts | 0           | 0           |
 
 Throughput barely improves from c=50 to c=200 (6,538 → 6,999 req/s) while
 latency roughly quadruples at every percentile — the signature of

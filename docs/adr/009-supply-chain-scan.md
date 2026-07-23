@@ -86,6 +86,7 @@ high-confidence secret shapes: AWS access keys (`AKIA...`), Slack tokens
 `(secret|password|token|api_key)\s*[:=]\s*"..."` assignments.
 
 15 matches, all reviewed individually and confirmed benign:
+
 - 7 are the documented local-dev Postgres credential `postgres://fuse:fuse@localhost`,
   matching `infra/docker-compose.yml`'s own dev-only `POSTGRES_PASSWORD=fuse`
   — not a production credential, not unique to this repo's exposure.
