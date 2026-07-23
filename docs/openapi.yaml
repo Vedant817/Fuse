@@ -1,0 +1,622 @@
+openapi: 3.0.3
+info:
+  title: Fuse control-plane API
+  version: '1'
+  description: >-
+    Hand-authored against the actual route/schema code (task.md §10.1's
+    "Contract: ... OpenAPI" item) — every path, method, and status code below
+    is verified against services/control-plane/src/routes/*.ts and
+    packages/contracts/src/*.ts directly, not guessed. This is the first
+    OpenAPI spec for this project; no code generation or request validation
+    is wired to it yet (see docs/runbooks/limitations.md).
+servers:
+  - url: http://localhost:8090
+    description: Local dev default (CONTROL_PLANE_PORT)
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        One flat token type with three roles (operator/agent/webhook) set by
+        which env-var list it appears in, not by anything in the token
+        itself — see docs/threat-model.md §2 and §4. A token valid for one
+        role but used against a route requiring a different role gets 403
+        (FuseError unauthorized), not a silent pass.
+
+  schemas:
+    Scope:
+      type: object
+      required: [tenant, environment, agentId]
+      properties:
+        tenant: { type: string, minLength: 1 }
+        environment: { type: string, minLength: 1 }
+        agentId: { type: string, minLength: 1 }
+
+    Actor:
+      type: object
+      required: [type, id]
+      properties:
+        type: { type: string, enum: [system, manual, policy] }
+        id: { type: string, minLength: 1 }
+
+    FuseError:
+      type: object
+      required: [error, message, correlationId]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - unauthenticated
+            - unauthorized
+            - unknown_scope
+            - stale_epoch
+            - idempotency_conflict
+            - invalid_transition
+            - cooldown_active
+            - contention_exhausted
+            - rate_limited
+            - store_unavailable
+            - internal_error
+        message: { type: string }
+        correlationId: { type: string }
+
+    BreakerState:
+      type: string
+      enum: [armed, tripped, disabled]
+
+    PermitState:
+      type: string
+      enum: [armed, tripped, disabled, unknown]
+      description: >-
+        `unknown` only ever appears in a permit RESPONSE (store was
+        unreachable) — never on a persisted BreakerRecord.
+
+    BreakerRecord:
+      type: object
+      required:
+        [scope, state, epoch, reason, policyVersion, cooldownUntil, updatedAt, updatedBy]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        state: { $ref: '#/components/schemas/BreakerState' }
+        epoch: { type: integer, minimum: 0 }
+        reason: { type: string }
+        policyVersion: { type: string }
+        cooldownUntil: { type: string, format: date-time, nullable: true }
+        updatedAt: { type: string, format: date-time }
+        updatedBy: { $ref: '#/components/schemas/Actor' }
+
+    PermitRequest:
+      type: object
+      required: [scope, correlationId]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        correlationId: { type: string, minLength: 1, maxLength: 200 }
+
+    PermitResponse:
+      type: object
+      required: [allowed, state, reason, epoch, degraded, correlationId, record]
+      properties:
+        allowed: { type: boolean }
+        state: { $ref: '#/components/schemas/PermitState' }
+        reason: { type: string }
+        epoch: { type: integer }
+        degraded:
+          type: boolean
+          description: 'true only when a store outage forced a fail-open/fail-closed default, not a real read'
+        correlationId: { type: string }
+        record: { $ref: '#/components/schemas/BreakerRecord' }
+
+    TripRequest:
+      type: object
+      required:
+        [
+          scope,
+          reason,
+          policyVersion,
+          cooldownSeconds,
+          actor,
+          correlationId,
+          idempotencyKey,
+        ]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        reason: { type: string, minLength: 1, maxLength: 2000 }
+        policyVersion: { type: string, minLength: 1 }
+        cooldownSeconds: { type: integer, minimum: 0 }
+        actor: { $ref: '#/components/schemas/Actor' }
+        correlationId: { type: string, minLength: 1, maxLength: 200 }
+        idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
+        expectedEpoch:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: 'optional optimistic-lock guard; alert-driven trips normally omit it'
+
+    ResumeOrDisableOrEnableRequest:
+      type: object
+      required: [scope, reason, actor, correlationId, idempotencyKey]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        reason: { type: string, minLength: 1, maxLength: 2000 }
+        actor: { $ref: '#/components/schemas/Actor' }
+        correlationId: { type: string, minLength: 1, maxLength: 200 }
+        idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
+        expectedEpoch: { type: integer, minimum: 0, nullable: true }
+
+    TransitionResponse:
+      type: object
+      required: [record, auditEvent]
+      properties:
+        record: { $ref: '#/components/schemas/BreakerRecord' }
+        auditEvent:
+          type: object
+          description: 'the persisted breaker_audit_log row for this transition'
+
+    DetectorResult:
+      type: object
+      required:
+        [
+          detector,
+          detectorVersion,
+          scope,
+          fired,
+          score,
+          threshold,
+          windowStart,
+          windowEnd,
+          evidence,
+          dedupeKey,
+        ]
+      properties:
+        detector: { type: string, enum: [loop-signature, context-bloat, cost-velocity] }
+        detectorVersion: { type: string }
+        scope: { $ref: '#/components/schemas/Scope' }
+        fired: { type: boolean }
+        score: { type: number }
+        threshold: { type: number }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        evidence: { type: array, items: { type: string } }
+        dedupeKey: { type: string }
+
+    StepObservation:
+      type: object
+      required: [timestampMs, canonicalShape, inputTokens, outputTokens, estimatedCostUsd]
+      properties:
+        timestampMs: { type: integer, minimum: 0 }
+        canonicalShape: { type: string, minLength: 1 }
+        inputTokens: { type: integer, minimum: 0 }
+        outputTokens: { type: integer, minimum: 0 }
+        estimatedCostUsd: { type: number, minimum: 0 }
+
+    ObserveStepsRequest:
+      type: object
+      required: [scope, steps]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        steps:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { $ref: '#/components/schemas/StepObservation' }
+
+    ObserveStepsResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/DetectorResult' }
+
+    SpanTelemetrySample:
+      type: object
+      required:
+        [
+          timestampMs,
+          hasRequestModel,
+          hasInputTokens,
+          hasOutputTokens,
+          hasScopedIdentity,
+          hasValidTimestamps,
+          isRootSpan,
+          hasParent,
+        ]
+      properties:
+        timestampMs: { type: integer, minimum: 0 }
+        hasRequestModel: { type: boolean }
+        hasInputTokens: { type: boolean }
+        hasOutputTokens: { type: boolean }
+        hasScopedIdentity: { type: boolean }
+        hasValidTimestamps: { type: boolean }
+        isRootSpan: { type: boolean }
+        hasParent: { type: boolean }
+
+    PreflightReportRequest:
+      type: object
+      required: [scope, spans]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        spans:
+          type: array
+          maxItems: 2000
+          items: { $ref: '#/components/schemas/SpanTelemetrySample' }
+        heartbeat:
+          type: object
+          properties:
+            lastSeenAtMs: { type: integer, minimum: 0 }
+        disabled: { type: boolean }
+        disabledReason: { type: string, maxLength: 2000 }
+
+    PreflightResult:
+      type: object
+      required:
+        [
+          scope,
+          state,
+          reasonCode,
+          reason,
+          evaluatedAt,
+          lastGoodAt,
+          requiredFieldCoveragePercent,
+          orphanRatePercent,
+          freshnessMs,
+          pendingRecoveryState,
+          pendingSince,
+        ]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        state: { type: string, enum: [protected, degraded, blind, disabled] }
+        reasonCode: { type: string }
+        reason: { type: string }
+        evaluatedAt: { type: string, format: date-time }
+        lastGoodAt: { type: string, format: date-time, nullable: true }
+        requiredFieldCoveragePercent: { type: number, minimum: 0, maximum: 100 }
+        orphanRatePercent: { type: number, minimum: 0, maximum: 100 }
+        freshnessMs: { type: number, minimum: 0, nullable: true }
+        pendingRecoveryState:
+          type: string
+          enum: [protected, degraded, blind, disabled]
+          nullable: true
+        pendingSince: { type: string, format: date-time, nullable: true }
+
+    SignozAlertmanagerWebhookPayload:
+      type: object
+      required: [status, alerts]
+      description: 'the Prometheus Alertmanager webhook contract SigNoz follows — see packages/contracts/src/alert-webhook.ts'
+      properties:
+        version: { type: string }
+        groupKey: { type: string }
+        truncatedAlerts: { type: integer, minimum: 0 }
+        status: { type: string, enum: [firing, resolved] }
+        receiver: { type: string }
+        groupLabels: { type: object, additionalProperties: { type: string } }
+        commonLabels: { type: object, additionalProperties: { type: string } }
+        commonAnnotations: { type: object, additionalProperties: { type: string } }
+        externalURL: { type: string }
+        alerts:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: object
+            required: [status, labels, startsAt, fingerprint]
+            properties:
+              status: { type: string, enum: [firing, resolved] }
+              labels: { type: object, additionalProperties: { type: string } }
+              annotations: { type: object, additionalProperties: { type: string } }
+              startsAt: { type: string }
+              endsAt: { type: string }
+              generatorURL: { type: string }
+              fingerprint: { type: string, minLength: 1 }
+
+  responses:
+    BadRequest:
+      description: Malformed body (schema validation failed)
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+    Unauthenticated:
+      description: Missing or invalid bearer token
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+    Unauthorized:
+      description: A valid token, but not authorized for this route/tenant
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+    TooManyRequests:
+      description: Rate limit exceeded (CONTROL_PLANE_RATE_LIMIT_MAX/_WINDOW_MS)
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+    StoreUnavailable:
+      description: The Postgres state store is unreachable; mutating routes always fail here (503), never report a fabricated success
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe — no dependency checks
+      security: []
+      responses:
+        '200':
+          description: Process is up
+          content:
+            application/json:
+              schema:
+                { type: object, properties: { status: { type: string, enum: [ok] } } }
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe — checks the Postgres store
+      security: []
+      responses:
+        '200':
+          description: Store reachable
+          content:
+            application/json:
+              schema:
+                { type: object, properties: { status: { type: string, enum: [ready] } } }
+        '503':
+          description: Store unreachable — a load balancer should stop routing here
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [not-ready] }
+                  reason: { type: string, enum: [store_unavailable] }
+
+  /v1/permit:
+    post:
+      operationId: postPermit
+      summary: Check whether a guarded LLM call may proceed (the hot path — see docs/adr/011-permit-load-test.md)
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/PermitRequest' } }
+      responses:
+        '200':
+          description: Permit decision (allowed may be true even for a degraded/fail-open outage response)
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/PermitResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/breaker/trip:
+    post:
+      operationId: postBreakerTrip
+      summary: Force-trip a scope (operator-only)
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/TripRequest' } }
+      responses:
+        '200':
+          description: Transition applied (or a same-idempotency-key no-op replay)
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/TransitionResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: idempotency_conflict / stale_epoch / invalid_transition
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/breaker/resume:
+    post:
+      operationId: postBreakerResume
+      summary: Resume a tripped scope (operator-only; rejected before cooldown expires)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+      responses:
+        '200':
+          description: Transition applied
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/TransitionResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: cooldown_active / idempotency_conflict / stale_epoch / invalid_transition
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/breaker/disable:
+    post:
+      operationId: postBreakerDisable
+      summary: Disable enforcement for a scope (operator-only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+      responses:
+        '200':
+          description: Transition applied
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/TransitionResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/breaker/enable:
+    post:
+      operationId: postBreakerEnable
+      summary: Re-enable enforcement for a previously disabled scope (operator-only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+      responses:
+        '200':
+          description: Transition applied
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/TransitionResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/breaker/status:
+    get:
+      operationId: getBreakerStatus
+      summary: Read a scope's current breaker record (operator-only)
+      parameters:
+        - { name: tenant, in: query, required: true, schema: { type: string } }
+        - { name: environment, in: query, required: true, schema: { type: string } }
+        - { name: agentId, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Current record
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/BreakerRecord' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: unknown_scope — never seen before
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+
+  /v1/preflight/report:
+    post:
+      operationId: postPreflightReport
+      summary: >-
+        Report structural telemetry-health evidence for a scope (agent-tier
+        token; operator-tier required only when the body sets
+        disabled/disabledReason)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/PreflightReportRequest' } }
+      responses:
+        '200':
+          description: Committed Preflight state after evaluating this report
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/PreflightResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/preflight/status:
+    get:
+      operationId: getPreflightStatus
+      summary: Read a scope's current Preflight state (agent-tier token)
+      parameters:
+        - { name: tenant, in: query, required: true, schema: { type: string } }
+        - { name: environment, in: query, required: true, schema: { type: string } }
+        - { name: agentId, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Current Preflight result
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/PreflightResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: unknown_scope
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+
+  /v1/detectors/observe:
+    post:
+      operationId: postDetectorsObserve
+      summary: Report step telemetry for real-time detector evaluation (agent-tier token)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/ObserveStepsRequest' } }
+      responses:
+        '200':
+          description: The three detectors' results after processing every step in the request
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/ObserveStepsResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/webhooks/signoz:
+    post:
+      operationId: postWebhooksSignoz
+      summary: >-
+        SigNoz's Alertmanager-compatible webhook channel (webhook-tier
+        token; scope named by the alert's own labels, not by the token —
+        see docs/threat-model.md §3)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignozAlertmanagerWebhookPayload' }
+      responses:
+        '200':
+          description: >-
+            Always 200 even for a per-alert outcome of unknown-scope,
+            stale-alert, or already-tripped/breaker-disabled — a webhook
+            delivery is acknowledged once parsed, regardless of what each
+            contained alert individually resolved to
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcomes:
+                    type: array
+                    items:
+                      { type: object, description: 'per-alert outcome, see webhook.ts' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/slack/interactive:
+    post:
+      operationId: postSlackInteractive
+      summary: >-
+        Slack's interactive-component callback (block_actions / view_submission)
+        — authenticated by Slack's own HMAC request signature, NOT a bearer
+        token (see docs/adr/007-signoz-mcp-diagnosis.md and
+        slack-actions.ts)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                payload:
+                  {
+                    type: string,
+                    description: 'URL-encoded JSON Slack interactive payload',
+                  }
+      responses:
+        '200':
+          description: 'Acknowledged (modal opened, or resume executed)'
+        '401':
+          description: >-
+            Missing/invalid X-Slack-Signature, or a stale
+            X-Slack-Request-Timestamp — fail-closed on either
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
