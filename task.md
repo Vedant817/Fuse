@@ -2663,6 +2663,13 @@ Add dated entries here rather than leaving important context only in chat.
   option — assessed low-severity (a trip is fail-safe, not data-exposing);
   recommended fix is a per-webhook-token trip-rate limit, tracked as
   follow-up work.
+- **New (2026-07-23, §11.3 adversarial review):** an agent-scoped token can
+  grow `breaker_state`/`preflight_state` and their OTel metric cardinality
+  without limit by sending requests with ever-new `agentId`s — distinct
+  from the already-fixed `DetectorRunner` in-memory cap (§9.2). Real,
+  open, not yet fixed — see `docs/threat-model.md` risk #9 and
+  `docs/adr/013-adversarial-review-findings.md` for why this needs a
+  scope-registration or new-scope-rate design decision, not a quick patch.
 
 ### Decisions (2026-07-23, gap-closure session)
 
@@ -2686,3 +2693,46 @@ explicit scope decisions before work resumed:
   Each slice still goes through the full AGENTS.md work cycle (define
   acceptance criteria → implement → test → gap review → update this file →
   commit) rather than being rushed unverified to cover more ground.
+
+### Decisions and evidence (2026-07-23, continuation through §9-§11)
+
+Continuing the sequencing decision above, §9 through §11 were completed in
+order, each committed locally as its own atomic slice (14 commits this
+continuation, all local per the standing git decision). Summary, in case
+this context is lost elsewhere:
+
+- **§9** (hardening): real `pnpm audit`/license/secret scan + SBOM (11
+  advisories → 1 accepted risk); `@fastify/helmet` added after auditing
+  secure defaults; a real `autocannon` load test against a live
+  control-plane + Postgres (6.5k req/s @ c=50, DB pool identified as the
+  ceiling @ c=200, zero errors either way); a genuine, previously-unnoticed
+  bug found and fixed — `DetectorRunner` had no cap on the *number* of
+  distinct scopes tracked (only each scope's own buffer was bounded), a
+  caller-controlled memory-exhaustion vector, fixed with a 10,000-scope LRU
+  cap; three new runbooks (`docs/runbooks/`).
+- **§10** (test matrix): audited the existing suite's coverage against
+  task.md's own categories (most already covered incidentally by earlier
+  work) rather than re-deriving it; added 19 new property/fuzz tests
+  (fast-check) for detector invariants and schema boundaries; hand-authored
+  `docs/openapi.yaml` (13 routes, validated with `redocly lint`). Final
+  real count: 396 unit + 83 integration = 479 tests, all passing.
+- **§11** (demo/submission): rehearsed both demo beats live — the SigNoz
+  alert-to-trip proof took 210.9s and produced an unscripted, genuinely
+  interesting result (both `context-bloat` and `loop-signature` fired 11s
+  apart; the system correctly applied only the first trip and recorded the
+  second as an audited no-op); the Preflight beat proved real hysteresis
+  (blind → recovering → protected only after the dwell window actually
+  elapsed). New `docs/architecture.md` (Mermaid diagrams) and a full
+  README overhaul. Four independent adversarial-review subagents
+  (correctness/races, security/privacy, observability-claims,
+  fresh-install reproducibility) found two real, fixed gaps (an unbounded
+  attacker-controlled alert label reaching audit-log/log content; the
+  shipped `.env.example` placeholder tokens silently working as real
+  credentials) and one real, deliberately-not-fixed gap (the scope-
+  cardinality growth noted above in "Open blockers").
+- **Explicitly not done, stated honestly rather than silently skipped**: a
+  produced two-minute video (no screen-recording/export capability
+  available), saved screenshot/GIF image files (live-verified via browser
+  instead), a literal from-clean-clone demo run, and release tagging
+  (deliberately left to the user's own judgment given the one known-open
+  gap above and the standing local-only git decision).
