@@ -8,6 +8,8 @@ export {
   getBreakerDecisionCounter,
   getDetectorScoreGauge,
   getDetectorFiredGauge,
+  getEstimatedCostCounter,
+  getPreflightStateGauge,
 } from './metrics.js';
 export { withGenAiSpan } from './gen-ai-span.js';
 export type {

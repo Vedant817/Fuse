@@ -14,7 +14,9 @@ import {
   getBreakerDecisionCounter,
   getDetectorFiredGauge,
   getDetectorScoreGauge,
+  getEstimatedCostCounter,
   getOperationDurationHistogram,
+  getPreflightStateGauge,
   getTokenUsageHistogram,
 } from './metrics.js';
 
@@ -123,5 +125,46 @@ describe('metrics instruments', () => {
     expect(metric).toBeDefined();
     const dataPoints = metric!.dataPoints as Array<{ value: number }>;
     expect(dataPoints[0]?.value).toBe(1);
+  });
+
+  it('accumulates estimated cost across calls, by scope/provider/model', async () => {
+    const attrs = {
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+      'gen_ai.provider.name': 'groq',
+      'gen_ai.request.model': 'llama-3.1-8b-instant',
+    };
+    getEstimatedCostCounter().add(0.001, attrs);
+    getEstimatedCostCounter().add(0.002, attrs);
+    await provider.forceFlush();
+    const [resourceMetrics] = exporter.getMetrics();
+    const metric = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (m) => m.descriptor.name === 'fuse.estimated_cost.usd.total',
+    );
+    expect(metric).toBeDefined();
+    const dataPoints = metric!.dataPoints as Array<{ value: number }>;
+    expect(dataPoints[0]?.value).toBeCloseTo(0.003, 6);
+  });
+
+  it('records the current Preflight state as a 1-valued gauge, by scope and state label', async () => {
+    getPreflightStateGauge().record(1, {
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+      'fuse.preflight.state': 'protected',
+    });
+    await provider.forceFlush();
+    const [resourceMetrics] = exporter.getMetrics();
+    const metric = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (m) => m.descriptor.name === 'fuse.preflight.state',
+    );
+    expect(metric).toBeDefined();
+    const dataPoints = metric!.dataPoints as Array<{
+      value: number;
+      attributes: Record<string, unknown>;
+    }>;
+    expect(dataPoints[0]?.value).toBe(1);
+    expect(dataPoints[0]?.attributes['fuse.preflight.state']).toBe('protected');
   });
 });

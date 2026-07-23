@@ -6,6 +6,7 @@ import {
 } from '@fuse/contracts';
 import { StoreUnavailableError, type PreflightStore } from '@fuse/breaker-store';
 import type { PreflightEvaluatorConfig } from '@fuse/preflight';
+import { getPreflightStateGauge } from '@fuse/otel';
 
 function correlationIdOf(request: FastifyRequest): string {
   const header = request.headers['x-correlation-id'];
@@ -54,6 +55,17 @@ export function registerPreflightRoutes(
         config,
         disabled: parsed.data.disabled,
         disabledReason: parsed.data.disabledReason,
+      });
+      // Recorded here, not client-side in the SDK's PreflightReporter — the
+      // same "authoritative decision point" reasoning as the breaker
+      // permit-decision counter (routes/permit.ts): this evaluation is the
+      // one place a scope's Preflight state is actually committed,
+      // network-wide across every reporting caller.
+      getPreflightStateGauge().record(1, {
+        'fuse.tenant': parsed.data.scope.tenant,
+        'fuse.environment': parsed.data.scope.environment,
+        'fuse.agent_id': parsed.data.scope.agentId,
+        'fuse.preflight.state': result.state,
       });
       return reply.code(200).send({ result });
     } catch (err) {

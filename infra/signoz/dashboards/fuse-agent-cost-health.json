@@ -1,0 +1,353 @@
+{
+  "title": "Fuse - Agent Cost Health",
+  "description": "Breaker/Preflight status, spend by agent/model, cost velocity, and detector activity (task.md §8). See docs/adr/008-signoz-dashboard-provisioning.md for the schema this was built against.",
+  "tags": ["fuse"],
+  "version": "v5",
+  "uploadedGrafana": false,
+  "layout": [
+    { "i": "breaker-decisions", "x": 0, "y": 0, "w": 6, "h": 4 },
+    { "i": "preflight-state", "x": 6, "y": 0, "w": 6, "h": 4 },
+    { "i": "detector-fired", "x": 0, "y": 4, "w": 6, "h": 4 },
+    { "i": "detector-score", "x": 6, "y": 4, "w": 6, "h": 4 },
+    { "i": "estimated-spend", "x": 0, "y": 8, "w": 6, "h": 4 },
+    { "i": "token-usage", "x": 6, "y": 8, "w": 6, "h": 4 },
+    { "i": "operation-duration", "x": 0, "y": 12, "w": 12, "h": 4 }
+  ],
+  "widgets": [
+    {
+      "id": "breaker-decisions",
+      "title": "Breaker permit decisions (rate, by state)",
+      "description": "fuse.breaker.permit.decisions increase, grouped by state/allowed/degraded — the breaker trip/deny/resume history task.md §8 asks for.",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "breaker-decisions-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "fuse.breaker.permit.decisions",
+                  "temporality": "cumulative",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [
+                { "key": "fuse.breaker.state" },
+                { "key": "fuse.breaker.allowed" }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "preflight-state",
+      "title": "Preflight telemetry-health state",
+      "description": "fuse.preflight.state (always 1), grouped by state label and scope — a 1-valued blip on 'blind'/'degraded' is the self-alert signal task.md §6 describes.",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "preflight-state-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "fuse.preflight.state",
+                  "temporality": "unspecified",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [{ "key": "fuse.preflight.state" }, { "key": "fuse.agent_id" }],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "detector-fired",
+      "title": "Detector fired (0/1), by detector type",
+      "description": "fuse.detector.fired — the exact signal the SigNoz alert rules (infra/signoz/alerts) threshold on.",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "detector-fired-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "fuse.detector.fired",
+                  "temporality": "unspecified",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [{ "key": "fuse.detector" }, { "key": "fuse.agent_id" }],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "detector-score",
+      "title": "Detector score (raw, by detector type) — units differ per detector, see docs/adr/006",
+      "description": "fuse.detector.score for debugging/context alongside the fired indicator — NOT the alerting signal (see docs/adr/006-signoz-alert-rule-provisioning.md for why score's units are not comparable across detectors).",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "detector-score-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "fuse.detector.score",
+                  "temporality": "unspecified",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [{ "key": "fuse.detector" }, { "key": "fuse.agent_id" }],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "estimated-spend",
+      "title": "Estimated spend (rate, by agent + model) — estimated, not reconciled billing",
+      "description": "fuse.estimated_cost.usd.total increase, grouped by agent_id/provider/model — always labeled estimated (packages/otel/src/pricing.ts).",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "estimated-spend-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "fuse.estimated_cost.usd.total",
+                  "temporality": "cumulative",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [{ "key": "fuse.agent_id" }, { "key": "gen_ai.request.model" }],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "token-usage",
+      "title": "Token usage (input/output, by model)",
+      "description": "gen_ai.client.token.usage.sum — SigNoz stores a histogram's pre-aggregated sum/count/min/max/bucket as separate metric names, not the bare gen_ai.client.token.usage name (found by querying ClickHouse directly, not assumed). Dimensioned by token type + model — never by session/agent (cardinality discipline, packages/otel/src/metrics.ts).",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "token-usage-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "gen_ai.client.token.usage.sum",
+                  "temporality": "cumulative",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [
+                { "key": "gen_ai.token.type" },
+                { "key": "gen_ai.request.model" }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    },
+    {
+      "id": "operation-duration",
+      "title": "gen_ai operation duration (total seconds, by model)",
+      "description": "gen_ai.client.operation.duration.sum — a true p95 would need bucket-level histogram math (the .bucket sub-metric), deferred; total elapsed seconds is a simpler, honestly-scoped proxy for now.",
+      "panelTypes": "graph",
+      "opacity": "1",
+      "nullZeroValues": "zero",
+      "timePreferance": "GLOBAL_TIME",
+      "isLogScale": false,
+      "selectedLogFields": null,
+      "selectedTracesFields": null,
+      "query": {
+        "queryType": "builder",
+        "id": "operation-duration-query",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "metrics",
+              "aggregations": [
+                {
+                  "metricName": "gen_ai.client.operation.duration.sum",
+                  "temporality": "cumulative",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "functions": [],
+              "filter": { "expression": "" },
+              "groupBy": [{ "key": "gen_ai.request.model" }],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "limit": null,
+              "stepInterval": 60,
+              "orderBy": [],
+              "legend": "",
+              "reduceTo": "sum"
+            }
+          ],
+          "queryFormulas": [],
+          "queryTraceOperator": []
+        }
+      }
+    }
+  ]
+}

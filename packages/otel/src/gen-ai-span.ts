@@ -22,7 +22,11 @@ import {
   ATTR_FUSE_TASK_ID,
   ATTR_FUSE_TENANT,
 } from './attributes.js';
-import { getOperationDurationHistogram, getTokenUsageHistogram } from './metrics.js';
+import {
+  getEstimatedCostCounter,
+  getOperationDurationHistogram,
+  getTokenUsageHistogram,
+} from './metrics.js';
 import { estimateCostUsd } from './pricing.js';
 
 const TRACER_NAME = 'fuse.gen_ai';
@@ -173,6 +177,13 @@ export async function withGenAiSpan<T>(
         );
         if (cost.priced) {
           span.setAttribute(ATTR_FUSE_ESTIMATED_COST_USD, cost.costUsd);
+          getEstimatedCostCounter().add(cost.costUsd, {
+            [ATTR_FUSE_TENANT]: ctx.tenant,
+            [ATTR_FUSE_ENVIRONMENT]: ctx.environment,
+            [ATTR_FUSE_AGENT_ID]: ctx.agentId,
+            [ATTR_GEN_AI_PROVIDER_NAME]: ctx.providerName,
+            [ATTR_GEN_AI_REQUEST_MODEL]: ctx.requestModel,
+          });
         }
 
         const metricAttributes = {

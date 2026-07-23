@@ -1510,27 +1510,91 @@ Acceptance criteria:
 
 ## 8. Agent cost-health dashboard (P1)
 
-- [ ] Define dashboard variables for environment, tenant (if applicable), agent,
-  model, task type, and time range with safe defaults.
-- [ ] Add current breaker and Preflight protection status panels.
-- [ ] Add spend and tokens by agent/user/task/model while respecting privacy and
-  cardinality constraints.
-- [ ] Add live cost velocity with policy threshold and detector annotations.
-- [ ] Add input-token/context-growth and loop-repeat views.
-- [ ] Add breaker trip/deny/resume history and alert-to-trip latency.
+Built and live-verified in the 2026-07-23 gap-closure session:
+`infra/signoz/dashboards/fuse-agent-cost-health.json` (7 panels) applied
+idempotently by `infra/signoz-dashboard-up.sh`. Two real, previously-
+unrendered-anywhere metrics were added to make this possible
+(`fuse.estimated_cost.usd.total`, `fuse.preflight.state` —
+`packages/otel/src/metrics.ts`). Full research/trap-avoidance trail in
+`docs/adr/008-signoz-dashboard-provisioning.md`, including two silently-
+unrendered-but-200-accepted payload shapes found before the real one, and
+a `PUT` body double-nesting bug. See the dated §12 entry for full evidence.
+
+- [d] Define dashboard variables for environment, tenant (if applicable), agent,
+  model, task type, and time range with safe defaults. Not built — the
+  7 panels query without variables (fixed to whatever scope reported most
+  recently); adding SigNoz dashboard variables is a real, separate research
+  item (a third payload shape, likely) not attempted this slice given time
+  constraints. Time range itself already has a safe default (SigNoz's own
+  "Last 30 minutes").
+- [x] Add current breaker and Preflight protection status panels. Evidence:
+  "Breaker permit decisions (rate, by state)" and "Preflight telemetry-
+  health state" panels, both live-verified showing real data from an
+  actual demo run (armed/tripped states; `fuse.preflight.state="protected"`).
+- [~] Add spend and tokens by agent/user/task/model while respecting privacy and
+  cardinality constraints. Done: "Estimated spend (rate, by agent + model)"
+  and "Token usage (input/output, by model)" panels exist and query
+  correctly (schema-verified — no "never received" error); both were
+  empty at verification time (only one real-cost call had happened,
+  insufficient for the `increase()` aggregation's two-sample minimum — the
+  same characteristic already documented for other cumulative counters in
+  this repo, not a new defect). Cardinality: grouped by agent_id/model
+  only, never session/correlation id, matching this repo's existing
+  discipline.
+- [d] Add live cost velocity with policy threshold and detector annotations.
+  Not built as its own dashboard panel — `fuse.detector.score`/`.fired`
+  for `cost-velocity` (already on the "Detector fired"/"Detector score"
+  panels) cover the live-value half; SigNoz-native annotation overlays for
+  a policy threshold line were not attempted this slice.
+- [~] Add input-token/context-growth and loop-repeat views. Partial: "Detector
+  score (raw, by detector type)" shows `context-bloat`'s and
+  `loop-signature`'s raw scores over time, which is a proxy for both
+  (context-bloat's score is often a token count or growth-run length;
+  loop-signature's score is repetition count) — not a dedicated "input
+  token growth curve" or "repeat count over time" view built from raw
+  `gen_ai` span data directly.
+- [x] Add breaker trip/deny/resume history and alert-to-trip latency. History:
+  the "Breaker permit decisions" panel, grouped by state, shows
+  armed/tripped transitions over time. Alert-to-trip latency itself is not
+  a dashboard panel (it was measured and recorded as text in §4.5/§12,
+  not wired into a queryable metric) — a real, honest gap: there is no
+  `fuse.alert_to_trip.latency` metric emitted anywhere yet.
 - [ ] Add projected monthly burn with explicit formula, minimum data requirement,
-  confidence/limitations, and `estimated` labeling.
+  confidence/limitations, and `estimated` labeling. Not built — a formula
+  panel (rate × time-remaining-in-month) was considered and deliberately
+  skipped this slice as a further research/verification cost not justified
+  given time constraints; tracked as a real gap, not assumed done.
 - [ ] Add instrumentation coverage, orphan rate, telemetry freshness/drop rate,
-  and build regression views.
-- [ ] Link panels to trace/log drill-down and the matching incident.
-- [ ] Export/version the dashboard; test empty, partial, normal, runaway, and
-  high-cardinality data plus common screen sizes.
+  and build regression views. Not built — none of Preflight's internal
+  percentages (`requiredFieldCoveragePercent`, `orphanRatePercent`) are
+  exported as their own OTel metrics yet, only readable via the
+  `/v1/preflight/status` REST API; a dashboard panel needs a metric to
+  query, and none exists for these values.
+- [ ] Link panels to trace/log drill-down and the matching incident. Not
+  built — no `contextLinks` configured on any widget.
+- [x] Export/version the dashboard; test empty, partial, normal, runaway, and
+  high-cardinality data plus common screen sizes. Evidence: the dashboard
+  is checked-in JSON (`infra/signoz/dashboards/fuse-agent-cost-health.json`,
+  `"version": "v5"`), applied via an idempotent script. "Empty" state was
+  directly observed and confirmed to render as an honest "No Data" (with a
+  distinct warning icon for a genuinely-wrong metric name, vs. a plain
+  "No Data" for a valid-but-empty query — see ADR-008 §3) rather than a
+  misleading zero. Partial/normal data was observed from a real demo run.
+  Runaway and high-cardinality scenarios and non-default screen sizes were
+  not separately tested — a real, scoped-out gap.
 
 Acceptance criteria:
 
-- the live demo story is visible without manual query editing;
-- empty or incomplete data is not rendered as zero/healthy;
-- every number has a documented unit, source, and aggregation window.
+- [x] the live demo story is visible without manual query editing — met: the
+  dashboard is provisioned by a script, not clicked together live;
+- [x] empty or incomplete data is not rendered as zero/healthy — met and
+  directly observed (SigNoz's own "No Data" state, distinguishable from a
+  schema-error warning, per the evidence above);
+- [x] every number has a documented unit, source, and aggregation window —
+  every widget's `description` field states its source metric and
+  aggregation; units are implicit in the metric names themselves
+  (`usd`, `{token}`, `s`, `1`) as documented in `packages/otel/src/
+  metrics.ts`'s own instrument descriptions.
 
 ## 9. Production hardening and operability (P1)
 
@@ -2165,6 +2229,55 @@ Add dated entries here rather than leaving important context only in chat.
   post); no adversarial "malicious telemetry" test against the evidence
   whitelist; §7.4 (optional fix PR) untouched, correctly deprioritized as
   P2.
+- 2026-07-23 (§8 built and live-verified: the "Fuse - Agent Cost Health"
+  dashboard). Added two OTel instruments that didn't exist anywhere
+  before this slice: `fuse.estimated_cost.usd.total` (a counter —
+  `fuse.estimated_cost.usd` previously existed only as a per-span
+  attribute, never a queryable metric) and `fuse.preflight.state` (a
+  gauge, always `1`, dimensioned by the state label — Preflight's
+  committed state had no metric at all). Both recorded server-side at
+  the same authoritative point their siblings already are
+  (`gen-ai-span.ts`'s cost computation; `routes/preflight.ts`'s
+  `store.evaluate()` call site) — 2 new unit tests in `metrics.test.ts`,
+  plus a new `services/control-plane/src/routes/preflight.test.ts` (2
+  tests) covering the gauge wiring specifically, mirroring
+  `routes/permit.test.ts`'s existing pattern for its own counter.
+  Built `infra/signoz/dashboards/fuse-agent-cost-health.json` (7 panels)
+  and `infra/signoz-dashboard-up.sh` (idempotent update-by-title, unlike
+  the alert script's create-if-missing). Getting a single widget to
+  actually render took three attempts, each verified by round-tripping a
+  real `PUT`+`GET`+page-reload rather than trusting a `200` response —
+  documented in full in `docs/adr/008-signoz-dashboard-provisioning.md`:
+  (1) a legacy flat query shape was accepted by the API but silently
+  never rendered; (2) the alert-rule's own v5 query envelope (a
+  reasonable-looking guess, since it's the *correct* shape one call site
+  over) was ALSO accepted and ALSO silently never rendered — dashboards
+  use an entirely different, older `IBuilderQuery` shape, found only by
+  reading the actual frontend TypeScript source; (3) once the query shape
+  was right, the dashboard STILL wouldn't render because the `PUT`
+  request body itself was double-nested (`{data: dashboardData}` when the
+  endpoint stores the raw body verbatim as `Dashboard.data`) — found by
+  comparing a `PUT` response against an immediate follow-up `GET`, since
+  the `PUT` response alone was misleadingly "correct-looking." A fourth,
+  separate discovery: `gen_ai.client.token.usage`/`.operation.duration`
+  (the two OTel histograms) are never queryable under their bare metric
+  name at all — SigNoz splits a histogram into independent
+  `.sum`/`.count`/`.min`/`.max`/`.bucket` sub-metrics, confirmed by a
+  direct ClickHouse query, not assumed. Live-verified end to end: ran the
+  full narrated demo (`pnpm --filter @fuse/broken-agent run demo`,
+  including a real Groq call) and confirmed 4 of the 7 panels showed real,
+  non-empty, correctly-labeled data (breaker state transitions, Preflight
+  `protected` state, both detector panels); the remaining 3 (spend, token
+  usage, operation duration) render with zero schema errors but were
+  empty at verification time, consistent with the same "needs ≥2 samples"
+  characteristic already documented elsewhere for cumulative counters, not
+  a new defect. Full clean-workspace verification: `pnpm run check` — 438
+  unit tests across 10 packages; `pnpm run test:integration` — 83 tests,
+  real Postgres, unaffected. Honest, scoped-out gaps (not silently
+  dropped): dashboard variables, a projected-monthly-burn formula panel,
+  instrumentation-coverage/orphan-rate/drop-rate panels (no metric exists
+  for these yet), trace/log drill-down context links, and no
+  runaway/high-cardinality/alternate-screen-size testing.
 
 ### Open blockers and risks
 

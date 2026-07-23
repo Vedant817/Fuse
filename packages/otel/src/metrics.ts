@@ -16,6 +16,8 @@ let operationDurationHistogram: Histogram | undefined;
 let breakerDecisionCounter: Counter | undefined;
 let detectorScoreGauge: Gauge | undefined;
 let detectorFiredGauge: Gauge | undefined;
+let estimatedCostCounter: Counter | undefined;
+let preflightStateGauge: Gauge | undefined;
 
 /** `{token}` unit histogram, dimensioned by `gen_ai.token.type` (input/
  * output) plus operation/provider/model — deliberately NOT by
@@ -101,4 +103,40 @@ export function getDetectorFiredGauge(): Gauge {
       '1 if the detector fired on its most recent evaluation, 0 otherwise, by detector type and scope.',
   });
   return detectorFiredGauge;
+}
+
+/**
+ * A monotonic counter (spend only ever accumulates), dimensioned by
+ * tenant/environment/agent_id/provider/model — the "spend by agent/model"
+ * task.md §8 dashboard panel needs a real metric to sum, and until now
+ * `fuse.estimated_cost.usd` existed only as a per-span attribute
+ * (`packages/otel/src/gen-ai-span.ts`), never aggregated anywhere a
+ * dashboard could query. Explicitly an *estimate* (see `pricing.ts`) —
+ * never presented as reconciled provider billing.
+ */
+export function getEstimatedCostCounter(): Counter {
+  estimatedCostCounter ??= meter().createCounter('fuse.estimated_cost.usd.total', {
+    unit: 'usd',
+    description:
+      'Cumulative estimated spend (never reconciled provider billing), by scope/provider/model.',
+  });
+  return estimatedCostCounter;
+}
+
+/**
+ * A gauge that is always `1` for whichever single state a scope's Preflight
+ * evaluation most recently reported — never a numeric encoding of the
+ * enum, which would invite a misleading "average state" query. Grouping by
+ * the `fuse.preflight.state` attribute and reading the latest value per
+ * scope (task.md §8's Preflight-status dashboard panel) reconstructs
+ * "what is this scope's current state" without pretending state is a
+ * continuous quantity.
+ */
+export function getPreflightStateGauge(): Gauge {
+  preflightStateGauge ??= meter().createGauge('fuse.preflight.state', {
+    unit: '1',
+    description:
+      'Always 1 for the most recently reported Preflight state, by scope and state label — read the latest value per scope/state to see current status.',
+  });
+  return preflightStateGauge;
 }
