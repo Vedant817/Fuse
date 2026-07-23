@@ -229,11 +229,21 @@ four are transitive dependencies needed for native bindings/build tooling
 used by `testcontainers`/OTel packages. This is a narrow but real increased
 attack surface: a compromise of any of the four would achieve local code
 execution during `pnpm install` (developer machine or CI), with the
-installing user's privileges. There is no automated `pnpm audit`, license
-check, or dependency-scanning step anywhere in the repo yet (no CI exists at
-all — see task.md §0/§12). **Recommended follow-up:** add `pnpm audit` (or
-equivalent) to the `check`/CI pipeline once CI exists, and periodically
-re-justify the `allowBuilds` list against the then-current dependency tree.
+installing user's privileges.
+
+**Updated 2026-07-23** (task.md §9.1, `docs/adr/009-supply-chain-scan.md`): a
+real `pnpm audit` + license + secret-scan + SBOM pass was run (still manual,
+not wired into CI — no CI exists at all, see task.md §0/§12). Findings:
+`pnpm-workspace.yaml` now also carries `overrides` pinning `undici`/`uuid`
+past 10 dev-only advisories transitive via `@testcontainers/postgresql`; one
+moderate advisory (`@hono/node-server`, transitive via
+`@modelcontextprotocol/sdk`'s server-side transport, which this codebase
+never instantiates) is an accepted, tracked risk, not fixed. License sweep
+of 533 installed packages found zero copyleft. A CycloneDX SBOM is checked
+in at `docs/sbom.cdx.json`. **Recommended follow-up unchanged:** wire
+`pnpm audit`/license-check/SBOM regeneration into a CI pipeline once one
+exists, and periodically re-justify the `allowBuilds` list against the
+then-current dependency tree.
 
 ## 8. Abuse-case test inventory
 
@@ -267,13 +277,25 @@ of what this document originally found is still visible):
   5-minute-future alert, and an unparseable timestamp are all rejected
   (`stale-alert`, no trip), while a fresh alert still trips normally.
 
+- ~~Unbounded scope cardinality in `DetectorRunner` via distinct
+  `tenant`/`environment`/`agentId` values in `POST /v1/detectors/observe`
+  (found during task.md §9.2's failure-injection review, not originally
+  listed in this document)~~ — now covered: `detector-runner.test.ts`'s
+  cardinality-cap tests prove a caller sending unbounded distinct scopes is
+  bounded by a 10,000-scope LRU eviction, not unlimited memory growth. See
+  `docs/adr/012-failure-injection-review.md`.
+
 Still with **no test** (tracked as follow-up work, not silently dropped):
 
 - Forgery via a _fresh_, attacker-chosen `(fingerprint, startsAt)` pair from
   a holder of a genuinely valid webhook token (§3's residual gap — the
   staleness window doesn't and can't prevent this; would need a rate-limit
   test once that follow-up is built).
-- Endpoint-specific rate-limit exhaustion on `/v1/preflight/report` (§6).
+- Endpoint-specific rate-limit exhaustion on `/v1/preflight/report` (§6) —
+  now measured, not just theorized: `docs/adr/011-permit-load-test.md`'s
+  load test confirms the default 120/60s limit is shared per-token across
+  every route including this one; no dedicated test forces the specific
+  "heavy `/v1/preflight/report` payload under this shared budget" scenario.
 
 ## 9. Summary risk register
 
@@ -284,8 +306,9 @@ Still with **no test** (tracked as follow-up work, not silently dropped):
 | 2b  | Residual: a _fresh_ forged alert from a valid webhook token is still not prevented   | Medium (same fail-safe-only impact; SigNoz has no payload signing)           | Open — recommended fix is a per-webhook-token trip-rate limit                   |
 | 3   | Flat rate limit across cheap and heavy endpoints                                     | Low                                                                          | Open, documented, not yet fixed                                                 |
 | 4   | No online key rotation                                                               | Low (env-var restart-based rotation works, just isn't graceful)              | Open, documented                                                                |
-| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                        | Low-medium, narrow scope                                                     | Open, no CI exists yet to enforce it                                            |
+| 5   | `allowBuilds` supply-chain surface, no dependency audit in CI                        | Low-medium, narrow scope                                                     | Manually audited 2026-07-23 (ADR-009); still no CI to enforce it automatically  |
 | 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it | None today (nothing populates it with sensitive content yet)                 | Monitor, no action needed now                                                   |
+| 7   | Unbounded scope cardinality in `DetectorRunner` (caller-controlled `agentId` growth) | Medium (memory exhaustion) before the fix; low after                         | Fixed 2026-07-23 — 10,000-scope LRU cap (ADR-012)                               |
 
 None of these gaps affect the breaker's core guarantee (zero provider calls
 after a committed trip) — that guarantee is enforced independently of the
