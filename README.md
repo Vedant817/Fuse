@@ -18,6 +18,52 @@ The breaker's pre-call enforcement is the critical path. Preflight exists so
 Fuse never claims protection it can't currently back with evidence — see
 `packages/preflight` and task.md §6.
 
+## The problem
+
+An agent stuck in a loop, growing its own context unboundedly, or burning
+tokens faster than any human is watching doesn't fail loudly — it just gets
+expensive, quietly, until someone notices the bill. Rate limits and
+per-request budgets don't catch this: a loop of _cheap_ calls, or a context
+window growing one legitimate-looking turn at a time, can pass every
+per-call check while still being a runaway. Fuse instead reads the _shape_
+of an agent's own execution across calls — repetition, growth, velocity —
+and answers one question before every model call: "given what this agent
+has actually been doing, should this next call happen at all?" If the
+answer is no, it blocks the call itself, not just alerts about it
+afterward — and if Fuse's own telemetry isn't good enough to answer that
+question honestly, it says so (`degraded`/`blind`) instead of silently
+assuming protection held.
+
+## Architecture
+
+See [`docs/architecture.md`](./docs/architecture.md) for the full system
+diagram, a step-by-step sequence of one real incident (telemetry in → alert
+→ trip → blocked call → diagnosis → Slack → resume), and why enforcement
+lives in a dedicated control plane rather than inside SigNoz itself.
+
+### How SigNoz is used — one closed loop, not a side dashboard
+
+Every SigNoz capability this hackathon track asks about is load-bearing,
+not decorative:
+
+- **Traces/metrics** — `packages/otel` emits `gen_ai.*` semantic-convention
+  spans and Fuse's own metrics (`fuse.detector.score`, `fuse.detector.fired`,
+  `fuse.breaker.permit.decisions`, `fuse.estimated_cost.usd.total`,
+  `fuse.preflight.state`) into SigNoz via OTLP.
+- **Alerts** — `infra/signoz/alerts/*.json` are real, provisioned alert
+  rules that query those exact gauges on a fixed cadence and call back into
+  the control plane's webhook when one crosses threshold — the _only_ path
+  that trips a breaker from outside an operator action.
+- **Dashboards** — `infra/signoz/dashboards/fuse-agent-cost-health.json`
+  visualizes the same metrics an operator would otherwise have to query by
+  hand: breaker state, Preflight health, detector activity, spend.
+  Live-verified rendering, not just "the JSON is valid"
+  (`docs/adr/008-signoz-dashboard-provisioning.md`).
+- **MCP** — when a breaker trips, `packages/diagnosis` calls SigNoz's own
+  MCP server to pull the real evidence spans behind the trip, before
+  building a deterministic hypothesis and posting it to Slack
+  (`docs/adr/007-signoz-mcp-diagnosis.md`).
+
 ## Repository layout
 
 pnpm workspaces, one package/service per concern:
@@ -95,6 +141,22 @@ any other call. Fails fast with setup instructions if the control plane
 isn't reachable; if SigNoz (below) isn't running either, it says so and
 carries on rather than treating that as an error.
 
+With SigNoz and its alert rules also provisioned (below,
+`infra/signoz-alerts-up.sh`), run the real detector-to-trip proof instead —
+**no manual trip call anywhere in this script**, only a real SigNoz alert
+rule evaluating real telemetry:
+
+```bash
+pnpm --filter @fuse/broken-agent run demo:real-detect
+```
+
+This takes a few minutes (SigNoz evaluates alert rules on a fixed cadence,
+plus notification delivery — measured at 231s/331s in two real runs, see
+[`docs/adr/006-signoz-alert-rule-provisioning.md`](./docs/adr/006-signoz-alert-rule-provisioning.md)
+and [`docs/demo-script.md`](./docs/demo-script.md) for a full rehearsed
+transcript with exact timings) — it polls the breaker's real status until a
+real alert fires and trips it, or times out with troubleshooting hints.
+
 ### Real LLM providers (optional)
 
 `packages/sdk` ships adapters for Groq and NVIDIA Build (ADR-003). Everything
@@ -136,6 +198,95 @@ Postgres and real HTTP without requiring SigNoz to be running at all.
 
 Tear the stack down with `docker compose -f infra/signoz/pours/deployment/compose.yaml down -v`.
 
+## Policy: detector formulas and thresholds
+
+Three pure, independently-testable detector functions
+(`packages/detectors`), each evaluated against a scope's trailing window of
+reported step telemetry — never raw prompt/tool content, only structural
+shape (token counts, a canonicalized step signature, cost):
+
+| Detector         | Fires when                                                                                                       | Default threshold                                                     |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `loop-signature` | The same cycle of canonicalized step shapes repeats                                                              | 3 repetitions of a cycle (`packages/detectors/src/loop-signature.ts`) |
+| `context-bloat`  | Input tokens hit an absolute ceiling, OR grow for enough consecutive steps, OR grow past a ratio over the window | 100,000 tokens absolute; 5 consecutive growing steps; 3x growth ratio |
+| `cost-velocity`  | Estimated spend in the trailing window crosses a threshold                                                       | See `DEFAULT_COST_VELOCITY_CONFIG`                                    |
+
+Every default is a real, versioned zod schema
+(`packages/contracts/src/policy.ts`'s `DetectorsConfigSchema`) with its own
+drift-guard test (`packages/detectors/src/policy-defaults.test.ts`) — but
+**the live `DetectorRunner` currently always evaluates the hardcoded
+defaults above, regardless of any policy file's contents**; no policy-file
+_loading_ pipeline exists yet (`docs/runbooks/operations.md` §6). Treat the
+table above as the actual live behavior, not a description of a
+configurable-per-deployment system.
+
+**False-positive tradeoffs**: every threshold above is a real design
+tradeoff, not a proven-optimal constant — a legitimately long analysis task
+can look like context-bloat; a legitimately repetitive but useful pattern
+(e.g. polling) can look like a loop. `docs/runbooks/incident-response.md`'s
+false-positive entry is the operational answer (resume with a documented
+reason, then tune the threshold if it recurs), not a claim these thresholds
+never misfire.
+
+**Cost-estimation caveat**: `fuse.estimated_cost.usd.total`
+(`packages/otel/src/pricing.ts`) is computed from a local pricing table
+against reported token counts — it is an estimate for detection purposes,
+not reconciled against your actual provider invoice, and will drift if the
+pricing table goes stale or a provider changes rates.
+
+## The guarantee, in plain language
+
+- **What Fuse guarantees**: once a trip commits, the very next `/v1/permit`
+  check for that scope returns `allowed: false` — proven under both
+  sequential and concurrent load (`packages/sdk/src/guard.integration.test.ts`).
+  A call that was already past its own permit check when the trip commits
+  may still complete (an accepted, measured in-flight-exposure window, not
+  hidden) — the guarantee is about the _next_ call, not a mid-flight abort.
+- **Outage behavior**: if the control plane or its Postgres store is
+  unreachable, both the SDK and the control plane default to **fail-closed**
+  (deny) — a deliberate tradeoff that a store outage also pauses guarded
+  calls, favoring cost protection over availability. Configurable per
+  deployment (`CONTROL_PLANE_STORE_OUTAGE_MODE`/`FUSE_SDK_OUTAGE_MODE`), but
+  fail-closed is the shipped default for a reason.
+- **Preflight's actual scope**: a `blind`/`degraded` Preflight state is an
+  honest signal that telemetry coverage is too thin to trust a detector's
+  silence — it does **not** itself pause enforcement (the breaker's own
+  state is independent). Treat a `blind` report as its own incident, not as
+  something Fuse has already handled for you. Full detail:
+  [`docs/runbooks/limitations.md`](./docs/runbooks/limitations.md).
+
+## Security
+
+Bearer-token auth with three least-privilege roles (operator/agent/webhook),
+constant-time token comparison, tenant scoping (opt-in), webhook replay/
+staleness rejection, and a real dependency/license/secret scan — see
+[`docs/threat-model.md`](./docs/threat-model.md) for the full trust-boundary
+analysis and [`docs/adr/009-supply-chain-scan.md`](./docs/adr/009-supply-chain-scan.md)/
+[`docs/adr/010-secure-defaults-audit.md`](./docs/adr/010-secure-defaults-audit.md)
+for this session's audit evidence. One open, accepted-risk dependency
+finding and several deliberately-open tradeoffs (flat rate limiting, no
+online key rotation) are recorded there, not silently fixed or hidden.
+
+## Limitations
+
+Read [`docs/runbooks/limitations.md`](./docs/runbooks/limitations.md) before
+relying on this in anything beyond a demo — it distinguishes what Fuse
+actually guarantees from documented tradeoffs and real, found-during-testing
+gaps (no online key rotation, no automated backup/retention job, no schema
+rollback, single-instance-only load testing, and more), each cited to its
+proving test or ADR.
+
+## Troubleshooting
+
+| Symptom                                                               | Likely cause                                                                                                              | Fix                                                                                                                    |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `demo`/`demo:real-detect` exits with "Cannot reach the control plane" | Control plane not running, or `.env` not sourced into this shell                                                          | `pnpm --filter @fuse/control-plane run dev` in another terminal; re-`source .env` here                                 |
+| Control plane fails to start: "breaker_state table is missing"        | Migrations not applied                                                                                                    | `pnpm --filter @fuse/breaker-store run migrate`                                                                        |
+| Control plane fails to start with a config error                      | `.env` still has a `changeme-...` placeholder — `CONTROL_PLANE_API_TOKENS`/`DATABASE_URL` have no default and fail closed | Fill in real values in `.env`, `source` it again                                                                       |
+| `demo:real-detect` never sees the breaker trip within 8 minutes       | SigNoz alert rules not provisioned, or the OTel collector isn't receiving `fuse.detector.fired`                           | Run `infra/signoz-alerts-up.sh`; confirm `infra/signoz-up.sh` succeeded and `OTEL_EXPORTER_OTLP_ENDPOINT` points at it |
+| A load test / rapid demo re-run returns `429`                         | The shared rate limit (`CONTROL_PLANE_RATE_LIMIT_MAX`, default 120/min/token) is exhausted, not a bug                     | Raise it for a test run, or use distinct tokens (`docs/adr/011-permit-load-test.md`)                                   |
+| Slack incident card never posts                                       | `SLACK_BOT_TOKEN` unset — this is the documented, graceful degrade                                                        | Check `FUSE_INCIDENT_SNAPSHOT_DIR` for the local HTML snapshot, always written regardless                              |
+
 ## Common commands
 
 Run from the repo root unless noted:
@@ -164,9 +315,21 @@ Scope any of these to one package with pnpm's `--filter`, e.g.
 - [`task.md`](./task.md) — the live execution tracker. Every checkbox is
   backed by a command or test that was actually run; deferred work is recorded
   honestly rather than silently dropped.
+- [`docs/architecture.md`](./docs/architecture.md) — system diagram, the
+  closed SigNoz loop, and a full incident's data-flow sequence.
+- [`docs/openapi.yaml`](./docs/openapi.yaml) — every control-plane route,
+  request/response schema, and status code, hand-verified against the
+  actual route code.
 - [`docs/adr/`](./docs/adr) — accepted architecture decisions (language/
   runtime choice, system boundaries and state store, provider adapters,
-  tenant-scoped tokens, self-hosted SigNoz).
+  tenant-scoped tokens, self-hosted SigNoz, alert-rule/dashboard/MCP
+  provisioning, supply-chain and secure-defaults audits, the real permit
+  load test, the failure-injection review).
+- [`docs/runbooks/`](./docs/runbooks) — operations (install/configure/
+  upgrade/rollback/key-rotation/retention), incident response (false
+  positive, missed trip, stuck breaker, blind telemetry, store outage,
+  leaked token, Slack/MCP failure), and a single limitations/non-guarantees
+  page.
 - [`docs/threat-model.md`](./docs/threat-model.md) — assets, actors, webhook
   auth/replay analysis, and an honest risk register (what's mitigated, what
   isn't yet).

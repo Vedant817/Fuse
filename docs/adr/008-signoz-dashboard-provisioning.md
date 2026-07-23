@@ -141,6 +141,15 @@ to be rule-as-code.
   verification time — the same "needs at least two samples" characteristic
   already documented for cumulative counters elsewhere in this repo, not a
   new defect.
+- **Re-verified 2026-07-23** (task.md §11.1's demo rehearsal, via the
+  Browser tool against the live dashboard, not just an API check): after
+  more real traffic accumulated, 6 of 7 panels now show real data —
+  including "Token usage" and "gen_ai operation duration", which were
+  empty at initial verification. Only "Estimated spend" still shows an
+  honest "No Data" state (no `mock-model-v1` call in this session's runs
+  carried a non-zero cost through `packages/otel/src/pricing.ts`) — still
+  the correct, non-misleading rendering for a genuinely-absent metric, not
+  a regression.
 - Not built: dashboard variables (tenant/agent/model dropdowns), a
   projected-monthly-burn formula panel, instrumentation-coverage/orphan-
   rate/drop-rate panels (Preflight's percentages aren't exported as their
