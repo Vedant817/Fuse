@@ -1,0 +1,48 @@
+{
+  "alert": "fuse-cost-velocity",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "evalWindow": "1m",
+  "frequency": "15s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "builder_query",
+      "panelType": "graph",
+      "queries": [
+        {
+          "type": "builder_query",
+          "spec": {
+            "name": "A",
+            "signal": "metrics",
+            "stepInterval": "60s",
+            "filter": { "expression": "fuse.detector = 'cost-velocity'" },
+            "groupBy": [
+              { "name": "fuse.tenant" },
+              { "name": "fuse.environment" },
+              { "name": "fuse.agent_id" }
+            ],
+            "aggregations": [
+              {
+                "metricName": "fuse.detector.fired",
+                "temporality": "unspecified",
+                "timeAggregation": "latest",
+                "spaceAggregation": "max"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "selectedQueryName": "A",
+    "op": "above_or_equal",
+    "target": 1,
+    "matchType": "at_least_once"
+  },
+  "labels": { "severity": "critical", "fuse_detector": "cost-velocity" },
+  "annotations": {
+    "summary": "Fuse: cost-velocity detector fired for {{$labels.fuse_agent_id}}",
+    "description": "Estimated spend in the trailing window crossed the configured threshold — see docs/adr/006-signoz-alert-rule-provisioning.md and packages/detectors/src/cost-velocity.ts."
+  },
+  "disabled": false,
+  "preferredChannels": ["fuse-control-plane"]
+}

@@ -8,7 +8,7 @@ import {
   detectLoopSignature,
   type StepRecord,
 } from '@fuse/detectors';
-import { getDetectorScoreGauge } from '@fuse/otel';
+import { getDetectorFiredGauge, getDetectorScoreGauge } from '@fuse/otel';
 
 /** Bounds per-scope memory: a genuinely long-running agent's buffer is
  * capped at this many steps, and anything older than this age is pruned on
@@ -64,12 +64,14 @@ export class DetectorRunner {
     ];
 
     for (const result of results) {
-      getDetectorScoreGauge().record(result.score, {
+      const attrs = {
         'fuse.detector': result.detector,
         'fuse.tenant': scope.tenant,
         'fuse.environment': scope.environment,
         'fuse.agent_id': scope.agentId,
-      });
+      };
+      getDetectorScoreGauge().record(result.score, attrs);
+      getDetectorFiredGauge().record(result.fired ? 1 : 0, attrs);
     }
     return results;
   }

@@ -15,6 +15,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
     "demo": "tsx src/demo.ts",
+    "demo:real-detect": "tsx src/demo-real-detect.ts",
     "test": "vitest run --exclude '**/*.integration.test.ts'",
     "test:integration": "vitest run integration",
     "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts'"

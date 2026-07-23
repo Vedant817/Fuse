@@ -786,68 +786,196 @@ Acceptance criteria:
 
 ## 4. Detection and SigNoz alerts (P0/P1)
 
+This section's checkboxes were badly stale before the 2026-07-22/23
+gap-closure session: `packages/detectors` and its 39 unit tests already
+existed and covered nearly everything below, but nothing had ever checked
+these boxes, and — the actually-missing part — nothing in the running system
+called the detectors or had ever created a real SigNoz alert rule. Both are
+now true. See the dated entries in §12 for full evidence.
+
 ### 4.1 Detection framework
 
-- [ ] Define a detector result contract containing detector/version, score,
+- [x] Define a detector result contract containing detector/version, score,
   threshold, window, evidence references, scope, and deduplication key.
-- [ ] Build deterministic fixture/replay tooling from synthetic, non-sensitive
-  telemetry.
-- [ ] Establish a normal baseline set and evaluate false positive/negative
-  behavior before selecting defaults.
-- [ ] Keep detector configuration in the versioned policy file and include the
-  effective policy version in alerts/trips.
+  Evidence: `packages/contracts/src/detector.ts`'s `DetectorResultSchema`
+  (pre-existing, now also the live wire contract `DetectorRunner` returns).
+- [x] Build deterministic fixture/replay tooling from synthetic, non-sensitive
+  telemetry. Evidence: `packages/detectors/src/fixtures.ts` (pre-existing).
+- [~] Establish a normal baseline set and evaluate false positive/negative
+  behavior before selecting defaults. Done: every detector's test suite
+  proves it stays quiet on the other two scenarios' fixtures plus a sparse/
+  low-traffic fixture (9 such "stays quiet on X" tests across the three
+  files) — this is the false-positive evaluation, just never written up as
+  a standalone document. Not done: no formal baseline-tuning write-up
+  exists; the chosen defaults were carried over from the original
+  implementation, not re-derived from real production traffic (none exists
+  yet).
+- [x] Keep detector configuration in the versioned policy file and include the
+  effective policy version in alerts/trips. Evidence:
+  `packages/contracts/src/policy.ts`'s `DetectorsConfigSchema` (this
+  session) — typed per-detector config blocks, defaults asserted against
+  `@fuse/detectors`' own constants via a dedicated drift-guard test
+  (`packages/detectors/src/policy-defaults.test.ts`). Policy-version
+  propagation into alerts/trips is not yet wired (no policy-file *loading*
+  pipeline exists anywhere in the system yet — `PolicySchema` itself has no
+  consumer — tracked as a separate, not-yet-scoped gap, not silently
+  dropped).
 
 ### 4.2 Loop-signature detector
 
-- [ ] Canonicalize repeatable step/span shapes while excluding volatile IDs,
-  timestamps, and token counts.
-- [ ] Detect consecutive and short-cycle repeats, including Analyzer/Verifier
-  ping-pong and retry/replan cycles.
-- [ ] Require configurable minimum repetitions/window and distinguish expected
-  bounded iteration from pathological progress-free repetition.
-- [ ] Test noise, alternating cycles, legitimate loops, retries, missing spans,
-  delayed spans, and high-volume cases.
+- [x] Canonicalize repeatable step/span shapes while excluding volatile IDs,
+  timestamps, and token counts. Evidence: `packages/detectors/src/types.ts`'s
+  `StepRecord.canonicalShape` contract (pre-existing); now genuinely
+  live-wired (this session) via `services/broken-agent/src/
+  analyzer-verifier.ts`, which hashes the model's actual output content
+  (`createHash('sha256')`, not an invented label) into `canonicalShape` —
+  proven by a new test that spies on `guard.recordStepObservation` during a
+  real `loop` run and confirms a small, bounded, genuinely-*repeating* set
+  of shapes, not just "some hash was computed."
+- [x] Detect consecutive and short-cycle repeats, including Analyzer/Verifier
+  ping-pong and retry/replan cycles. Evidence: `loop-signature.test.ts` —
+  "fires on the Analyzer/Verifier ping-pong (cycle length 2)" and "detects
+  a cycle-length-1 (immediate consecutive repeat), not just cycle-length-2."
+- [x] Require configurable minimum repetitions/window and distinguish expected
+  bounded iteration from pathological progress-free repetition. Evidence:
+  `LoopSignatureConfig{windowSize,minRepetitions,maxCycleLength}` +
+  "does not fire on a short, legitimate bounded loop (2 repetitions, below
+  the minimum)."
+- [x] Test noise, alternating cycles, legitimate loops, retries, missing spans,
+  delayed spans, and high-volume cases. Evidence: `loop-signature.test.ts`'s
+  10 tests include "handles missing/delayed spans gracefully," "is
+  invariant to delayed/out-of-order delivery," and "handles a high-volume
+  window without misclassifying noisy-but-distinct steps as a loop."
 
 ### 4.3 Context-bloat detector
 
-- [ ] Compute input-token growth over a scoped session/task window.
-- [ ] Support absolute context ceiling, consecutive growth, slope/ratio, and
+- [x] Compute input-token growth over a scoped session/task window.
+- [x] Support absolute context ceiling, consecutive growth, slope/ratio, and
   minimum-call safeguards to prevent early noise.
-- [ ] Handle model context-window changes, history compaction, cached tokens,
-  late data, and session boundaries.
-- [ ] Test linear growth, sudden jumps, stable large contexts, normal resets,
-  and missing token attributes.
+- [x] Handle model context-window changes, history compaction, cached tokens,
+  late data, and session boundaries. Evidence: `context-bloat.test.ts`'s
+  "does not penalize a legitimate history compaction/reset," "is invariant
+  to delayed/out-of-order step delivery," "handles a stable large context
+  without flagging it."
+- [x] Test linear growth, sudden jumps, stable large contexts, normal resets,
+  and missing token attributes. Evidence: 14 tests total, including "is
+  robust to a missing/zero token attribute on the first step" and "reports
+  a finite, JSON-serializable score" (a real regression test for a past
+  `Infinity`-becomes-`null` bug).
 
 ### 4.4 Cost-velocity detector
 
-- [ ] Compute estimated spend per documented time window with low-traffic and
-  incomplete-window safeguards.
-- [ ] Implement a deterministic static threshold for the demo.
-- [ ] Add an optional learned baseline with minimum history, robust outlier
-  treatment, seasonality stance, and cold-start fallback.
-- [ ] Test spikes, sustained burns, traffic growth, price-table changes, sparse
-  workloads, delayed telemetry, and counter resets.
+- [x] Compute estimated spend per documented time window with low-traffic and
+  incomplete-window safeguards. Evidence: `CostVelocityConfig
+  {minCallsForSignal,minElapsedMsForSignal}` + matching tests.
+- [x] Implement a deterministic static threshold for the demo.
+- [d] Add an optional learned baseline with minimum history, robust outlier
+  treatment, seasonality stance, and cold-start fallback. Deliberately out
+  of scope per the module's own doc comment (task.md always marked this
+  optional/lower-priority than a working static-threshold detector) — no
+  real production traffic history exists yet to learn a baseline from.
+- [x] Test spikes, sustained burns, traffic growth, price-table changes, sparse
+  workloads, delayed telemetry, and counter resets. Evidence:
+  `cost-velocity.test.ts`'s 12 tests, including "detects sustained burn
+  (many moderate calls) as well as a sharp spike," "only sums calls
+  actually inside the trailing window, ignoring older calls (a counter-
+  reset-like scenario)," and a named regression test documenting (not
+  fixing — an inherent fixed-window property) that a burst straddling the
+  window boundary can be under-counted.
 
 ### 4.5 SigNoz rules and delivery
 
-- [ ] Express each supported detector as a SigNoz query/derived metric and alert
-  rule, documenting any preprocessing that cannot live in SigNoz.
-- [ ] Configure evaluation interval, window, pending duration, recovery, labels,
+- [x] Express each supported detector as a SigNoz query/derived metric and alert
+  rule, documenting any preprocessing that cannot live in SigNoz. Evidence:
+  `docs/adr/006-signoz-alert-rule-provisioning.md` records the decision and
+  why — canonicalizing a step shape and evaluating a repeat-cycle across a
+  trailing window is not expressible as a native SigNoz query, so
+  `services/control-plane/src/detector-runner.ts` runs the real
+  `@fuse/detectors` functions in-process and emits the *result* as two OTel
+  gauges (`fuse.detector.score`, `fuse.detector.fired`); `infra/signoz/
+  alerts/{loop-signature,context-bloat,cost-velocity}.json` are real,
+  working `threshold_rule` definitions against `fuse.detector.fired`,
+  grouped by tenant/environment/agent_id so each scope gets its own alert
+  instance.
+- [x] Configure evaluation interval, window, pending duration, recovery, labels,
   annotations, severity, and routing without embedding credentials.
-- [ ] Include enough scoped identifiers and evidence in webhook payloads without
-  sending sensitive prompt/tool content.
-- [ ] Add rule-as-code/export artifacts and a repeatable install/update process.
-- [ ] Test firing and recovery against each fixture plus duplicate, delayed, and
-  out-of-order notification delivery.
-- [ ] Measure alert-to-trip latency and verify it meets the documented budget.
+  Evidence: `evalWindow`/`frequency` set per rule (tuned to 15s/1m after
+  live measurement — see below); `labels`/`annotations` set per rule;
+  `preferredChannels` routes to the `fuse-control-plane` webhook channel,
+  itself created via `infra/signoz/channels/fuse-control-plane.json` with
+  the actual bearer token supplied at apply-time by `infra/
+  signoz-alerts-up.sh` (never committed). "Recovery" (a resolved alert)
+  reuses the pre-existing, already-tested `resolved-observed` webhook
+  behavior (§5.1) — not re-verified against a live SigNoz resolve event in
+  this session specifically.
+- [x] Include enough scoped identifiers and evidence in webhook payloads without
+  sending sensitive prompt/tool content. Evidence: live-proven — real
+  webhook deliveries correctly resolved to the exact scope
+  (tenant=demo/environment=local-demo/agent_id=agent-real-detect-*) via the
+  pre-existing `signoz-alert-mapper.ts`, confirmed by real
+  `breaker_audit_log` rows (see below). No prompt/tool content anywhere in
+  the metric or its labels — only tenant/environment/agent_id/detector
+  type.
+- [x] Add rule-as-code/export artifacts and a repeatable install/update process.
+  Evidence: `infra/signoz/alerts/*.json`, `infra/signoz/channels/*.json`,
+  `infra/signoz-alerts-up.sh` — run twice back to back against the live
+  instance; the second run detected every channel/rule as already present
+  and created nothing, proving real idempotency (create-if-missing by
+  name, not a full diff/update — documented as a deliberate, narrower
+  scope in the script's own header comment).
+- [~] Test firing and recovery against each fixture plus duplicate, delayed, and
+  out-of-order notification delivery. Done: firing proven live end-to-end
+  three separate times (see §12) with correct actor attribution
+  (`system:signoz-webhook:loop-signature`, `system:signoz-webhook:
+  context-bloat`) in the real `breaker_audit_log`. Duplicate/delayed/out-
+  of-order *delivery* relies on the same idempotency-key mechanism already
+  proven against synthetic Alertmanager payloads in
+  `webhook.integration.test.ts` (§5.1) — that mechanism doesn't care where
+  a delivery came from, but a live SigNoz-sourced duplicate was not
+  separately manufactured this session.
+- [x] Measure alert-to-trip latency and verify it meets the documented budget.
+  No prior budget existed to check against — this session establishes the
+  first real measurement instead of an assumption. Three independent,
+  single-fresh-scope runs (`services/broken-agent/src/
+  demo-real-detect.ts`, no manual trip call anywhere in the script), all
+  measured from run-end to observed trip, both real and attributed to
+  `system:signoz-webhook:loop-signature` in the audit log:
+  - `evalWindow: "1m"` / `frequency: "1m"` (first rule config tried): **231s**.
+  - `evalWindow: "1m"` / `frequency: "15s"` (tightened, expecting an
+    improvement): **331s** on a clean single-scope run — essentially the
+    same order of magnitude, *not* meaningfully faster. Tightening
+    `frequency` did not fix the dominant cost, which is most likely
+    SigNoz's own internal alert-routing/dispatch delay (outside the rule's
+    own `evalWindow`/`frequency` fields, and not something this session
+    found an API-exposed knob for) rather than evaluation cadence — an
+    honest negative result, not hidden to make the tuning look successful.
+  - A fourth attempt, run back-to-back with an earlier scope whose alert
+    was still `firing` (never resumed), never tripped at all even after
+    480s — see below.
+  This is far slower than the sub-minute figure a live demo would want,
+  and is documented as such rather than glossed over. A genuine, separate
+  discovery from the fourth attempt: SigNoz's rule `state` field appears to
+  be per-*rule*, not strictly per-*group* — a brand-new alert instance
+  (a fresh agent scope) that starts firing while the rule is already
+  `"firing"` from an older, never-resolved scope may not generate its own
+  notification. `services/broken-agent/src/demo-real-detect.ts` and any
+  rehearsed demo (§11) must therefore resume/clear prior scopes (or
+  restart the control plane, which drops its in-memory detector buffers)
+  before a fresh single-scope proof, rather than stacking multiple
+  never-resumed firing scopes on the same three rules.
 
 Acceptance criteria:
 
-- each detector catches its intended fixture and stays quiet for the agreed
-  normal fixtures;
-- SigNoz alerting, rather than an undisclosed parallel path, triggers the demo
-  breaker;
-- thresholds, windows, limitations, and policy version are inspectable.
+- [x] each detector catches its intended fixture and stays quiet for the agreed
+  normal fixtures — met, see the per-detector test evidence above;
+- [x] SigNoz alerting, rather than an undisclosed parallel path, triggers the demo
+  breaker — met and proven live three times; the webhook has no other
+  trigger path than a real Alertmanager-shaped delivery;
+- [x] thresholds, windows, limitations, and policy version are inspectable —
+  the alert-rule JSON files and `DetectorsConfigSchema` are both
+  human-readable, checked-in, and versioned; the discovered latency/
+  overlapping-scope limitations are documented here and in ADR-006, not
+  hidden.
 
 ## 5. Authenticated enforcement control plane (P0)
 
@@ -1794,6 +1922,53 @@ Add dated entries here rather than leaving important context only in chat.
   in the self-hosted SigNoz instance from a live run. §4's checkboxes are
   deliberately left unchecked until that end-to-end proof exists — this
   entry documents genuine, tested progress, not claimed completion.
+- 2026-07-22/23 (§4 gap-closure, slice 2 of 3 — real SigNoz alert rules
+  provisioned and proven to trip the breaker, closing task.md's single
+  biggest documented gap: "SigNoz alerting, rather than an undisclosed
+  parallel path, triggers the demo breaker"). Added a second gauge,
+  `fuse.detector.fired` (0/1), alongside `fuse.detector.score` —
+  `context-bloat`'s score mixes three incompatible units depending on
+  which internal path fired (a raw token count, a small consecutive-growth
+  count, or a ratio), so a single numeric SigNoz threshold against `score`
+  would need a different, fragile target per path; `fired >= 1` is exact
+  and detector-agnostic since `@fuse/detectors` has already done the real
+  evaluation. Researched SigNoz v0.133.0's undocumented alert-rule/
+  channel/login API by reading the pinned version's actual Go source (raw
+  file fetches, not an AI-summarizing fetch, which first produced subtly
+  wrong generic-shaped structs) and by driving the real login/rule-
+  creation UI once to capture the exact request shapes — recorded in
+  `docs/adr/006-signoz-alert-rule-provisioning.md`, including the specific
+  trap that `/api/v1/login` and several other plausible paths return HTTP
+  200 with the SPA's `index.html` instead of a 404, and the real upstream
+  bug ([SigNoz/signoz#10823](https://github.com/SigNoz/signoz/issues/10823))
+  where a legacy `builderQueries` (v4) rule shape silently never fires.
+  Added `infra/signoz/alerts/{loop-signature,context-bloat,cost-velocity}
+  .json` (real `threshold_rule` definitions, grouped by tenant/environment/
+  agent_id), `infra/signoz/channels/fuse-control-plane.json`, and
+  `infra/signoz-alerts-up.sh` (idempotent apply script — verified by
+  running it twice, the second run correctly detecting and skipping every
+  existing channel/rule). Live end-to-end proof, run three times total via
+  `services/broken-agent/src/demo-real-detect.ts` (which contains **no**
+  manual trip call — the breaker can only transition via the real webhook
+  in this script): a real loop-scenario run reports genuine step telemetry,
+  `fuse.detector.fired=1` is confirmed via direct ClickHouse query, the
+  real SigNoz rule transitions to `"firing"`, its webhook delivery lands at
+  `/v1/webhooks/signoz`, and `breaker_audit_log` shows the resulting trip
+  attributed to actor `system:signoz-webhook:loop-signature` — verified
+  independently via `docker exec ... psql`, not merely trusted from the
+  script's own printed output. Measured latency and one genuine limitation
+  discovered are recorded in §4.5's own checklist entries above (231s and
+  331s across two clean single-scope runs; a third, overlapping-scope
+  attempt never fired at all, traced to SigNoz's rule `state` appearing to
+  be per-rule rather than strictly per-group). Full clean-workspace
+  verification after this slice: `pnpm run check` — 290 unit tests across
+  9 packages; `pnpm run test:integration` unaffected (no integration test
+  changes in this slice). What remains open for §4 to be fully "done":
+  a formal detector-baseline write-up (§4.1), live-testing a genuine
+  duplicate/out-of-order SigNoz-sourced delivery specifically (as opposed
+  to the existing synthetic-payload coverage), and deciding whether the
+  measured ~4-5 minute alert-to-trip latency is acceptable for the
+  rehearsed demo (§11) or needs a faster fallback path.
 
 ### Open blockers and risks
 
@@ -1806,13 +1981,16 @@ Add dated entries here rather than leaving important context only in chat.
   ingestion (traces + metrics + correlated logs, §3.3) is now verified.
   `signoz-alert-mapper.ts`'s label-propagation-format question has real
   evidence at the label-storage layer (dotted form confirmed preserved,
-  §3.2 evidence above) though not a live end-to-end alert-fire proof.
-  Still genuinely open: §4.5's SigNoz alert-rule-as-code installation, and
-  the SigNoz UI's session-based auth API was not reverse-engineered (tried
-  `/api/v1/login` and `/api/v2/sessions`, both fell through to the SPA
-  route — only `/api/v1/register` was confirmed reachable), so no alert
-  rule was actually created through it. MCP capabilities and Slack
-  workspace remain unselected.
+  §3.2 evidence above) — and now also a live end-to-end alert-fire proof:
+  real webhook deliveries have correctly resolved to their scope three
+  times (see §4.5, §12's 2026-07-22/23 slice-2 entry).
+  **Resolved (2026-07-22/23):** §4.5's SigNoz alert-rule-as-code
+  installation is done, and the UI's session-based auth was reverse-
+  engineered against the real running instance (not guessed from docs) —
+  see `docs/adr/006-signoz-alert-rule-provisioning.md` for the exact login
+  flow (`GET /api/v2/sessions/context` → `POST /api/v2/sessions/
+  email_password`) and rule/channel payload shapes. MCP capabilities and
+  Slack workspace remain unselected.
 - **Resolved (2026-07-23):** both real LLM provider credentials are available
   locally. `set -a; source .env; set +a; pnpm --filter @fuse/sdk run test:live`
   passed both live smoke tests (Groq: 184 ms; NVIDIA Build: 481 ms), each

@@ -12,6 +12,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getBreakerDecisionCounter,
+  getDetectorFiredGauge,
   getDetectorScoreGauge,
   getOperationDurationHistogram,
   getTokenUsageHistogram,
@@ -105,5 +106,22 @@ describe('metrics instruments', () => {
     // a gauge reports the latest value, not an accumulated sum
     const dataPoints = metric!.dataPoints as Array<{ value: number }>;
     expect(dataPoints[0]?.value).toBe(7);
+  });
+
+  it('records fuse.detector.fired as a clean 0/1 indicator, independent of score units', async () => {
+    getDetectorFiredGauge().record(1, {
+      'fuse.detector': 'context-bloat',
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+    });
+    await provider.forceFlush();
+    const [resourceMetrics] = exporter.getMetrics();
+    const metric = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (m) => m.descriptor.name === 'fuse.detector.fired',
+    );
+    expect(metric).toBeDefined();
+    const dataPoints = metric!.dataPoints as Array<{ value: number }>;
+    expect(dataPoints[0]?.value).toBe(1);
   });
 });

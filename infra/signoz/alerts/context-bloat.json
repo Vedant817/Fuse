@@ -1,0 +1,48 @@
+{
+  "alert": "fuse-context-bloat",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "evalWindow": "1m",
+  "frequency": "15s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "builder_query",
+      "panelType": "graph",
+      "queries": [
+        {
+          "type": "builder_query",
+          "spec": {
+            "name": "A",
+            "signal": "metrics",
+            "stepInterval": "60s",
+            "filter": { "expression": "fuse.detector = 'context-bloat'" },
+            "groupBy": [
+              { "name": "fuse.tenant" },
+              { "name": "fuse.environment" },
+              { "name": "fuse.agent_id" }
+            ],
+            "aggregations": [
+              {
+                "metricName": "fuse.detector.fired",
+                "temporality": "unspecified",
+                "timeAggregation": "latest",
+                "spaceAggregation": "max"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "selectedQueryName": "A",
+    "op": "above_or_equal",
+    "target": 1,
+    "matchType": "at_least_once"
+  },
+  "labels": { "severity": "critical", "fuse_detector": "context-bloat" },
+  "annotations": {
+    "summary": "Fuse: context-bloat detector fired for {{$labels.fuse_agent_id}}",
+    "description": "Input-token growth crossed the absolute ceiling, consecutive-growth-run, or ratio safeguard — see docs/adr/006-signoz-alert-rule-provisioning.md and packages/detectors/src/context-bloat.ts."
+  },
+  "disabled": false,
+  "preferredChannels": ["fuse-control-plane"]
+}

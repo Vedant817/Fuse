@@ -1,0 +1,13 @@
+{
+  "name": "fuse-control-plane",
+  "type": "webhook",
+  "webhook_configs": [
+    {
+      "url": "__CONTROL_PLANE_WEBHOOK_URL__",
+      "send_resolved": true,
+      "http_config": {
+        "authorization": { "credentials": "__CONTROL_PLANE_WEBHOOK_TOKEN__" }
+      }
+    }
+  ]
+}

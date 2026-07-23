@@ -15,6 +15,7 @@ let tokenUsageHistogram: Histogram | undefined;
 let operationDurationHistogram: Histogram | undefined;
 let breakerDecisionCounter: Counter | undefined;
 let detectorScoreGauge: Gauge | undefined;
+let detectorFiredGauge: Gauge | undefined;
 
 /** `{token}` unit histogram, dimensioned by `gen_ai.token.type` (input/
  * output) plus operation/provider/model — deliberately NOT by
@@ -76,4 +77,28 @@ export function getDetectorScoreGauge(): Gauge {
       'Most recent detector evaluation score, by detector type and scope. Compare against the threshold configured in the corresponding SigNoz alert rule.',
   });
   return detectorScoreGauge;
+}
+
+/**
+ * A second, deliberately simpler gauge alongside `fuse.detector.score`:
+ * `1` when the detector's own `fired` boolean is true, `0` otherwise —
+ * always the same unit (a 0/1 indicator), regardless of detector type.
+ * `score`'s *units* are not comparable across detectors or even within
+ * one: `context-bloat`'s score is a raw token count when its absolute-
+ * ceiling path fires, a small consecutive-growth-step count when its
+ * growth-run path fires, or a ratio when its ratio path fires — three
+ * different scales on one number. A SigNoz alert rule thresholding
+ * directly on `score` would need a different, fragile per-path target;
+ * thresholding on `fired >= 1` is exact and detector-agnostic by
+ * construction, since `@fuse/detectors` has already done the real
+ * evaluation work. `score` is kept for dashboards/debugging, not as the
+ * alerting signal.
+ */
+export function getDetectorFiredGauge(): Gauge {
+  detectorFiredGauge ??= meter().createGauge('fuse.detector.fired', {
+    unit: '1',
+    description:
+      '1 if the detector fired on its most recent evaluation, 0 otherwise, by detector type and scope.',
+  });
+  return detectorFiredGauge;
 }

@@ -3,9 +3,11 @@ import type { DetectorResult, Scope, StepObservationWire } from '@fuse/contracts
 import { DetectorRunner } from './detector-runner.js';
 
 const recordMock = vi.fn();
+const firedRecordMock = vi.fn();
 
 vi.mock('@fuse/otel', () => ({
   getDetectorScoreGauge: () => ({ record: recordMock }),
+  getDetectorFiredGauge: () => ({ record: firedRecordMock }),
 }));
 
 const SCOPE: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-1' };
@@ -25,14 +27,16 @@ function step(
 describe('DetectorRunner', () => {
   beforeEach(() => {
     recordMock.mockReset();
+    firedRecordMock.mockReset();
   });
 
-  it('emits a fuse.detector.score gauge point for every detector on every step', () => {
+  it('emits fuse.detector.score AND fuse.detector.fired gauge points for every detector on every step', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
     runner.recordStep(SCOPE, step({ timestampMs: now.getTime() }), now);
 
     expect(recordMock).toHaveBeenCalledTimes(3);
+    expect(firedRecordMock).toHaveBeenCalledTimes(3);
     const detectors = recordMock.mock.calls.map((call) => call[1]['fuse.detector']);
     expect(new Set(detectors)).toEqual(
       new Set(['loop-signature', 'context-bloat', 'cost-velocity']),
@@ -43,6 +47,10 @@ describe('DetectorRunner', () => {
         'fuse.environment': 'test',
         'fuse.agent_id': 'agent-1',
       });
+    }
+    // fired is always 0 or 1, never the raw (differently-scaled) score
+    for (const call of firedRecordMock.mock.calls) {
+      expect([0, 1]).toContain(call[0]);
     }
   });
 
@@ -62,6 +70,14 @@ describe('DetectorRunner', () => {
     }
     const loop = results.find((r) => r.detector === 'loop-signature');
     expect(loop?.fired).toBe(true);
+
+    // the fired gauge for loop-signature's very last emission must be 1 —
+    // exactly what a SigNoz alert rule thresholds on, regardless of the
+    // raw score's own scale.
+    const lastLoopFiredCall = firedRecordMock.mock.calls
+      .filter((call) => call[1]['fuse.detector'] === 'loop-signature')
+      .at(-1);
+    expect(lastLoopFiredCall?.[0]).toBe(1);
   });
 
   it('fires the context-bloat detector once input tokens cross the absolute ceiling', () => {

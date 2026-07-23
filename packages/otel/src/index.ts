@@ -7,6 +7,7 @@ export {
   getOperationDurationHistogram,
   getBreakerDecisionCounter,
   getDetectorScoreGauge,
+  getDetectorFiredGauge,
 } from './metrics.js';
 export { withGenAiSpan } from './gen-ai-span.js';
 export type {
