@@ -66,6 +66,20 @@ describe('mapSignozAlertToNormalizedEvent', () => {
     expect(withoutDetector?.detector).toBe('unknown');
   });
 
+  // task.md §11.3 adversarial review: a webhook-tier token (the
+  // lowest-privilege credential) can name an arbitrary `fuse.detector`
+  // label, which flows into actor.id (persisted into unbounded TEXT
+  // columns) and into an info-level log line for an unrecognized value —
+  // this bounds that at the source, matching `reason`'s existing max(2000).
+  it('truncates an oversized detector label rather than passing it through unbounded', () => {
+    const oversized = 'x'.repeat(10_000);
+    const result = mapSignozAlertToNormalizedEvent(
+      baseAlert({ labels: { ...baseAlert().labels, fuse_detector: oversized } }),
+    );
+    expect(result?.detector.length).toBe(200);
+    expect(result?.detector).toBe('x'.repeat(200));
+  });
+
   it('prefers the summary annotation for reason, falling back to description, then a generic message', () => {
     const withSummary = mapSignozAlertToNormalizedEvent(
       baseAlert({ annotations: { summary: 'loop detected' } }),

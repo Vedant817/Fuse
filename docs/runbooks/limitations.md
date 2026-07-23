@@ -81,6 +81,14 @@ the single place a new operator or judge should read to know what Fuse does
   an accepted characteristic, not a durability guarantee. It is bounded
   (per-scope: 500 steps / 1 hour; total distinct scopes: 10,000 with LRU
   eviction, `docs/adr/012-failure-injection-review.md`) but not persisted.
+- **A caller can grow `breaker_state`/`preflight_state` and their own
+  metric cardinality without limit.** Unlike `DetectorRunner`'s in-memory
+  buffer (bounded, above) and `idempotency_keys` (has a TTL,
+  `docs/runbooks/operations.md` §8), any agent-scoped token can create a
+  permanent new row per never-seen `agentId` on `/v1/permit` or
+  `/v1/preflight/report`, with no cap — a real, found-not-fixed gap
+  (`docs/adr/013-adversarial-review-findings.md`), tracked in
+  `docs/threat-model.md`'s risk register as risk #9.
 - **No SAST/container-image scanning has been run.** `docs/adr/009-supply-
 chain-scan.md` covers dependency vulnerabilities, licenses, secrets, and
   an SBOM — but no static-analysis security scan and no container-image

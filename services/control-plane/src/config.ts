@@ -157,10 +157,40 @@ function parseTokenList(raw: string | undefined): TokenConfigEntry[] {
     .map(parseTokenEntry);
 }
 
+/** `.env.example`'s own placeholder token values (e.g.
+ * `changeme-generate-a-strong-random-token`) are 39 characters long — long
+ * enough to pass `TokenConfigEntrySchema`'s `min(16)` check, so a fresh
+ * `cp .env.example .env` with no edits starts the control plane
+ * successfully using a publicly-known string as a live bearer token,
+ * rather than failing closed the way an empty/unset token list already
+ * does (task.md §11.3 adversarial review — a real fresh-install gap, not
+ * a hypothetical one). Every placeholder in `.env.example` starts with
+ * `changeme`, so rejecting that literal prefix (case-insensitive) at
+ * startup catches the actual copy-paste-without-editing mistake without
+ * rejecting any real token an operator would plausibly choose. */
+function assertNoPlaceholderTokens(
+  envVarName: string,
+  entries: readonly TokenConfigEntry[],
+): void {
+  for (const entry of entries) {
+    const token = typeof entry === 'string' ? entry : entry.token;
+    if (token.toLowerCase().startsWith('changeme')) {
+      throw new Error(
+        `${envVarName} still contains a placeholder value from .env.example ` +
+          `("${token}") — generate a real random token (e.g. \`openssl rand -hex 32\`) ` +
+          'and set it before starting the control plane.',
+      );
+    }
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
   const apiTokens = parseTokenList(env['CONTROL_PLANE_API_TOKENS']);
   const agentApiTokens = parseTokenList(env['CONTROL_PLANE_AGENT_API_TOKENS']);
   const webhookTokens = parseTokenList(env['CONTROL_PLANE_WEBHOOK_TOKENS']);
+  assertNoPlaceholderTokens('CONTROL_PLANE_API_TOKENS', apiTokens);
+  assertNoPlaceholderTokens('CONTROL_PLANE_AGENT_API_TOKENS', agentApiTokens);
+  assertNoPlaceholderTokens('CONTROL_PLANE_WEBHOOK_TOKENS', webhookTokens);
 
   const parsed = ConfigSchema.safeParse({
     port: env['CONTROL_PLANE_PORT'],

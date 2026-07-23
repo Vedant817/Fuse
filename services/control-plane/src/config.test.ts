@@ -51,6 +51,64 @@ describe('loadConfig token parsing', () => {
       /invalid control-plane configuration/,
     );
   });
+
+  // task.md §11.3 adversarial review: .env.example's own placeholder tokens
+  // (e.g. "changeme-generate-a-strong-random-token", 39 chars) are long
+  // enough to pass the plain min(16) length check and would otherwise start
+  // the control plane successfully with a publicly-known credential.
+  it('rejects the exact placeholder value shipped in .env.example for CONTROL_PLANE_API_TOKENS', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: 'changeme-generate-a-strong-random-token',
+      }),
+    ).toThrow(/CONTROL_PLANE_API_TOKENS still contains a placeholder value/);
+  });
+
+  it('rejects a placeholder token for CONTROL_PLANE_AGENT_API_TOKENS', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_AGENT_API_TOKENS:
+          'changeme-generate-a-different-strong-random-token',
+      }),
+    ).toThrow(/CONTROL_PLANE_AGENT_API_TOKENS still contains a placeholder value/);
+  });
+
+  it('rejects a placeholder token for CONTROL_PLANE_WEBHOOK_TOKENS', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_WEBHOOK_TOKENS: 'changeme-generate-a-third-strong-random-token',
+      }),
+    ).toThrow(/CONTROL_PLANE_WEBHOOK_TOKENS still contains a placeholder value/);
+  });
+
+  it('rejects a placeholder token even in tenant:token form', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: `acme-corp:${'changeme-acme-token'.padEnd(16, '0')}`,
+      }),
+    ).toThrow(/CONTROL_PLANE_API_TOKENS still contains a placeholder value/);
+  });
+
+  it('is case-insensitive so "ChangeMe..." is still caught', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: 'ChangeMe-still-a-placeholder-value',
+      }),
+    ).toThrow(/CONTROL_PLANE_API_TOKENS still contains a placeholder value/);
+  });
+
+  it('does not reject a real token that merely contains "changeme" somewhere other than the start', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_API_TOKENS: `${'a'.repeat(16)}-notachangemeplaceholder`,
+    });
+    expect(config.apiTokens).toEqual([`${'a'.repeat(16)}-notachangemeplaceholder`]);
+  });
 });
 
 describe('loadConfig Postgres pool options', () => {

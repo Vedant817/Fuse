@@ -52,7 +52,17 @@ export type SignozAlertmanagerWebhookPayload = z.infer<
 export const NormalizedAlertEventSchema = z.object({
   scope: ScopeSchema,
   status: SignozAlertStatusSchema,
-  detector: z.string().min(1),
+  /** Bounded like `reason` below (task.md §11.3 adversarial review): this
+   * value is attacker-reachable — any holder of a webhook-tier token
+   * chooses the alert's own `fuse.detector` label — and flows into
+   * `actor.id` (`system:signoz-webhook:${detector}`, persisted verbatim
+   * into unbounded `TEXT` columns in `breaker_audit_log`/`breaker_state`)
+   * and into an info-level log line for an unrecognized value
+   * (`diagnosis-worker.ts`). Real detector names are short, known strings
+   * (`loop-signature`/`context-bloat`/`cost-velocity`); 200 chars is
+   * generous headroom for a legitimate value while still bounding an
+   * attacker-chosen one. */
+  detector: z.string().min(1).max(200),
   reason: z.string().min(1).max(2000),
   fingerprint: z.string().min(1),
   startsAt: z.string().min(1),

@@ -55,8 +55,14 @@ export function mapSignozAlertToNormalizedEvent(
     return undefined;
   }
 
-  const detector =
-    findLabel(alert.labels, 'fuse.detector', 'fuse_detector', 'detector') ?? 'unknown';
+  // Truncated defensively (matching `reason` below) rather than trusting
+  // NormalizedAlertEventSchema's own max(200) to be enforced downstream —
+  // this value is never actually run through that schema's safeParse/parse
+  // anywhere on the real webhook path (task.md §11.3 adversarial review), so
+  // truncation has to happen here to be load-bearing at all.
+  const detector = (
+    findLabel(alert.labels, 'fuse.detector', 'fuse_detector', 'detector') ?? 'unknown'
+  ).slice(0, 200);
   const reason =
     alert.annotations['summary'] ??
     alert.annotations['description'] ??
