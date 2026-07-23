@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
+import helmet from '@fastify/helmet';
 import type pg from 'pg';
 import { FuseHttpError } from '@fuse/contracts';
 import type { BreakerStore, PreflightStore } from '@fuse/breaker-store';
@@ -35,9 +36,24 @@ export interface BuildAppDeps {
 }
 
 export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
+  // No @fastify/cors is registered anywhere in this app, deliberately: every
+  // route requires a bearer token (see the preHandler hook below), this API
+  // has no browser-facing frontend, and Fastify sets no CORS headers unless
+  // a plugin adds them — so a browser's same-origin policy already blocks
+  // any cross-origin page from reading a response, with no explicit opt-out
+  // needed. Do not add @fastify/cors without a concrete browser caller that
+  // needs it, and if one appears, scope its `origin` allowlist explicitly
+  // rather than reflecting the request's Origin or using '*'.
   const app = Fastify({
     logger: { level: deps.config.logLevel },
     bodyLimit: MAX_BODY_BYTES,
+    // Left `false` deliberately: this process has no reverse proxy in the
+    // documented local/dev topology (infra/docker-compose.yml exposes it
+    // directly), so trusting X-Forwarded-* here would let any caller spoof
+    // `request.ip` (used only for unauthenticated health-route rate-limit
+    // keys, but still). A production deployment behind a real reverse proxy
+    // must set this appropriately for that topology — tracked in the
+    // operability runbook (docs/runbooks/), not assumed here.
     trustProxy: false,
     genReqId: () => crypto.randomUUID(),
   });
@@ -56,6 +72,14 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   );
 
   const diagnosisConfig = deps.diagnosisConfig ?? loadDiagnosisWorkerConfig();
+
+  // Baseline response headers (X-Content-Type-Options, X-Frame-Options,
+  // Referrer-Policy, etc.) — this is a JSON-only API with no browser
+  // audience by design (see CORS below), so these are defense-in-depth
+  // against a caller ever rendering a response in a browser context, not a
+  // primary control. Defaults from @fastify/helmet are safe for a JSON API:
+  // there is no HTML/inline-script response for a CSP to break.
+  await app.register(helmet);
 
   await app.register(rateLimit, {
     max: deps.config.rateLimitMax,
