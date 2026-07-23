@@ -2822,3 +2822,40 @@ the earlier checkmarks:
   definition, and owner steps are checked in under
   `.github/workflows/release.yml`, `infra/production/oci-free/`, and
   `docs/runbooks/oci-free-tier.md`.
+
+### Migrations silently never ran in the deployed container/Kubernetes layout (2026-07-24)
+
+- Actually executing the documented deployment path — not just reading
+  it — found a critical, previously-undetected gap: `docker compose -f
+  infra/production/oci-free/compose.yaml --profile tools run --rm migrate`
+  (the exact command the runbook and the Kubernetes migration Job both use)
+  exited `0` with **zero output** and created **zero tables** against a
+  freshly created Postgres database. `migrate.ts`'s CLI-entry guard compared
+  `process.argv[1]` (the literal invoked path) against
+  `fileURLToPath(import.meta.url)`; `pnpm deploy`'s production layout puts
+  `@fuse/breaker-store` under `node_modules/.pnpm/...` and symlinks it into
+  `node_modules/@fuse/...`, so Node's ESM loader resolves `import.meta.url`
+  through the symlink target while the CLI is invoked through the symlink
+  path itself — the two strings never matched, so `main()` never ran. Every
+  Docker/Kubernetes deployment of this repository would have started against
+  an unmigrated database with no error, warning, or non-zero exit code.
+- Verified directly: `readlink -f
+  /app/node_modules/@fuse/breaker-store/dist/migrate.js` inside the built
+  image resolved to
+  `/app/node_modules/.pnpm/@fuse+breaker-store@file+packages+breaker-store/node_modules/@fuse/breaker-store/dist/migrate.js`,
+  confirming the mismatch. This was previously masked because the only prior
+  manual verification used `pnpm --filter @fuse/breaker-store run migrate`
+  (`tsx src/migrate.ts`, no symlink indirection, argv[1] matches exactly) —
+  the actual containerized invocation shape had never been executed before.
+- Fixed by extracting and exporting `isMainModule(argv1, moduleUrl)`, which
+  resolves `argv1` through `realpathSync` before comparing, making the check
+  symlink-proof; added `packages/breaker-store/src/migrate.test.ts` (5 tests)
+  reproducing the exact symlink layout. Re-verified end-to-end: built the
+  production image fresh, created a throwaway Postgres database, ran the
+  unmodified `compose.yaml` migrate command — `applied: 0001_init.sql,
+  0002_preflight.sql, 0003_scope_registry.sql`, 6 tables created — then `up
+  -d control-plane` against that same freshly migrated database returned
+  `/healthz` 200 `{"status":"ok"}` and `/readyz` 200 `{"status":"ready"}`.
+  Clean-slate gate re-run after the fix: `pnpm run check` — **454 unit tests**
+  across every package — and `pnpm run test:integration` — **88 integration
+  tests across 10 files** — both green.

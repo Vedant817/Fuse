@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
@@ -81,7 +81,25 @@ async function main(): Promise<void> {
   }
 }
 
-const isMain = process.argv[1] === fileURLToPath(import.meta.url);
+/** `pnpm deploy`'s production layout puts this package under
+ * `node_modules/.pnpm/...` and symlinks it into `node_modules/@fuse/...`, so
+ * the path the CLI is invoked with (`process.argv[1]`, unresolved) never
+ * string-equals `import.meta.url`'s realpath — a naive comparison makes
+ * `main()` silently never run, so migrations silently never apply. Resolving
+ * both sides through the filesystem (not just `import.meta.url`'s target)
+ * makes the check symlink-proof. */
+export function isMainModule(argv1: string | undefined, moduleUrl: string): boolean {
+  if (!argv1) return false;
+  let resolvedArgv1: string;
+  try {
+    resolvedArgv1 = realpathSync(argv1);
+  } catch {
+    return false;
+  }
+  return resolvedArgv1 === fileURLToPath(moduleUrl);
+}
+
+const isMain = isMainModule(process.argv[1], import.meta.url);
 if (isMain) {
   main().catch((err) => {
     console.error(err);

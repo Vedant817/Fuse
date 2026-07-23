@@ -43,6 +43,11 @@ All notable changes to Fuse are documented here. The project follows
 - Wired the already-implemented Slack Resume action into real diagnosis
   messages. The button is emitted only when Slack request signing and a
   tenant-matching operator credential make the complete action usable.
+- Fixed migrations silently never running in any deployed container: the
+  CLI-entry check compared an unresolved invocation path against a
+  symlink-resolved `import.meta.url`, which `pnpm deploy`'s production
+  `node_modules/.pnpm/...` layout always mismatches. The migrate script now
+  exits `0` with real applied migrations, not a silent no-op.
 
 ### Operational notes
 
