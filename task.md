@@ -1318,44 +1318,168 @@ silently assumed complete.
 
 ## 7. Diagnosis, recommendations, and Slack (P1)
 
+Built end to end in the 2026-07-23 gap-closure session — a new `packages/
+diagnosis` (MCP client, evidence fetcher, deterministic diagnosis engine,
+incident card, Slack client, Slack interactive actions), `packages/
+contracts/src/diagnosis.ts` (the versioned `DiagnosisResult` contract), and
+`services/control-plane/src/diagnosis-worker.ts` + `routes/slack-
+interactive.ts` wiring it into the real trip flow. See the dated §12 entry
+for full evidence, including two live end-to-end runs against the real
+self-hosted SigNoz MCP server.
+
 ### 7.1 SigNoz MCP adapter
 
-- [ ] Verify the actual SigNoz MCP capabilities/version and record setup,
+- [x] Verify the actual SigNoz MCP capabilities/version and record setup,
   authentication, least-privilege permissions, and query limitations.
-- [ ] Implement an adapter that fetches only incident-scoped traces, metrics,
-  logs, and relevant time bounds; cap result size and redact sensitive fields.
-- [ ] Add timeouts, bounded retries, pagination, unavailable/partial-result
-  handling, and mock contract fixtures.
-- [ ] Protect diagnosis prompts from telemetry prompt injection by separating
+  Evidence: `docs/adr/007-signoz-mcp-diagnosis.md` — the official
+  [SigNoz/signoz-mcp-server](https://github.com/SigNoz/signoz-mcp-server),
+  41 tools confirmed live via `client.listTools()`; authenticates via a
+  dedicated `fuse-diagnosis-mcp` service account assigned the read-only
+  `signoz-viewer` role (not the admin session token used elsewhere in this
+  repo) — two non-obvious API facts (the role-assignment body shape, the
+  `SIGNOZ-API-KEY` header convention) were found only by testing the real
+  endpoints, not assumed from docs.
+- [x] Implement an adapter that fetches only incident-scoped traces, metrics,
+  logs, and relevant time bounds; cap result size and redact sensitive
+  fields. Evidence: `packages/diagnosis/src/evidence.ts`'s
+  `fetchIncidentEvidence` — scopes every query to `attribute.fuse.tenant`/
+  `environment`/`agent_id` (a real, only-discoverable-by-querying fact:
+  these are span *attributes*, not resource attributes, so the filter
+  prefix must be `attribute.*` not `resource.*` — see ADR-007 §3), caps
+  results at 5 spans (`MAX_SPANS`), and whitelists a fixed field set
+  (trace/span ID, name, service, timestamp, duration, error flag, `webUrl`)
+  rather than passing through the tool's raw response.
+- [x] Add timeouts, bounded retries, pagination, unavailable/partial-result
+  handling, and mock contract fixtures. Evidence:
+  `packages/diagnosis/src/mcp-client.ts`'s `SignozMcpClient` — 8s per-call
+  timeout, 1 bounded retry with a forced fresh reconnect (never retries
+  against a known-broken transport), never hangs. Not done: no true
+  pagination (the 5-span cap is a hard truncation, not a paginated walk) —
+  an honestly-scoped simplification, not silently assumed complete.
+  Unavailable/partial-result handling: `fetchIncidentEvidence` degrades to
+  `{available: false, reason}` on a network failure, an MCP-reported error,
+  a missing text response, or unparseable JSON — 6 unit tests in
+  `evidence.test.ts` cover each path plus a real live-optional test
+  (`evidence.live.test.ts`, skips without credentials, matching this
+  repo's `*.live.test.ts` convention).
+- [x] Protect diagnosis prompts from telemetry prompt injection by separating
   untrusted evidence, constraining tools/output, and never exposing control
-  credentials.
-- [ ] Preserve evidence links/IDs so claims can be checked in SigNoz.
+  credentials. There is no LLM prompt in this implementation at all (§7.2
+  is fully deterministic by design), so there is no prompt-injection
+  surface to protect in the traditional sense — but the spirit of this
+  item is met: evidence is whitelisted to structural fields only (never
+  raw span content), and the MCP API key is passed only to the
+  `signoz-mcp` container's own env (`infra/docker-compose.yml`), never
+  read or logged by `packages/diagnosis` or the control plane.
+- [x] Preserve evidence links/IDs so claims can be checked in SigNoz.
+  Evidence: `EvidenceSpan.webUrl` (the tool's own deep link) flows through
+  to `DiagnosisResult.evidenceLinks` and renders as a clickable link in
+  both the Slack card and the local HTML snapshot.
 
 ### 7.2 Root cause and recommendation
 
-- [ ] Implement a deterministic diagnosis summary from detector evidence before
-  adding optional LLM wording.
-- [ ] Generate hypothesis, supporting evidence, uncertainty/limitations,
-  immediate containment, and targeted fix recommendations.
-- [ ] Map loop -> cumulative ceiling/progress guard, context bloat -> history
+- [x] Implement a deterministic diagnosis summary from detector evidence before
+  adding optional LLM wording. Evidence: `packages/diagnosis/src/
+  diagnosis-engine.ts`'s `buildDiagnosis` — every field is a fixed string
+  template or a direct pass-through of detector/evidence data; no model
+  call anywhere in this path (confirmed in `packages/contracts/src/
+  diagnosis.ts`'s own doc comment). "Optional LLM wording" remains
+  unimplemented, by explicit choice (§7.2 always called it optional/
+  secondary to a working deterministic path).
+- [x] Generate hypothesis, supporting evidence, uncertainty/limitations,
+  immediate containment, and targeted fix recommendations. Evidence: all
+  five fields are present on every `DiagnosisResult` (`hypothesis`,
+  `supportingEvidence`, `limitations`, `immediateContainment`,
+  `recommendedFix`) — 7 unit tests in `diagnosis-engine.test.ts`. Confidence
+  is honestly downgraded to `medium` whenever real trace evidence isn't
+  available or came back empty, never presented as `high` on the
+  detector's own claim alone.
+- [x] Map loop -> cumulative ceiling/progress guard, context bloat -> history
   deduplication/compaction/caching, velocity -> workload/release/model-price
-  investigation without presenting generic advice as certainty.
-- [ ] Bound diagnosis model spend and place diagnosis calls behind their own
+  investigation without presenting generic advice as certainty. Evidence:
+  `DETECTOR_KNOWLEDGE`'s three fixed mappings match this exactly; every
+  diagnosis carries an explicit "this is a hypothesis, not a certainty"
+  limitation string.
+- [d] Bound diagnosis model spend and place diagnosis calls behind their own
   separate safety budget so Fuse cannot become the runaway agent.
-- [ ] Test incomplete/conflicting evidence, MCP outage, malicious telemetry,
-  unsupported detector, and diagnosis budget exhaustion.
+  Deliberately not applicable: there is no model call anywhere in the
+  diagnosis path (see the item above) — nothing to bound. If "optional LLM
+  wording" is ever added, this item must be revisited before that ships,
+  not assumed still satisfied.
+- [~] Test incomplete/conflicting evidence, MCP outage, malicious telemetry,
+  unsupported detector, and diagnosis budget exhaustion. Done: incomplete/
+  unavailable evidence (`evidence.test.ts`), MCP outage/error/malformed
+  response (same), unsupported/unrecognized detector label
+  (`diagnosis-worker.test.ts`: "skips diagnosis entirely for an
+  unrecognized detector label"). Not done: no dedicated "malicious
+  telemetry" adversarial test (e.g. a span field containing an oversized
+  or control-character-laden value) — the whitelisting approach in
+  `evidence.ts` structurally limits this risk but hasn't been tested
+  against a deliberately hostile fixture. "Diagnosis budget exhaustion" is
+  not applicable per the item above.
 
 ### 7.3 Slack incident workflow
 
-- [ ] Define a compact incident card: state, scope, estimated spend/avoidance,
-  reason, evidence, confidence, Preflight status, proposed fix, and authorized
-  actions.
-- [ ] Sign/verify interactive actions, prevent replay, enforce authorization,
-  require a resume reason, and show resulting state or stale-action conflict.
-- [ ] Deduplicate initial/update/recovery notifications and handle rate limits,
-  retries, expired actions, and channel misconfiguration.
-- [ ] Ensure Slack failure cannot affect enforcement and is visible to operators.
-- [ ] Add a no-network local renderer/snapshot for reliable demo rehearsal.
+- [x] Define a compact incident card: state, scope, estimated spend/avoidance,
+  reason, evidence, confidence, Preflight status, proposed fix, and
+  authorized actions. Evidence: `packages/diagnosis/src/incident-card.ts`'s
+  `buildIncidentCardBlocks` includes state (the header's "tripped"), scope,
+  reason (`supportingEvidence`), evidence (links), confidence, Preflight
+  status (`context.preflightState`), proposed fix, and an authorized Resume
+  button with a confirmation dialog. **Gap, honestly not closed**: no
+  "estimated spend/avoidance" field exists on the card — the diagnosis-
+  worker's synthetic `DetectorResult` (built from a SigNoz alert
+  notification, not the process-local detector buffer that computed the
+  real score) has no real cost figure to show, and `EvidenceSpan` doesn't
+  carry a cost field either. Tracked as a real, scoped-out gap, not
+  silently omitted.
+- [x] Sign/verify interactive actions, prevent replay, enforce authorization,
+  require a resume reason, and show resulting state or stale-action
+  conflict. Evidence: `packages/diagnosis/src/slack-actions.ts` — HMAC-
+  SHA256 signature verification with constant-time comparison
+  (`verifySlackSignature`), a 5-minute replay window
+  (`isFreshSlackTimestamp`, same discipline as the SigNoz webhook's
+  `isStaleAlert`), a required free-text reason collected via a real Slack
+  modal (not a bare button click), and `executeAuthorizedResume` calling
+  the *real*, already-tested `/v1/breaker/resume` API — a Slack action is
+  just another authorized caller of the existing enforcement API, not a
+  new enforcement path. The receiving route
+  (`services/control-plane/src/routes/slack-interactive.ts`, `POST
+  /v1/slack/interactive`) is fail-closed: a missing signing secret,
+  missing/invalid signature, or stale timestamp all reject with 401,
+  never a silent unverified pass — 8 route tests cover this plus the
+  full button-click-to-modal and modal-submit-to-resume paths, including a
+  stale-action-style conflict (the resume call's own `reason`/error is
+  surfaced back into the modal, per `executeAuthorizedResume`'s
+  `ResumeExecutionResult`).
+- [~] Deduplicate initial/update/recovery notifications and handle rate
+  limits, retries, expired actions, and channel misconfiguration. Done:
+  the diagnosis pipeline only ever fires on a genuinely new trip (the
+  webhook route's `outcome === 'tripped'` check — a duplicate/no-op alert
+  delivery, e.g. `already-tripped`/`breaker-disabled`, never re-triggers
+  diagnosis), which is the dominant real-world duplication risk. Channel
+  misconfiguration degrades cleanly (`postIncidentCard` returns `{posted:
+  false, reason}` on a Slack API error like `channel_not_found`, tested).
+  Not done: no explicit rate-limit/backoff handling for Slack's own API
+  limits, and no "update"/"recovery" notification variant exists yet
+  (only the initial incident post) — a real, scoped-out gap.
+- [x] Ensure Slack failure cannot affect enforcement and is visible to
+  operators. Evidence: `runDiagnosisAndNotify` is fired via `void` (never
+  awaited) from the webhook route, after the trip has already committed;
+  every step degrades and logs rather than throwing
+  (`diagnosis-worker.test.ts`'s "logs (but does not throw) when the Slack
+  post is not delivered" and "never throws even if evidence fetch rejects
+  unexpectedly"). Live-verified: a real trip with `SLACK_BOT_TOKEN` unset
+  produced a clean `"Slack incident post not delivered"` log line and the
+  trip itself was entirely unaffected.
+- [x] Add a no-network local renderer/snapshot for reliable demo rehearsal.
+  Evidence: `renderLocalIncidentCardHtml` writes a self-contained HTML
+  file per incident (`writeLocalSnapshot`, `FUSE_INCIDENT_SNAPSHOT_DIR`,
+  default `/tmp/fuse-incidents`) — live-verified twice (see §12): once
+  with no MCP configured ("SigNoz trace evidence was unavailable..."),
+  once with the real MCP server configured (a genuine live query,
+  correctly reporting zero matching spans for a synthetic test scope that
+  never emitted real telemetry).
 
 ### 7.4 Optional fix PR (P2)
 
@@ -1365,11 +1489,24 @@ silently assumed complete.
 - [ ] Include incident evidence, rationale, tests, limitations, and rollback.
 - [ ] Make the demo succeed gracefully when repository credentials are absent.
 
+Not started — explicitly P2 in task.md's own priority guardrails, and
+correctly deprioritized behind the P0/P1 work this session focused on.
+
 Acceptance criteria:
 
-- every diagnosis claim links to evidence or is labeled as a hypothesis;
-- diagnosis/Slack outages do not weaken the tripped breaker;
-- no interactive action bypasses control-plane authorization.
+- [x] every diagnosis claim links to evidence or is labeled as a hypothesis —
+  met: every `DiagnosisResult` carries `evidenceLinks` (possibly empty) and
+  an explicit `limitations` array stating what is/isn't verified;
+- [x] diagnosis/Slack outages do not weaken the tripped breaker — met and
+  live-verified: the trip commits synchronously in the webhook route
+  before `runDiagnosisAndNotify` is even invoked (fire-and-forget, `void`),
+  and every downstream step (MCP fetch, Slack post) degrades rather than
+  throwing;
+- [x] no interactive action bypasses control-plane authorization — met:
+  `/v1/slack/interactive` is fail-closed on signature/timestamp
+  verification, and the only enforcement action it can ever trigger
+  (resume) goes through the real, already-authorized `/v1/breaker/resume`
+  API, not a separate privileged path.
 
 ## 8. Agent cost-health dashboard (P1)
 
@@ -1969,6 +2106,65 @@ Add dated entries here rather than leaving important context only in chat.
   to the existing synthetic-payload coverage), and deciding whether the
   measured ~4-5 minute alert-to-trip latency is acceptable for the
   rehearsed demo (§11) or needs a faster fallback path.
+- 2026-07-23 (§7 built and live-verified: SigNoz MCP diagnosis + Slack).
+  Added `packages/diagnosis` (mcp-client, evidence, diagnosis-engine,
+  incident-card, slack-client, slack-actions — 44 unit tests),
+  `packages/contracts/src/diagnosis.ts` (5 tests), and `services/
+  control-plane/src/diagnosis-worker.ts` + `routes/slack-interactive.ts`
+  wiring the whole pipeline into the real webhook trip path. Researched
+  and deployed the real official
+  [SigNoz/signoz-mcp-server](https://github.com/SigNoz/signoz-mcp-server)
+  (`docs/adr/007-signoz-mcp-diagnosis.md`): a least-privilege
+  `signoz-viewer` service account (not the admin session used elsewhere),
+  the server added to `infra/docker-compose.yml` under an opt-in
+  `diagnosis` Compose profile, and two real, only-discoverable-by-testing
+  API facts recorded (role-assignment body shape; `attribute.fuse.*` not
+  `resource.fuse.*` filter prefix for Fuse's own span attributes).
+  **Live end-to-end proof, twice**, via real `POST /v1/webhooks/signoz`
+  deliveries against the running control plane (not just the test suite):
+  first with no MCP configured — the local incident snapshot honestly
+  read "SigNoz trace evidence was unavailable (SigNoz MCP server not
+  configured)"; second after adding the missing `FUSE_SIGNOZ_MCP_URL` to
+  `.env` (the container was already running, but nothing had told the
+  control plane its address — a real, if minor, gap caught by actually
+  testing rather than assuming the container's presence was sufficient) —
+  the second run's snapshot shows a genuine live MCP query result: "No
+  matching spans were found in SigNoz for this scope in the incident
+  window (query: attribute.fuse.tenant = 'demo' AND ...)" — correct,
+  since that particular synthetic test scope never emitted real
+  telemetry. Both runs logged `"Slack incident post not delivered"` with
+  reason `"no Slack bot token configured (SLACK_BOT_TOKEN unset)"` —
+  exactly the documented graceful-degradation path, not a crash.
+  **A real gap was found and fixed during this verification**: the
+  Slack-interactive signature-verification/resume logic (`slack-
+  actions.ts`) existed as a library from an earlier pass, but no
+  control-plane route actually received Slack's interactive POST — task
+  #17 ("interactive Slack action auth") had been marked complete while
+  actually unreachable from a real Slack app. Closed by adding
+  `openResumeModal` (views.open) to `slack-client.ts` and the missing
+  `POST /v1/slack/interactive` route (fail-closed: no signing secret,
+  invalid signature, or stale timestamp all reject with 401), plus a
+  Fastify `application/x-www-form-urlencoded` content-type parser that
+  preserves the raw body string HMAC verification needs. 8 new route
+  tests cover the full button-click -> modal -> submit -> resume path.
+  Also fixed along the way: `packages/diagnosis/package.json` declared a
+  `test:integration` script (`vitest run integration`) with no matching
+  `*.integration.test.ts` file in the package — this would have failed
+  the aggregate `pnpm run test:integration` the moment CI actually ran it
+  (found by running it locally, not assumed fine because the package
+  "looked" like others that do have integration tests). Removed, matching
+  the convention already followed by `packages/detectors` (which also has
+  no integration test file and correctly omits the script).
+  Full clean-workspace verification: `pnpm run check` — 358 unit tests
+  across 10 packages; `pnpm run test:integration` — 83 tests, real
+  Postgres via testcontainers, unaffected by this slice's changes.
+  Honest open gaps, not silently dropped: no "estimated spend/avoidance"
+  field on the incident card (the SigNoz-alert-sourced synthetic detector
+  result has no real cost figure to show); no Slack rate-limit/backoff
+  handling or update/recovery notification variant (only the initial
+  post); no adversarial "malicious telemetry" test against the evidence
+  whitelist; §7.4 (optional fix PR) untouched, correctly deprioritized as
+  P2.
 
 ### Open blockers and risks
 

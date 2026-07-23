@@ -7,6 +7,11 @@ import {
 } from '@fuse/breaker-store';
 import type { ControlPlaneConfig } from '../config.js';
 import { mapSignozAlertToNormalizedEvent } from '../signoz-alert-mapper.js';
+import {
+  loadDiagnosisWorkerConfig,
+  runDiagnosisAndNotify,
+  type DiagnosisWorkerConfig,
+} from '../diagnosis-worker.js';
 
 const WEBHOOK_BODY_LIMIT_BYTES = 256 * 1024; // grouped Alertmanager deliveries can carry many alerts
 
@@ -54,6 +59,7 @@ export function registerWebhookRoutes(
   app: FastifyInstance,
   store: BreakerStore,
   config: ControlPlaneConfig,
+  diagnosisConfig: DiagnosisWorkerConfig = loadDiagnosisWorkerConfig(),
 ): void {
   app.post(
     '/v1/webhooks/signoz',
@@ -147,6 +153,27 @@ export function registerWebhookRoutes(
                 ? 'breaker-disabled'
                 : 'already-tripped';
             results.push({ fingerprint: alert.fingerprint, outcome });
+
+            // Fire-and-forget, deliberately not awaited: the trip already
+            // committed above, and diagnosis/Slack must never slow down or
+            // affect this webhook's own response (task.md §7's "diagnosis/
+            // Slack outages do not weaken the tripped breaker"). Only for a
+            // genuinely NEW trip — a no-op (already-tripped/disabled) alert
+            // would otherwise re-diagnose and re-notify on every duplicate
+            // delivery of an already-firing alert.
+            if (outcome === 'tripped') {
+              void runDiagnosisAndNotify(
+                {
+                  scope: normalized.scope,
+                  detector: normalized.detector,
+                  reason: normalized.reason,
+                  correlationId: alertCorrelationId,
+                  startsAt: normalized.startsAt,
+                },
+                diagnosisConfig,
+                (msg, meta) => request.log.info(meta, msg),
+              );
+            }
           }
         } catch (err) {
           if (err instanceof IdempotencyConflictError) {

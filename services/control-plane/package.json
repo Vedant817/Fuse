@@ -25,6 +25,7 @@
     "@fuse/breaker-store": "workspace:*",
     "@fuse/contracts": "workspace:*",
     "@fuse/detectors": "workspace:*",
+    "@fuse/diagnosis": "workspace:*",
     "@fuse/otel": "workspace:*",
     "@fuse/preflight": "workspace:*",
     "@fastify/rate-limit": "^10.2.2",

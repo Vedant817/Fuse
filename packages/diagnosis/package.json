@@ -1,0 +1,30 @@
+{
+  "name": "@fuse/diagnosis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
+    "test": "vitest run --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'",
+    "test:live": "vitest run live",
+    "test:coverage": "vitest run --coverage --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'"
+  },
+  "dependencies": {
+    "@fuse/contracts": "workspace:*",
+    "@fuse/detectors": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.0"
+  }
+}

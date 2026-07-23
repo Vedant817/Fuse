@@ -18,3 +18,29 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+
+  # The diagnosis half of task.md §7: an agent uses SigNoz MCP to pull the
+  # offending traces. Official server (github.com/SigNoz/signoz-mcp-server),
+  # image pinned by version tag per AGENTS.md's dependency-pinning
+  # requirement. Requires SIGNOZ_API_KEY (a service-account key with the
+  # least-privilege signoz-viewer role — see docs/adr/007-signoz-mcp-
+  # diagnosis.md for how it was created) and SIGNOZ_URL in the environment;
+  # this container is never started by `pnpm run dev`/tests automatically,
+  # only when a caller explicitly wants live MCP evidence (packages/
+  # diagnosis falls back to a documented offline mode otherwise).
+  signoz-mcp:
+    image: signoz/signoz-mcp-server:v0.9.0
+    container_name: fuse-signoz-mcp
+    environment:
+      SIGNOZ_URL: ${SIGNOZ_URL:-http://host.docker.internal:8080}
+      SIGNOZ_API_KEY: ${SIGNOZ_API_KEY:?SIGNOZ_API_KEY is required to start signoz-mcp}
+      TRANSPORT_MODE: http
+      MCP_SERVER_HOST: 0.0.0.0
+      MCP_SERVER_PORT: '8000'
+    ports:
+      - '8020:8000'
+    # No healthcheck: the image is distroless (no shell/wget/curl binary to
+    # exec), so container-level health is verified by the adapter's own
+    # connection retry logic (packages/diagnosis) instead, not Compose.
+    restart: unless-stopped
+    profiles: ['diagnosis']

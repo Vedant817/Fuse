@@ -11,7 +11,12 @@ import { registerBreakerRoutes } from './routes/breaker.js';
 import { registerWebhookRoutes } from './routes/webhook.js';
 import { registerPreflightRoutes } from './routes/preflight.js';
 import { registerDetectorRoutes } from './routes/detectors.js';
+import { registerSlackInteractiveRoute } from './routes/slack-interactive.js';
 import { DetectorRunner } from './detector-runner.js';
+import {
+  loadDiagnosisWorkerConfig,
+  type DiagnosisWorkerConfig,
+} from './diagnosis-worker.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -23,6 +28,8 @@ export interface BuildAppDeps {
    * to observe or control its buffer directly. Pass one explicitly only
    * when a test needs to assert on it or share it with a fixed clock. */
   detectorRunner?: DetectorRunner;
+  /** Defaults to `loadDiagnosisWorkerConfig()` (reads env) if omitted. */
+  diagnosisConfig?: DiagnosisWorkerConfig;
   pool: pg.Pool;
   config: ControlPlaneConfig;
 }
@@ -34,6 +41,21 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     trustProxy: false,
     genReqId: () => crypto.randomUUID(),
   });
+
+  // Slack's interactive payload arrives as application/x-www-form-urlencoded
+  // with a `payload` field containing URL-encoded JSON. The raw string (not
+  // a parsed object) is preserved as `request.body` because HMAC signature
+  // verification (routes/slack-interactive.ts) needs the exact bytes Slack
+  // signed, not a re-serialized reconstruction of them.
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_request, body, done) => {
+      done(null, body);
+    },
+  );
+
+  const diagnosisConfig = deps.diagnosisConfig ?? loadDiagnosisWorkerConfig();
 
   await app.register(rateLimit, {
     max: deps.config.rateLimitMax,
@@ -120,7 +142,12 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
 
   registerPermitRoute(app, deps.store, deps.config.storeOutageMode);
   registerBreakerRoutes(app, deps.store);
-  registerWebhookRoutes(app, deps.store, deps.config);
+  registerWebhookRoutes(app, deps.store, deps.config, diagnosisConfig);
+  registerSlackInteractiveRoute(
+    app,
+    diagnosisConfig,
+    `http://127.0.0.1:${deps.config.port}`,
+  );
   registerPreflightRoutes(app, deps.preflightStore, {
     windowMs: deps.config.preflightWindowMs,
     blindCoverageThreshold: deps.config.preflightBlindCoverageThreshold,
