@@ -5,6 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
+  '@hono/node-server': 2.0.10
   undici@<6.27.0: '>=6.27.0'
   uuid@<11.1.1: '>=11.1.1'
 
@@ -130,9 +131,6 @@ importers:
       '@fuse/contracts':
         specifier: workspace:*
         version: link:../contracts
-      '@fuse/detectors':
-        specifier: workspace:*
-        version: link:../detectors
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)
@@ -170,9 +168,6 @@ importers:
       '@opentelemetry/sdk-node':
         specifier: ^0.220.0
         version: 0.220.0(@opentelemetry/api@1.9.1)
-      '@opentelemetry/sdk-trace-node':
-        specifier: ^2.9.0
-        version: 2.9.0(@opentelemetry/api@1.9.1)
       '@opentelemetry/semantic-conventions':
         specifier: ^1.43.0
         version: 1.43.0
@@ -181,6 +176,9 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0(@opentelemetry/api@1.9.1)
       '@opentelemetry/sdk-trace-base':
+        specifier: ^2.9.0
+        version: 2.9.0(@opentelemetry/api@1.9.1)
+      '@opentelemetry/sdk-trace-node':
         specifier: ^2.9.0
         version: 2.9.0(@opentelemetry/api@1.9.1)
       typescript:
@@ -297,9 +295,6 @@ importers:
       '@fastify/rate-limit':
         specifier: ^10.2.2
         version: 10.3.0
-      '@fuse/breaker-core':
-        specifier: workspace:*
-        version: link:../../packages/breaker-core
       '@fuse/breaker-store':
         specifier: workspace:*
         version: link:../../packages/breaker-store
@@ -606,9 +601,9 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
-  '@hono/node-server@1.19.14':
-    resolution: {integrity: sha512-GwtvgtXxnWsucXvbQXkRgqksiH2Qed37H9xHZocE5sA3N8O8O8/8FA3uclQXxXVzc9XBZuEOMK7+r02FmSpHtw==}
-    engines: {node: '>=18.14.1'}
+  '@hono/node-server@2.0.10':
+    resolution: {integrity: sha512-ZcnNVhKTmyDJeg0UlnZjvM73JBsTAuhrH/J4fjwGOw59PwOW51r4J+p6CsKZWXdKSme4MFqU62CZMOsdDrU4CA==}
+    engines: {node: '>=20'}
     peerDependencies:
       hono: ^4
 
@@ -2876,7 +2871,7 @@ snapshots:
       protobufjs: 7.6.5
       yargs: 17.7.3
 
-  '@hono/node-server@1.19.14(hono@4.12.31)':
+  '@hono/node-server@2.0.10(hono@4.12.31)':
     dependencies:
       hono: 4.12.31
 
@@ -2927,7 +2922,7 @@ snapshots:
 
   '@modelcontextprotocol/sdk@1.29.0(zod@3.25.76)':
     dependencies:
-      '@hono/node-server': 1.19.14(hono@4.12.31)
+      '@hono/node-server': 2.0.10(hono@4.12.31)
       ajv: 8.20.0
       ajv-formats: 3.0.1(ajv@8.20.0)
       content-type: 1.0.5

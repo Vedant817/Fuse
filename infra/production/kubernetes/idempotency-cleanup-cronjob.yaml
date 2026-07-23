@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fuse-idempotency-cleanup
+spec:
+  schedule: '17 3 * * *'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: fuse-idempotency-cleanup
+            app.kubernetes.io/component: maintenance
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: cleanup
+              image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+              imagePullPolicy: IfNotPresent
+              command:
+                - psql
+                - --set
+                - ON_ERROR_STOP=1
+                - --command
+                - DELETE FROM idempotency_keys WHERE expires_at < now();
+              env:
+                - name: PGCONNECT_TIMEOUT
+                  value: '5'
+                - name: PGSSLMODE
+                  value: require
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: fuse-control-plane-secrets
+                      key: DATABASE_URL
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 32Mi
+                  ephemeral-storage: 16Mi
+                limits:
+                  cpu: 250m
+                  memory: 128Mi
+                  ephemeral-storage: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL

@@ -20,7 +20,6 @@
   },
   "dependencies": {
     "@fuse/contracts": "workspace:*",
-    "@fuse/detectors": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {

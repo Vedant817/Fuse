@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.env.*
+.DS_Store
+node_modules
+**/node_modules
+**/dist
+**/coverage
+**/*.tsbuildinfo
+infra/data
+infra/signoz/pours
+docs
+*.log
+**/*.test.ts
+**/*.integration.test.ts
+**/*.live.test.ts

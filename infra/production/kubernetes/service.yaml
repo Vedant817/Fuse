@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuse-control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fuse-control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

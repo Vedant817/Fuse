@@ -23,7 +23,6 @@
   "dependencies": {
     "@fastify/helmet": "^13.1.0",
     "@fastify/rate-limit": "^10.2.2",
-    "@fuse/breaker-core": "workspace:*",
     "@fuse/breaker-store": "workspace:*",
     "@fuse/contracts": "workspace:*",
     "@fuse/detectors": "workspace:*",

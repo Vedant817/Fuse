@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24.14.0
+  PNPM_VERSION: 11.6.0
+
+jobs:
+  quality:
+    name: Quality and integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run format, lint, build, typecheck, and unit tests
+        run: pnpm run check
+
+      - name: Run PostgreSQL integration tests
+        run: pnpm run test:integration
+
+      - name: Generate unit-test coverage
+        run: pnpm run test:coverage
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-test-coverage
+          path: |
+            packages/*/coverage
+            services/*/coverage
+          if-no-files-found: error
+          retention-days: 14
+
+  supply-chain:
+    name: Dependency audit and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Fail on high or critical production advisories
+        run: pnpm audit --prod --audit-level high
+
+      - name: Capture complete production audit
+        shell: bash
+        run: |
+          set +e
+          pnpm audit --prod --json > pnpm-audit.json
+          audit_status=$?
+          set -e
+          if [ "$audit_status" -gt 1 ]; then
+            echo "pnpm audit failed to complete (exit $audit_status)"
+            exit "$audit_status"
+          fi
+
+      - name: Generate CycloneDX SBOM
+        run: >-
+          npx --yes @cyclonedx/cdxgen@12.8.1
+          --type js
+          --required-only
+          --fail-on-error
+          --no-install-deps
+          --spec-version 1.6
+          --output ci-sbom.cdx.json
+          .
+
+      - name: Validate SBOM
+        run: >-
+          node -e "const fs=require('node:fs');
+          const bom=JSON.parse(fs.readFileSync('ci-sbom.cdx.json','utf8'));
+          if(bom.bomFormat!=='CycloneDX'||bom.specVersion!=='1.6'||!Array.isArray(bom.components)||bom.components.length===0)
+          process.exit(1);
+          console.log('CycloneDX components:',bom.components.length)"
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: supply-chain-evidence
+          path: |
+            pnpm-audit.json
+            ci-sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  container:
+    name: Build and smoke-test container
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs:
+      - quality
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: fuse
+          POSTGRES_USER: fuse
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fuse -d fuse"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build immutable runtime image
+        run: |
+          docker build \
+            --pull \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --tag fuse-control-plane:ci \
+            .
+
+      - name: Verify non-root runtime metadata
+        shell: bash
+        run: |
+          configured_user="$(docker image inspect fuse-control-plane:ci --format '{{.Config.User}}')"
+          test "$configured_user" = "node"
+          test -n "$(docker image inspect fuse-control-plane:ci --format '{{json .Config.Healthcheck}}')"
+
+      - name: Apply migrations with the runtime image
+        run: >-
+          docker run --rm --network host
+          --env DATABASE_URL=postgres://fuse:ci-only-password@127.0.0.1:5432/fuse
+          fuse-control-plane:ci
+          node node_modules/@fuse/breaker-store/dist/migrate.js
+
+      - name: Start hardened container
+        run: |
+          docker run --detach --name fuse-control-plane-ci --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --env DATABASE_URL=postgres://fuse:ci-only-password@127.0.0.1:5432/fuse \
+            --env CONTROL_PLANE_API_TOKENS=ci-operator-token-0123456789abcdef \
+            --env CONTROL_PLANE_AGENT_API_TOKENS=ci-agent-token-0123456789abcdef \
+            --env CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=ci \
+            --env OTEL_SDK_DISABLED=true \
+            fuse-control-plane:ci
+
+      - name: Verify liveness and readiness
+        run: |
+          curl --fail --show-error --silent --retry 15 --retry-all-errors \
+            http://127.0.0.1:8090/healthz
+          curl --fail --show-error --silent --retry 15 --retry-all-errors \
+            http://127.0.0.1:8090/readyz
+
+      - name: Capture container diagnostics
+        if: always()
+        run: |
+          docker inspect fuse-control-plane-ci || true
+          docker logs fuse-control-plane-ci || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm --force fuse-control-plane-ci || true
