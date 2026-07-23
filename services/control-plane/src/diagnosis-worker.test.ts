@@ -242,6 +242,64 @@ describe('runDiagnosisAndNotify', () => {
     });
   });
 
+  it('includes Resume only when Slack signing and a tenant-matching operator token make it usable', async () => {
+    await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-resume-action',
+        startsAt: new Date().toISOString(),
+      },
+      baseConfig({
+        localSnapshotDir: snapshotDir,
+        slackBotToken: 'xoxb-test',
+        slackSigningSecret: 'signing-secret',
+        operatorTokens: [{ tenant: SCOPE.tenant, token: 'tenant-operator-token-0001' }],
+      }),
+      log,
+    );
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    const blocks = JSON.stringify(postedCard?.blocks);
+    expect(blocks).toContain('"action_id":"fuse_resume"');
+    expect(blocks).toContain(JSON.stringify(JSON.stringify(SCOPE)).slice(1, -1));
+  });
+
+  it('omits Resume and logs why when no operator token matches the incident tenant', async () => {
+    await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-no-resume-action',
+        startsAt: new Date().toISOString(),
+      },
+      baseConfig({
+        localSnapshotDir: snapshotDir,
+        slackBotToken: 'xoxb-test',
+        slackSigningSecret: 'signing-secret',
+        operatorTokens: [
+          { tenant: 'different-tenant', token: 'other-operator-token-0001' },
+        ],
+      }),
+      log,
+    );
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    expect(JSON.stringify(postedCard?.blocks)).not.toContain('fuse_resume');
+    expect(logs).toContainEqual({
+      msg: 'Slack Resume action omitted: interactive authorization unavailable',
+      meta: {
+        hasSigningSecret: true,
+        hasTenantOperatorToken: false,
+        tenant: SCOPE.tenant,
+      },
+    });
+  });
+
   it('never throws even if evidence fetch rejects unexpectedly', async () => {
     fetchIncidentEvidence.mockRejectedValue(new Error('boom'));
     await expect(

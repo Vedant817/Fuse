@@ -2793,3 +2793,32 @@ the earlier checkmarks:
   plane, SDK, detector, diagnosis, OTel, Preflight, and demo-agent packages.
   A source-tree search excluding generated coverage found no HTML, CSS, TSX,
   React, Next, Vite, Vue, Svelte, or Angular application.
+
+### Personal free-tier deployment and Slack action correction (2026-07-24)
+
+- A real Slack incident exposed a wiring defect: `incident-card.ts` supported
+  `fuse_resume`, and the signed interactive route was live, but
+  `runDiagnosisAndNotify` never supplied `resumeActionValue`, so every actual
+  Slack card was read-only. The worker now includes the serialized scope only
+  when both `SLACK_SIGNING_SECRET` and an exact-tenant (or explicit wildcard)
+  operator token are usable; otherwise it logs why the action was omitted.
+  `pnpm --filter @fuse/control-plane exec vitest run
+  src/diagnosis-worker.test.ts src/routes/slack-interactive.test.ts` passed
+  25/25 tests. A new real `demo/live-button/agent-resume` context-bloat trip
+  returned enforcement `tripped` and delivered Slack timestamp
+  `1784833926.521259`.
+- The three ignored local control-plane credentials were replaced with
+  independent 64-hex `demo`-scoped values and `.env` was restricted to mode
+  `0600`. Provider-managed credentials accidentally surfaced during a local
+  Compose-render validation and must be rotated before deployment; the three
+  Fuse-owned credentials were immediately rotated again. Future Compose
+  validation uses an empty env file plus `config --quiet` so secrets cannot be
+  rendered into logs.
+- For the personal zero-cost target, the selected topology is one OCI Always
+  Free Ampere A1 VM (2 OCPUs/12 GB), Neon Free PostgreSQL, self-hosted SigNoz
+  Foundry, public GHCR multi-architecture images, and the existing reserved
+  ngrok HTTPS hostname. This preserves the full demo/product path but is
+  explicitly not HA or SLA-backed. The release workflow, hardened Compose
+  definition, and owner steps are checked in under
+  `.github/workflows/release.yml`, `infra/production/oci-free/`, and
+  `docs/runbooks/oci-free-tier.md`.

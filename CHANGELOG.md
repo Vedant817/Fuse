@@ -22,6 +22,9 @@ All notable changes to Fuse are documented here. The project follows
 - Direct SDK detector enforcement: the SDK carries a bounded complete window,
   the control plane commits a trip before acknowledging a firing observation,
   and the next guarded provider call is denied.
+- A tag/manual release workflow that verifies the full suite and publishes
+  immutable `linux/amd64` and `linux/arm64` images to GHCR, plus an OCI
+  Always Free personal-deployment Compose definition and runbook.
 
 ### Fixed
 
@@ -37,6 +40,9 @@ All notable changes to Fuse are documented here. The project follows
   diagnosis when SigNoz did not supply the original detector measurement.
 - Serialized concurrent migration runners and remediated all currently known
   production dependency advisories.
+- Wired the already-implemented Slack Resume action into real diagnosis
+  messages. The button is emitted only when Slack request signing and a
+  tenant-matching operator credential make the complete action usable.
 
 ### Operational notes
 

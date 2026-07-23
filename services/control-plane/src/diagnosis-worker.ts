@@ -185,9 +185,26 @@ export async function runDiagnosisAndNotify(
       windowEnd,
       trigger.detectorResult !== undefined,
     );
+    const resumeOperatorToken = selectOperatorTokenForTenant(
+      config,
+      trigger.scope.tenant,
+    );
+    const resumeActionValue =
+      config.slackSigningSecret && resumeOperatorToken
+        ? JSON.stringify(trigger.scope)
+        : undefined;
     const card = buildIncidentCardBlocks(diagnosis, {
       correlationId: trigger.correlationId,
+      ...(resumeActionValue ? { resumeActionValue } : {}),
     });
+
+    if (config.slackBotToken && !resumeActionValue) {
+      log('Slack Resume action omitted: interactive authorization unavailable', {
+        hasSigningSecret: Boolean(config.slackSigningSecret),
+        hasTenantOperatorToken: Boolean(resumeOperatorToken),
+        tenant: trigger.scope.tenant,
+      });
+    }
 
     await writeLocalSnapshot(diagnosis, trigger.correlationId, config, log);
 

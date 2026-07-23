@@ -1,0 +1,194 @@
+# Personal zero-cost deployment: OCI + Neon + GHCR
+
+This is the recommended personal-project deployment, not an HA/SLA-backed
+commercial production topology. It keeps the full Fuse product path,
+including self-hosted SigNoz, while staying inside currently published free
+allowances:
+
+- one Oracle Cloud Always Free `VM.Standard.A1.Flex` Ubuntu VM using the full
+  2 OCPUs and 12 GB RAM allowance;
+- a 150 GB boot volume (within OCI's 200 GB combined Always Free block-volume
+  allowance) and scheduled OCI volume backups;
+- Neon Free Postgres for breaker state, registrations, idempotency, and audit;
+- self-hosted SigNoz Foundry on the OCI VM;
+- GHCR for the public multi-architecture Fuse image;
+- the existing reserved ngrok HTTPS hostname for the control-plane and Slack
+  interactive endpoint.
+
+The tradeoffs are explicit: OCI may reclaim an idle Always Free VM, Neon Free
+is limited to 0.5 GB and 100 CU-hours per project, and ngrok Free has no
+availability SLA. Fuse remains fail-closed during an outage, but this topology
+must not be described as highly available.
+
+## 1. Accounts and values the owner must create
+
+1. Create an OCI Free Tier tenancy. Choose the home region carefully; Always
+   Free compute is tied to it.
+2. Create a Neon Free project named `fuse-production`, PostgreSQL 16 or newer,
+   and copy its pooled TLS connection string.
+3. Keep the GitHub repository public so the published GHCR package can be
+   pulled anonymously from the VM.
+4. Retain the existing ngrok reserved hostname
+   `appear-extradite-raven.ngrok-free.dev`. Only one free agent can own it at
+   once, so stop the laptop tunnel before starting the VM tunnel.
+
+Never paste bearer tokens, database credentials, Slack secrets, or the ngrok
+authtoken into chat, Git, an image layer, or a Compose file.
+
+## 2. Create the OCI VM
+
+In the OCI Console:
+
+1. Create an Ubuntu 24.04 ARM instance using `VM.Standard.A1.Flex`.
+2. Allocate 2 OCPUs, 12 GB RAM, and a 150 GB boot volume.
+3. Add your SSH public key.
+4. In the subnet security list, allow inbound TCP 22 only from your own IP.
+   Do not expose 8090, 4317, 4318, 8020, 8080, ClickHouse, or PostgreSQL.
+5. Enable an OCI budget alert at `$1`; never select a non-Always-Free shape
+   or paid load balancer.
+
+Connect:
+
+```bash
+ssh ubuntu@OCI_PUBLIC_IP
+```
+
+Install Docker, Git, and basic host controls:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git ufw
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker ubuntu
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from YOUR_PUBLIC_IP to any port 22 proto tcp
+sudo ufw --force enable
+```
+
+Log out and reconnect so Docker group membership applies.
+
+## 3. Publish the release image
+
+The checked-in `Release image` GitHub workflow verifies the full suite, builds
+both `linux/amd64` and `linux/arm64`, and publishes to
+`ghcr.io/vedant817/fuse-control-plane`.
+
+In GitHub, open **Actions → Release image → Run workflow** and set a version
+such as `v0.1.0-rc.1`. After it succeeds:
+
+```bash
+docker buildx imagetools inspect \
+  ghcr.io/vedant817/fuse-control-plane:v0.1.0-rc.1
+```
+
+Record the `linux/arm64` manifest-list digest. Deployment must use
+`ghcr.io/vedant817/fuse-control-plane@sha256:...`, never `latest`.
+
+## 4. Install SigNoz and repository configuration
+
+On the VM:
+
+```bash
+git clone https://github.com/Vedant817/Fuse.git fuse
+cd fuse
+./infra/signoz-up.sh
+```
+
+Wait for SigNoz and OTLP health. Keep its UI private and reach it only through
+SSH forwarding:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 ubuntu@OCI_PUBLIC_IP
+```
+
+Then open `http://localhost:8080` on the laptop. Create a least-privilege
+SigNoz service account for MCP, start the MCP profile, and apply the checked-in
+dashboard, alert rules, and Slack webhook channel using the existing scripts.
+
+## 5. Install secrets on the VM
+
+Create a root-owned runtime file:
+
+```bash
+sudo install -d -m 700 /etc/fuse
+sudo install -m 600 /dev/null /etc/fuse/control-plane.env
+sudoedit /etc/fuse/control-plane.env
+```
+
+Populate it from the local ignored `.env`, replacing `DATABASE_URL` with the
+Neon pooled TLS URL and using host access for the local SigNoz services:
+
+```dotenv
+DATABASE_URL=postgresql://...neon.../fuse?sslmode=require
+CONTROL_PLANE_API_TOKENS=demo:...
+CONTROL_PLANE_AGENT_API_TOKENS=demo:...
+CONTROL_PLANE_WEBHOOK_TOKENS=demo:...
+CONTROL_PLANE_STORE_OUTAGE_MODE=fail-closed
+CONTROL_PLANE_WEBHOOK_POLICY_VERSION=fuse-production-v1
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+SLACK_INCIDENT_CHANNEL=C0BKFBTFR4H
+OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
+FUSE_SIGNOZ_MCP_URL=http://host.docker.internal:8020/mcp
+```
+
+Do not copy LLM provider keys to the control-plane VM. Groq/NVIDIA keys belong
+only in the agent workload that actually calls those providers.
+
+## 6. Migrate and start Fuse
+
+From the repository checkout:
+
+```bash
+export FUSE_CONTROL_PLANE_IMAGE='ghcr.io/vedant817/fuse-control-plane@sha256:...'
+export FUSE_ENV_FILE=/etc/fuse/control-plane.env
+
+docker compose -f infra/production/oci-free/compose.yaml \
+  --profile tools run --rm migrate
+docker compose -f infra/production/oci-free/compose.yaml \
+  up -d control-plane
+docker compose -f infra/production/oci-free/compose.yaml \
+  ps
+
+curl --fail http://127.0.0.1:8090/healthz
+curl --fail http://127.0.0.1:8090/readyz
+```
+
+## 7. Move the reserved ngrok hostname to OCI
+
+Stop the laptop's ngrok process first. On the VM, install ngrok from its
+official repository, add the existing account authtoken locally, and verify:
+
+```bash
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+ngrok http --url=appear-extradite-raven.ngrok-free.dev 8090
+curl --fail https://appear-extradite-raven.ngrok-free.dev/healthz
+```
+
+Install that exact command as a systemd unit with `Restart=always`; store the
+authtoken in ngrok's root-readable config, not in the unit. In Slack App
+settings, keep **Interactivity & Shortcuts → Request URL** set to:
+
+```text
+https://appear-extradite-raven.ngrok-free.dev/v1/slack/interactive
+```
+
+## 8. Canary and backup
+
+Before calling it deployed:
+
+1. register a dedicated `demo/production/canary` scope;
+2. confirm permit returns allowed;
+3. submit a 100,000-token detector observation;
+4. confirm the trip, next-call denial, PostgreSQL audit row, SigNoz evidence,
+   and Slack card;
+5. click **Resume (requires reason)** and confirm permit recovers;
+6. reboot the VM and confirm SigNoz, Fuse, and ngrok recover automatically;
+7. schedule OCI boot-volume backups and a monthly Neon logical export;
+8. set retention for ClickHouse telemetry, idempotency keys, and breaker audit
+   rows before the 150 GB disk or 0.5 GB Neon allowance is exhausted.
+
+Keep the original Kubernetes deployment for a future paid/HA move. The OCI
+Compose path is the smallest honest zero-cost topology for this personal
+deployment.

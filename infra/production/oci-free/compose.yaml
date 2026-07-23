@@ -1,0 +1,42 @@
+name: fuse-personal-production
+
+services:
+  migrate:
+    image: ${FUSE_CONTROL_PLANE_IMAGE:?set FUSE_CONTROL_PLANE_IMAGE to an immutable GHCR digest}
+    env_file:
+      - ${FUSE_ENV_FILE:-/etc/fuse/control-plane.env}
+    command:
+      - node
+      - node_modules/@fuse/breaker-store/dist/migrate.js
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    profiles:
+      - tools
+    restart: 'no'
+
+  control-plane:
+    image: ${FUSE_CONTROL_PLANE_IMAGE:?set FUSE_CONTROL_PLANE_IMAGE to an immutable GHCR digest}
+    env_file:
+      - ${FUSE_ENV_FILE:-/etc/fuse/control-plane.env}
+    environment:
+      NODE_ENV: production
+      CONTROL_PLANE_HOST: 0.0.0.0
+      CONTROL_PLANE_PORT: '8090'
+      CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: production
+      CONTROL_PLANE_DETECTOR_POLICY_FILE: /app/policies/production.json
+    ports:
+      - 127.0.0.1:8090:8090
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 200
+    mem_limit: 768m
+    cpus: 1.0
+    restart: unless-stopped
+    stop_grace_period: 30s
