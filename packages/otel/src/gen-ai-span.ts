@@ -55,7 +55,7 @@ export interface GenAiSpanContext {
   /** Fired once, after a successful call whose `outcome.canonicalShape` is
    * set, with the numeric data the loop-signature/context-bloat/cost-
    * velocity detectors need (task.md §4). */
-  onStepObserved?: (step: StepObservation) => void;
+  onStepObserved?: (step: StepObservation) => void | Promise<void>;
 }
 
 export interface GenAiSpanOutcome {
@@ -202,7 +202,7 @@ export async function withGenAiSpan<T>(
         getOperationDurationHistogram().record(durationSeconds, metricAttributes);
 
         if (outcome.canonicalShape !== undefined && outcome.outcome === 'success') {
-          ctx.onStepObserved?.({
+          await ctx.onStepObserved?.({
             timestampMs: observedAtMs,
             canonicalShape: outcome.canonicalShape,
             inputTokens: outcome.inputTokens,

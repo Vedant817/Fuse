@@ -7,7 +7,10 @@ import {
   parseResumeSubmission,
   verifySlackSignature,
 } from '@fuse/diagnosis';
-import type { DiagnosisWorkerConfig } from '../diagnosis-worker.js';
+import {
+  selectOperatorTokenForTenant,
+  type DiagnosisWorkerConfig,
+} from '../diagnosis-worker.js';
 
 interface SlackInteractivePayload {
   type?: string;
@@ -85,6 +88,15 @@ export function registerSlackInteractiveRoute(
           botToken: config.slackBotToken,
           triggerId,
           view: buildResumeReasonModalView(action.value),
+        }).then((result) => {
+          if (result.opened) {
+            request.log.info({ correlationId }, 'Slack resume modal opened');
+          } else {
+            request.log.warn(
+              { correlationId, reason: result.reason },
+              'Slack resume modal not opened',
+            );
+          }
         });
       }
       return reply.code(200).send();
@@ -100,9 +112,18 @@ export function registerSlackInteractiveRoute(
           errors: { reason_block: 'Missing or malformed submission' },
         });
       }
+      const operatorToken = selectOperatorTokenForTenant(config, submission.scope.tenant);
+      if (!operatorToken) {
+        return reply.code(200).send({
+          response_action: 'errors',
+          errors: {
+            reason_block: 'No operator credential is configured for this incident tenant',
+          },
+        });
+      }
       const result = await executeAuthorizedResume(submission, {
         controlPlaneUrl,
-        operatorToken: config.operatorToken ?? '',
+        operatorToken,
       });
       if (!result.resumed) {
         return reply.code(200).send({

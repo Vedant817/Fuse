@@ -5,12 +5,10 @@
 # §4.5: "SigNoz alerting, rather than an undisclosed parallel path,
 # triggers the demo breaker."
 #
-# Idempotent by name: an existing channel/rule with the same name is left
-# untouched, not duplicated or overwritten — re-running this script after
-# editing infra/signoz/alerts/*.json requires deleting the stale rule first
-# (via the SigNoz UI or `DELETE /api/v2/rules/{id}`), a deliberate
-# create-if-missing design rather than a full diff/update, since these
-# fixed-threshold demo rules are not expected to change often.
+# Idempotent by name: the channel is created or fully updated so URL/token
+# rotation takes effect; alert rules remain create-if-missing because their
+# fixed thresholds are versioned in source and a rule replacement needs an
+# explicit rollout decision.
 #
 # Login flow (non-interactive; see docs/adr/006-signoz-alert-rule-
 # provisioning.md for how this was reverse-engineered against the real
@@ -64,14 +62,27 @@ auth_header="Authorization: Bearer $access_token"
 
 echo "==> Ensuring the fuse-control-plane webhook channel exists..."
 existing_channels=$(curl -sS -m 10 "$SIGNOZ_URL/api/v1/channels" -H "$auth_header")
+channel_body=$(jq \
+  --arg url "$CONTROL_PLANE_WEBHOOK_URL" \
+  --arg token "$CONTROL_PLANE_WEBHOOK_TOKEN" \
+  '.webhook_configs[0].url = $url | .webhook_configs[0].http_config.authorization.credentials = $token' \
+  "$CHANNELS_DIR/fuse-control-plane.json")
 if echo "$existing_channels" | jq -e '.data[]? | select(.name == "fuse-control-plane")' >/dev/null; then
-  echo "    already exists — skipping."
+  channel_id=$(echo "$existing_channels" | jq -r \
+    '.data[]? | select(.name == "fuse-control-plane") | .id' | head -n 1)
+  update_response=$(curl -sS -m 30 -X PUT \
+    "$SIGNOZ_URL/api/v1/channels/$channel_id" \
+    -H "$auth_header" -H "content-type: application/json" -d "$channel_body" \
+    -w $'\n%{http_code}')
+  update_status="${update_response##*$'\n'}"
+  update_body="${update_response%$'\n'*}"
+  if [[ "$update_status" != 2* ]]; then
+    echo "!! Failed to update the webhook channel (HTTP $update_status). Response:" >&2
+    echo "   $update_body" >&2
+    exit 1
+  fi
+  echo "    updated."
 else
-  channel_body=$(jq \
-    --arg url "$CONTROL_PLANE_WEBHOOK_URL" \
-    --arg token "$CONTROL_PLANE_WEBHOOK_TOKEN" \
-    '.webhook_configs[0].url = $url | .webhook_configs[0].http_config.authorization.credentials = $token' \
-    "$CHANNELS_DIR/fuse-control-plane.json")
   create_response=$(curl -sS -m 10 -X POST "$SIGNOZ_URL/api/v1/channels" \
     -H "$auth_header" -H "content-type: application/json" -d "$channel_body")
   if ! echo "$create_response" | jq -e '.data.id' >/dev/null 2>&1; then

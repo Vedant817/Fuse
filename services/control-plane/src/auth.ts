@@ -32,14 +32,35 @@ function tokenRecordMatches(
  * report) or a GET request's `?tenant=` query param (breaker/Preflight
  * status). Returns undefined if neither is present as a string — callers
  * treat that as "could not determine," which is fail-closed for any
- * non-wildcard token (see `requireBearerAuth`). Not used for the webhook
- * route — see config.ts's `webhookTokens` doc comment for why. */
+ * non-wildcard token (see `requireBearerAuth`). */
 export function extractTenantFromRequest(request: FastifyRequest): string | undefined {
   const body = request.body as { scope?: { tenant?: unknown } } | null | undefined;
   if (typeof body?.scope?.tenant === 'string') return body.scope.tenant;
   const query = request.query as { tenant?: unknown } | undefined;
   if (typeof query?.tenant === 'string') return query.tenant;
   return undefined;
+}
+
+/** A grouped SigNoz delivery can contain several alerts. A tenant-scoped
+ * webhook credential is accepted only when every alert explicitly names the
+ * same matching tenant. Mixed-tenant or missing-tenant groups fail closed;
+ * an explicitly configured wildcard credential remains the escape hatch for
+ * a shared, multi-tenant SigNoz instance. */
+export function extractTenantFromWebhookRequest(
+  request: FastifyRequest,
+): string | undefined {
+  const body = request.body as
+    { alerts?: Array<{ labels?: Record<string, unknown> }> } | null | undefined;
+  if (!Array.isArray(body?.alerts) || body.alerts.length === 0) return undefined;
+  const tenants = new Set<string>();
+  for (const alert of body.alerts) {
+    const labels = alert.labels;
+    const tenant =
+      labels?.['fuse.tenant'] ?? labels?.['fuse_tenant'] ?? labels?.['tenant'];
+    if (typeof tenant !== 'string' || tenant.length === 0) return undefined;
+    tenants.add(tenant);
+  }
+  return tenants.size === 1 ? [...tenants][0] : undefined;
 }
 
 /**

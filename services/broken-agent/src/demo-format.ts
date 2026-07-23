@@ -23,14 +23,14 @@ function paint(code: keyof typeof CODES, text: string): string {
   return COLOR_ENABLED ? `${CODES[code]}${text}${CODES.reset}` : text;
 }
 
-export const bold = (s: string): string => paint('bold', s);
+const bold = (s: string): string => paint('bold', s);
 export const dim = (s: string): string => paint('dim', s);
-export const red = (s: string): string => paint('red', s);
-export const green = (s: string): string => paint('green', s);
-export const yellow = (s: string): string => paint('yellow', s);
-export const blue = (s: string): string => paint('blue', s);
-export const magenta = (s: string): string => paint('magenta', s);
-export const cyan = (s: string): string => paint('cyan', s);
+const red = (s: string): string => paint('red', s);
+const green = (s: string): string => paint('green', s);
+const yellow = (s: string): string => paint('yellow', s);
+const blue = (s: string): string => paint('blue', s);
+const magenta = (s: string): string => paint('magenta', s);
+const cyan = (s: string): string => paint('cyan', s);
 
 const WIDTH = 72;
 

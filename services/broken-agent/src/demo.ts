@@ -82,6 +82,24 @@ function scopeFor(agentId: string): Scope {
   return { tenant: 'demo', environment: 'local-demo', agentId };
 }
 
+async function registerScopeViaRealApi(scope: Scope): Promise<void> {
+  const res = await fetch(`${CONTROL_PLANE_URL}/v1/scopes/register`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${OPERATOR_TOKEN}`,
+    },
+    body: JSON.stringify({
+      scope,
+      policyVersion: 'demo-v1',
+      actor: { type: 'manual', id: 'user:demo-operator' },
+      reason: 'broken-agent demo scope',
+      correlationId: `demo-register-${randomUUID()}`,
+    }),
+  });
+  if (!res.ok) fmt.fatal(`Scope registration failed: HTTP ${res.status}`);
+}
+
 function loggingModel(inner: Model): Model {
   return {
     async call(args) {
@@ -158,8 +176,10 @@ async function main(): Promise<void> {
   try {
     // --- Act 1: a normal run terminates cleanly, no false trip ---
     fmt.act('Normal run — the verifier approves quickly');
+    const scope1 = scopeFor(`agent-normal-${randomUUID().slice(0, 8)}`);
+    await registerScopeViaRealApi(scope1);
     const guard1 = new FuseGuard({
-      scope: scopeFor(`agent-normal-${randomUUID().slice(0, 8)}`),
+      scope: scope1,
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
       ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
@@ -181,12 +201,15 @@ async function main(): Promise<void> {
 
     // --- Act 2: a pathological scenario is bounded by the fixture's own ceiling ---
     fmt.act("Loop scenario — never approves, stopped by the fixture's own hard ceiling");
+    const scope2 = scopeFor(`agent-loop-${randomUUID().slice(0, 8)}`);
+    await registerScopeViaRealApi(scope2);
     const guard2 = new FuseGuard({
-      scope: scopeFor(`agent-loop-${randomUUID().slice(0, 8)}`),
+      scope: scope2,
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
       ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
       outageMode: SDK_OUTAGE_MODE,
+      reportStepObservations: false,
     });
     const result2 = await runAnalyzerVerifier({
       scenario: 'loop',
@@ -211,12 +234,14 @@ async function main(): Promise<void> {
     // --- Act 3: THE CORE CLAIM ---
     fmt.act('THE CORE CLAIM — an external trip stops the very next call, mid-run');
     const scope3 = scopeFor(`agent-trip-${randomUUID().slice(0, 8)}`);
+    await registerScopeViaRealApi(scope3);
     const guard3 = new FuseGuard({
       scope: scope3,
       controlPlaneUrl: CONTROL_PLANE_URL,
       apiToken: AGENT_TOKEN!,
       ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
       outageMode: SDK_OUTAGE_MODE,
+      reportStepObservations: false,
     });
 
     let dispatchCount = 0;
@@ -336,8 +361,10 @@ async function main(): Promise<void> {
       const model =
         process.env['FUSE_DEMO_MODEL'] ??
         (groqKey ? 'llama-3.1-8b-instant' : 'meta/llama-3.1-8b-instruct');
+      const scope4 = scopeFor(`agent-real-llm-${randomUUID().slice(0, 8)}`);
+      await registerScopeViaRealApi(scope4);
       const guard4 = new FuseGuard({
-        scope: scopeFor(`agent-real-llm-${randomUUID().slice(0, 8)}`),
+        scope: scope4,
         controlPlaneUrl: CONTROL_PLANE_URL,
         apiToken: AGENT_TOKEN!,
         ...permitTimeoutOption(PERMIT_TIMEOUT_MS),

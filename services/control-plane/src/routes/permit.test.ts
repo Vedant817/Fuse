@@ -1,6 +1,10 @@
 import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { StoreUnavailableError, type BreakerStore } from '@fuse/breaker-store';
+import {
+  StoreUnavailableError,
+  UnknownScopeError,
+  type BreakerStore,
+} from '@fuse/breaker-store';
 import type { Scope } from '@fuse/contracts';
 import { registerPermitRoute } from './permit.js';
 
@@ -88,6 +92,34 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
     await app.close();
   });
 
+  it('resolves store outage mode from the scope policy before applying an outage fallback', async () => {
+    const app = Fastify();
+    const resolveMode = vi.fn(() => 'fail-open' as const);
+    registerPermitRoute(
+      app,
+      fakeStore(async () => {
+        throw new StoreUnavailableError('down');
+      }),
+      resolveMode,
+    );
+    await app.ready();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      payload: { scope: SCOPE, correlationId: 'policy-outage-mode' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      allowed: true,
+      degraded: true,
+      reason: 'store unavailable: applying configured outage mode (fail-open)',
+    });
+    expect(resolveMode).toHaveBeenCalledWith(SCOPE);
+    await app.close();
+  });
+
   it('does not record a decision for a malformed request that never reaches the store', async () => {
     const app = Fastify();
     registerPermitRoute(
@@ -105,6 +137,28 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
       payload: { scope: { tenant: '' }, correlationId: 'c1' },
     });
     expect(res.statusCode).toBe(400);
+    expect(addMock).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('rejects an unregistered scope without emitting an arbitrary metric series', async () => {
+    const app = Fastify();
+    registerPermitRoute(
+      app,
+      fakeStore(async () => {
+        throw new UnknownScopeError('scope is not registered');
+      }),
+      'fail-closed',
+    );
+    await app.ready();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      payload: { scope: SCOPE, correlationId: 'c1' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('unknown_scope');
     expect(addMock).not.toHaveBeenCalled();
     await app.close();
   });

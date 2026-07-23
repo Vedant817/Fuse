@@ -3,6 +3,7 @@ import { FuseHttpError, SignozAlertmanagerWebhookPayloadSchema } from '@fuse/con
 import {
   IdempotencyConflictError,
   StoreUnavailableError,
+  UnknownScopeError,
   type BreakerStore,
 } from '@fuse/breaker-store';
 import type { ControlPlaneConfig } from '../config.js';
@@ -60,6 +61,7 @@ export function registerWebhookRoutes(
   store: BreakerStore,
   config: ControlPlaneConfig,
   diagnosisConfig: DiagnosisWorkerConfig = loadDiagnosisWorkerConfig(),
+  diagnose: typeof runDiagnosisAndNotify = runDiagnosisAndNotify,
 ): void {
   app.post(
     '/v1/webhooks/signoz',
@@ -161,8 +163,8 @@ export function registerWebhookRoutes(
             // genuinely NEW trip — a no-op (already-tripped/disabled) alert
             // would otherwise re-diagnose and re-notify on every duplicate
             // delivery of an already-firing alert.
-            if (outcome === 'tripped') {
-              void runDiagnosisAndNotify(
+            if (outcome === 'tripped' && !tripResult.replayed) {
+              void diagnose(
                 {
                   scope: normalized.scope,
                   detector: normalized.detector,
@@ -176,6 +178,13 @@ export function registerWebhookRoutes(
             }
           }
         } catch (err) {
+          if (err instanceof UnknownScopeError) {
+            results.push({
+              fingerprint: alert.fingerprint,
+              outcome: 'unknown-scope',
+            });
+            continue;
+          }
           if (err instanceof IdempotencyConflictError) {
             results.push({
               fingerprint: alert.fingerprint,

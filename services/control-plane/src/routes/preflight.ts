@@ -4,7 +4,11 @@ import {
   PreflightReportRequestSchema,
   ScopeSchema,
 } from '@fuse/contracts';
-import { StoreUnavailableError, type PreflightStore } from '@fuse/breaker-store';
+import {
+  StoreUnavailableError,
+  UnknownScopeError,
+  type PreflightStore,
+} from '@fuse/breaker-store';
 import type { PreflightEvaluatorConfig } from '@fuse/preflight';
 import { getPreflightStateGauge } from '@fuse/otel';
 
@@ -25,6 +29,10 @@ function handleStoreError(
       503,
       correlationId,
     );
+    return reply.code(httpErr.httpStatus).send(httpErr.toBody());
+  }
+  if (err instanceof UnknownScopeError) {
+    const httpErr = new FuseHttpError('unknown_scope', err.message, 404, correlationId);
     return reply.code(httpErr.httpStatus).send(httpErr.toBody());
   }
   throw err;

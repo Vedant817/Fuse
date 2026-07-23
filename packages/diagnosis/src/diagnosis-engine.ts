@@ -11,23 +11,32 @@ import type { EvidenceBundle } from './evidence.js';
  */
 const DETECTOR_KNOWLEDGE: Record<
   DetectorResult['detector'],
-  { hypothesisTemplate: (r: DetectorResult) => string; recommendedFix: string }
+  {
+    hypothesisTemplate: (r: DetectorResult, measurementAvailable: boolean) => string;
+    recommendedFix: string;
+  }
 > = {
   'loop-signature': {
-    hypothesisTemplate: (r) =>
-      `A repeating step-shape cycle was detected (score ${r.score}, threshold ${r.threshold}), consistent with a progress-free Analyzer/Verifier-style loop that has no concept of its own cumulative cost.`,
+    hypothesisTemplate: (r, measurementAvailable) =>
+      measurementAvailable
+        ? `A repeating step-shape cycle was detected (score ${r.score}, threshold ${r.threshold}), consistent with a progress-free Analyzer/Verifier-style loop that has no concept of its own cumulative cost.`
+        : 'SigNoz reported that the repeating step-shape safeguard fired, consistent with a progress-free Analyzer/Verifier-style loop; the original numeric detector score was not included in the webhook.',
     recommendedFix:
       'Add a cumulative per-session/task cost or step ceiling, and a progress/novelty check that breaks the loop when the last few steps are canonically identical (not just bounded iteration).',
   },
   'context-bloat': {
-    hypothesisTemplate: (r) =>
-      `Input token count grew past the configured safeguard (score ${r.score}, threshold ${r.threshold}), consistent with a conversation history that is never compacted, deduplicated, or cached.`,
+    hypothesisTemplate: (r, measurementAvailable) =>
+      measurementAvailable
+        ? `Input token count grew past the configured safeguard (score ${r.score}, threshold ${r.threshold}), consistent with a conversation history that is never compacted, deduplicated, or cached.`
+        : 'SigNoz reported that the context-growth safeguard fired, consistent with a conversation history that is never compacted, deduplicated, or cached; the original numeric detector score was not included in the webhook.',
     recommendedFix:
       'Add history compaction/summarization, prompt caching for the stable prefix, or a hard context-size ceiling with a truncation/summarization fallback.',
   },
   'cost-velocity': {
-    hypothesisTemplate: (r) =>
-      `Estimated spend in the trailing window crossed the configured threshold (score $${r.score.toFixed(4)}, threshold $${r.threshold.toFixed(4)}), consistent with an abnormal call rate, a retry storm, or a pricing/model change.`,
+    hypothesisTemplate: (r, measurementAvailable) =>
+      measurementAvailable
+        ? `Estimated spend in the trailing window crossed the configured threshold (score $${r.score.toFixed(4)}, threshold $${r.threshold.toFixed(4)}), consistent with an abnormal call rate, a retry storm, or a pricing/model change.`
+        : 'SigNoz reported that the cost-velocity safeguard fired, consistent with an abnormal call rate, a retry storm, or a pricing/model change; the original numeric detector score was not included in the webhook.',
     recommendedFix:
       'Investigate recent workload/traffic changes, provider pricing or model-version changes, and retry/backoff configuration; a session-level cost ceiling is a useful backstop but not a substitute for finding the root cause.',
   },
@@ -45,6 +54,7 @@ export function buildDiagnosis(
   detectorResult: DetectorResult,
   evidence: EvidenceBundle,
   now: Date = new Date(),
+  measurementAvailable = true,
 ): DiagnosisResult {
   const knowledge = DETECTOR_KNOWLEDGE[detectorResult.detector];
   const limitations: string[] = [
@@ -54,6 +64,11 @@ export function buildDiagnosis(
   if (!evidence.available) {
     limitations.push(
       `SigNoz trace evidence was unavailable (${evidence.reason ?? 'unknown reason'}) — this diagnosis relies on the detector's own result only.`,
+    );
+  }
+  if (!measurementAvailable) {
+    limitations.push(
+      'The SigNoz webhook did not include the detector score or threshold; no numeric value is inferred or fabricated.',
     );
   }
 
@@ -77,7 +92,7 @@ export function buildDiagnosis(
     ...(evidence.available
       ? {}
       : { evidenceUnavailableReason: evidence.reason ?? 'unknown' }),
-    hypothesis: knowledge.hypothesisTemplate(detectorResult),
+    hypothesis: knowledge.hypothesisTemplate(detectorResult, measurementAvailable),
     // Lower confidence when we can't back the detector's own result with
     // real trace evidence — an honest signal, not a cosmetic one.
     confidence: evidence.available && evidence.spans.length > 0 ? 'high' : 'medium',

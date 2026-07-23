@@ -243,7 +243,9 @@ describe('withGenAiSpan', () => {
       {
         ...BASE_CTX,
         stepIndex: 0,
-        onStepObserved: (step) => steps.push(step),
+        onStepObserved: (step) => {
+          steps.push(step);
+        },
       },
       async () => ({
         result: 'ok',
@@ -268,7 +270,13 @@ describe('withGenAiSpan', () => {
   it('never fires onStepObserved when outcome.canonicalShape is not set', async () => {
     const steps: StepObservation[] = [];
     await withGenAiSpan(
-      { ...BASE_CTX, stepIndex: 0, onStepObserved: (step) => steps.push(step) },
+      {
+        ...BASE_CTX,
+        stepIndex: 0,
+        onStepObserved: (step) => {
+          steps.push(step);
+        },
+      },
       async () => ({
         result: 'ok',
         outcome: { inputTokens: 200, outputTokens: 50, outcome: 'success' },
@@ -284,7 +292,9 @@ describe('withGenAiSpan', () => {
         {
           ...BASE_CTX,
           stepIndex: 0,
-          onStepObserved: (step) => steps.push(step),
+          onStepObserved: (step) => {
+            steps.push(step);
+          },
         },
         async () => {
           throw new Error('provider exploded');

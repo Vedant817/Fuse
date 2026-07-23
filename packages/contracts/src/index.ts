@@ -1,4 +1,5 @@
 export * from './scope.js';
+export * from './scope-registration.js';
 export * from './errors.js';
 export * from './policy.js';
 export * from './breaker-state.js';

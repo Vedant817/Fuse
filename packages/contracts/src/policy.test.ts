@@ -53,6 +53,14 @@ describe('PolicySchema', () => {
     const result = PolicySchema.safeParse({ ...MINIMAL_POLICY, cooldownSeconds: -1 });
     expect(result.success).toBe(false);
   });
+
+  it('rejects notification routes the runtime cannot deliver', () => {
+    const result = PolicySchema.safeParse({
+      ...MINIMAL_POLICY,
+      notificationRoutes: ['pager-that-is-not-implemented'],
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 describe('DetectorsConfigSchema', () => {
@@ -78,6 +86,7 @@ describe('per-detector config schemas', () => {
       absoluteCeilingTokens: 100_000,
       minConsecutiveGrowthSteps: 5,
       minGrowthRatio: 3,
+      minInputTokensForGrowthSignal: 8_000,
       minStepsRequired: 4,
     });
   });

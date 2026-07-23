@@ -47,6 +47,10 @@ export interface FuseGuardOptions {
   reportStepObservations?: boolean;
   stepObservationFlushIntervalMs?: number;
   stepObservationMaxBatchSize?: number;
+  /** Defaults to the guard's `outageMode`. Fail-closed is recommended:
+   * detector observations are part of enforcement, not best-effort
+   * observability. */
+  stepObservationOutageMode?: OutageMode;
   onStepObservationReportError?: (err: unknown) => void;
 }
 
@@ -82,6 +86,8 @@ export class FuseGuard {
       reportStepObservations: options.reportStepObservations ?? true,
       stepObservationFlushIntervalMs: options.stepObservationFlushIntervalMs ?? 5_000,
       stepObservationMaxBatchSize: options.stepObservationMaxBatchSize ?? 200,
+      stepObservationOutageMode:
+        options.stepObservationOutageMode ?? options.outageMode ?? 'fail-closed',
       onStepObservationReportError: options.onStepObservationReportError,
     };
   }
@@ -139,7 +145,7 @@ export class FuseGuard {
    * No-ops if `reportStepObservations` was set to false. Lazily created,
    * same as `recordSpanTelemetry`.
    */
-  recordStepObservation(step: StepObservationWire): void {
+  async recordStepObservation(step: StepObservationWire): Promise<void> {
     if (!this.options.reportStepObservations) return;
     if (!this.stepObservationReporter) {
       this.stepObservationReporter = new StepObservationReporter({
@@ -149,11 +155,12 @@ export class FuseGuard {
         fetchImpl: this.options.fetchImpl,
         flushIntervalMs: this.options.stepObservationFlushIntervalMs,
         maxBatchSize: this.options.stepObservationMaxBatchSize,
+        outageMode: this.options.stepObservationOutageMode,
         onFlushError: this.options.onStepObservationReportError,
       });
       this.stepObservationReporter.start();
     }
-    this.stepObservationReporter.record(step);
+    await this.stepObservationReporter.recordAndFlush(step);
   }
 
   /** Forces an immediate flush of any buffered step observations. */

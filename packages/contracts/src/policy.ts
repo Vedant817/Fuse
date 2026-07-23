@@ -37,6 +37,7 @@ export const ContextBloatDetectorConfigSchema = z.object({
   absoluteCeilingTokens: z.number().int().positive().default(100_000),
   minConsecutiveGrowthSteps: z.number().int().positive().default(5),
   minGrowthRatio: z.number().positive().default(3),
+  minInputTokensForGrowthSignal: z.number().int().nonnegative().default(8_000),
   minStepsRequired: z.number().int().positive().default(4),
 });
 export type ContextBloatDetectorConfig = z.infer<typeof ContextBloatDetectorConfigSchema>;
@@ -71,7 +72,7 @@ export const PolicySchema = z.object({
   /** Behavior for the SDK when the control plane itself is unreachable. */
   controlPlaneOutageMode: OutageModeSchema.default('fail-closed'),
   detectors: DetectorsConfigSchema.default({}),
-  notificationRoutes: z.array(z.string()).default([]),
+  notificationRoutes: z.array(z.enum(['slack'])).default([]),
 });
 export type Policy = z.infer<typeof PolicySchema>;
 

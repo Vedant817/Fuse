@@ -14,6 +14,10 @@ export interface ContextBloatConfig {
    * even without a perfectly monotonic run (catches noisy-but-growing
    * traces the consecutive-run check might miss). */
   minGrowthRatio: number;
+  /** Growth is normal while a short conversation accumulates history.
+   * Trend-based signals stay disabled until the largest observed context
+   * reaches this floor; the absolute ceiling remains immediate. */
+  minInputTokensForGrowthSignal: number;
   /** Minimum steps before evaluating growth trends — the absolute ceiling
    * remains immediate even on the first observed call. */
   minStepsRequired: number;
@@ -23,6 +27,7 @@ export const DEFAULT_CONTEXT_BLOAT_CONFIG: ContextBloatConfig = {
   absoluteCeilingTokens: 100_000,
   minConsecutiveGrowthSteps: 5,
   minGrowthRatio: 3,
+  minInputTokensForGrowthSignal: 8_000,
   minStepsRequired: 4,
 };
 
@@ -64,6 +69,15 @@ export function detectContextBloat(
 
   if (orderedSteps.length < config.minStepsRequired) {
     return { ...base, fired: false, score: 0, evidence: [] };
+  }
+  if (maxInputTokens < config.minInputTokensForGrowthSignal) {
+    return {
+      ...base,
+      fired: false,
+      score: maxInputTokens,
+      threshold: config.minInputTokensForGrowthSignal,
+      evidence: [],
+    };
   }
 
   const consecutiveGrowth = longestTrailingIncreasingRun(

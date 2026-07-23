@@ -44,6 +44,18 @@ describe('buildDiagnosis', () => {
     expect(diagnosis.limitations.join(' ')).toContain('hypothesis, not a certainty');
   });
 
+  it('does not invent score/threshold evidence when an alert omitted the measurement', () => {
+    const diagnosis = buildDiagnosis(
+      loopResult({ score: 0, threshold: 0 }),
+      buildFixtureEvidenceBundle(),
+      new Date('2026-07-23T00:02:00.000Z'),
+      false,
+    );
+    expect(diagnosis.hypothesis).toContain('numeric detector score was not included');
+    expect(diagnosis.hypothesis).not.toContain('score 0');
+    expect(diagnosis.limitations.join(' ')).toContain('no numeric value is inferred');
+  });
+
   it('degrades to medium confidence and records the reason when evidence is unavailable', () => {
     const diagnosis = buildDiagnosis(
       loopResult(),

@@ -351,8 +351,7 @@ describe('FuseGuard', () => {
       apiToken: 'tok',
       fetchImpl,
     });
-    guard.recordStepObservation(healthyStep());
-    await guard.flushStepObservations();
+    await guard.recordStepObservation(healthyStep());
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://cp.internal/v1/detectors/observe',
       expect.objectContaining({ method: 'POST' }),
@@ -373,7 +372,7 @@ describe('FuseGuard', () => {
       fetchImpl,
       reportStepObservations: false,
     });
-    guard.recordStepObservation(healthyStep());
+    await guard.recordStepObservation(healthyStep());
     await guard.flushStepObservations();
     expect(fetchImpl).not.toHaveBeenCalled();
   });

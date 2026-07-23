@@ -80,6 +80,28 @@ describe('DetectorRunner', () => {
     expect(lastLoopFiredCall?.[0]).toBe(1);
   });
 
+  it('evaluates a complete carried window identically on a fresh replica', () => {
+    const firstReplica = new DetectorRunner();
+    const secondReplica = new DetectorRunner();
+    const now = new Date('2026-07-22T00:00:10.000Z');
+    const window = Array.from({ length: 8 }, (_, index) =>
+      step({
+        timestampMs: now.getTime() - (8 - index) * 1000,
+        canonicalShape:
+          index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+      }),
+    );
+
+    const first = firstReplica.evaluateWindow(SCOPE, window, now);
+    const second = secondReplica.evaluateWindow(SCOPE, window, now);
+    expect(second).toEqual(first);
+    expect(second.find((result) => result.detector === 'loop-signature')?.fired).toBe(
+      true,
+    );
+    expect(firstReplica.trackedScopeCount).toBe(0);
+    expect(secondReplica.trackedScopeCount).toBe(0);
+  });
+
   it('fires the context-bloat detector once input tokens cross the absolute ceiling', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');

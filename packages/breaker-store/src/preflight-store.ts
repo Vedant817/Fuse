@@ -5,6 +5,7 @@ import {
   type PreflightEvaluatorConfig,
 } from '@fuse/preflight';
 import type { PreflightResult, Scope, SpanTelemetrySampleWire } from '@fuse/contracts';
+import { UnknownScopeError } from './errors.js';
 import { withStoreErrors } from './pool.js';
 import { rowToPreflightResult, type PreflightStateRow } from './mapper.js';
 
@@ -45,6 +46,17 @@ export class PreflightStore {
       const client = await this.pool.connect();
       try {
         await client.query('BEGIN');
+        const registration = await client.query<{ registered: number }>(
+          `SELECT 1 AS registered
+             FROM registered_scopes
+            WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+          [args.scope.tenant, args.scope.environment, args.scope.agentId],
+        );
+        if (registration.rows.length === 0) {
+          throw new UnknownScopeError(
+            `scope ${args.scope.tenant}/${args.scope.environment}/${args.scope.agentId} is not registered`,
+          );
+        }
         const existing = await client.query<PreflightStateRow>(
           `SELECT * FROM preflight_state WHERE tenant=$1 AND environment=$2 AND agent_id=$3 FOR UPDATE`,
           [args.scope.tenant, args.scope.environment, args.scope.agentId],

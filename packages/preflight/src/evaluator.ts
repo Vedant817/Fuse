@@ -1,4 +1,4 @@
-import type { PreflightResult, PreflightState, Scope } from '@fuse/contracts';
+import type { PreflightResult, Scope } from '@fuse/contracts';
 import type {
   HeartbeatSignal,
   PreflightEvaluatorConfig,
@@ -244,5 +244,3 @@ export function evaluatePreflight(args: EvaluatePreflightArgs): PreflightResult 
     pendingSince,
   };
 }
-
-export type { PreflightState };

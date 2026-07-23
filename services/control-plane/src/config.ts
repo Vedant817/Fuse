@@ -5,7 +5,7 @@ import { OutageModeSchema } from '@fuse/contracts';
  * escape hatch (also what a plain, unscoped token normalizes to), not the
  * recommended shape for a real multi-tenant deployment. See
  * docs/adr/004-tenant-scoped-tokens.md and docs/threat-model.md §4. */
-export const ScopedTokenSchema = z.object({
+const ScopedTokenSchema = z.object({
   token: z.string().min(16),
   tenant: z.string().min(1),
 });
@@ -14,7 +14,7 @@ export type ScopedToken = z.infer<typeof ScopedTokenSchema>;
 /** A plain string is accepted for backward compatibility and normalizes to
  * `{ tenant: '*' }` (see `normalizeToken`) — every existing single-tenant
  * config/token continues to work unchanged; tenant scoping is opt-in. */
-export const TokenConfigEntrySchema = z.union([z.string().min(16), ScopedTokenSchema]);
+const TokenConfigEntrySchema = z.union([z.string().min(16), ScopedTokenSchema]);
 export type TokenConfigEntry = z.infer<typeof TokenConfigEntrySchema>;
 
 export function normalizeToken(entry: TokenConfigEntry): ScopedToken {
@@ -49,6 +49,7 @@ const ConfigSchema = z.object({
   dbPoolIdleTimeoutMs: z.number().int().positive().default(30_000),
   dbPoolConnectionTimeoutMs: z.number().int().positive().default(2_000),
   dbStatementTimeoutMs: z.number().int().positive().default(5_000),
+  maxRegisteredScopesPerTenant: z.number().int().positive().default(10_000),
   /** Global authenticated/unauthenticated request limiter. The default is
    * retained for backward compatibility, but production agents can raise
    * it based on measured permit throughput instead of being hard-capped in
@@ -80,11 +81,9 @@ const ConfigSchema = z.object({
    * means a leaked SigNoz webhook credential still cannot resume, disable,
    * or force-trip anything directly — it can only cause a *trip*, and only
    * for the scope named in the alert's own labels. Comma-separated in
-   * CONTROL_PLANE_WEBHOOK_TOKENS. Webhook tokens are NOT tenant-scoped even
-   * when given the `tenant:token` form — a single SigNoz instance may
-   * legitimately watch multiple tenants, and the alert payload already
-   * names its own scope; this is a separate, still-open hardening item
-   * (docs/threat-model.md §3). */
+   * CONTROL_PLANE_WEBHOOK_TOKENS. Tenant-scoped entries are enforced across every
+   * alert in a grouped delivery; use a plain wildcard token only when one
+   * SigNoz instance intentionally spans multiple tenants. */
   webhookTokens: z.array(TokenConfigEntrySchema).default([]),
   /** Server-controlled defaults applied to every trip the webhook causes.
    * Deliberately NOT read from the alert payload itself — an inbound
@@ -106,6 +105,10 @@ const ConfigSchema = z.object({
    * (clock skew between SigNoz and the control plane) before it is
    * treated as suspicious/malformed rather than merely fresh. */
   webhookMaxClockSkewAheadMs: z.number().int().nonnegative().default(60_000),
+  /** Startup-loaded, immutable policy JSON (one Policy object or an array).
+   * Production deployments should always set this; omission retains the
+   * documented local-development defaults. */
+  detectorPolicyFile: z.string().min(1).optional(),
   /** Preflight evaluator thresholds for the /v1/preflight/report route.
    * Defaults below are byte-for-byte `@fuse/preflight`'s own
    * `DEFAULT_PREFLIGHT_CONFIG` — set here only to give operators an
@@ -135,17 +138,20 @@ const ConfigSchema = z.object({
 export type ControlPlaneConfig = z.infer<typeof ConfigSchema>;
 
 /** Parses one comma-separated entry. `tenant:token` binds the token to that
- * tenant; a plain token (no colon, or an empty tenant/token part) is left as
- * a bare string and normalizes to the `'*'` (all-tenants) wildcard — see
- * `normalizeToken`. Splits on the FIRST colon only, so a token value itself
- * containing a colon is still handled (as long as no `tenant:` prefix was
- * intended, which is documented as the expected format in .env.example). */
+ * tenant; a plain token with no colon normalizes to the `'*'` wildcard.
+ * A colon with either side empty is rejected fail-closed: treating an
+ * operator typo such as `production:` as a literal wildcard bearer token
+ * would silently expand its authorization scope. */
 function parseTokenEntry(raw: string): TokenConfigEntry {
   const separatorIndex = raw.indexOf(':');
-  if (separatorIndex <= 0) return raw;
+  if (separatorIndex < 0) return raw;
   const tenant = raw.slice(0, separatorIndex).trim();
   const token = raw.slice(separatorIndex + 1).trim();
-  if (tenant.length === 0 || token.length === 0) return raw;
+  if (tenant.length === 0 || token.length === 0) {
+    throw new Error(
+      'invalid token entry: tenant:token entries require both a non-empty tenant and token',
+    );
+  }
   return { tenant, token };
 }
 
@@ -210,6 +216,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     dbStatementTimeoutMs: env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS']
       ? Number(env['CONTROL_PLANE_DB_STATEMENT_TIMEOUT_MS'])
       : undefined,
+    maxRegisteredScopesPerTenant: env['CONTROL_PLANE_MAX_REGISTERED_SCOPES_PER_TENANT']
+      ? Number(env['CONTROL_PLANE_MAX_REGISTERED_SCOPES_PER_TENANT'])
+      : undefined,
     rateLimitMax: env['CONTROL_PLANE_RATE_LIMIT_MAX']
       ? Number(env['CONTROL_PLANE_RATE_LIMIT_MAX'])
       : undefined,
@@ -230,6 +239,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     webhookMaxClockSkewAheadMs: env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS']
       ? Number(env['CONTROL_PLANE_WEBHOOK_MAX_CLOCK_SKEW_MS'])
       : undefined,
+    detectorPolicyFile: env['CONTROL_PLANE_DETECTOR_POLICY_FILE'],
     preflightWindowMs: env['CONTROL_PLANE_PREFLIGHT_WINDOW_MS']
       ? Number(env['CONTROL_PLANE_PREFLIGHT_WINDOW_MS'])
       : undefined,
@@ -262,6 +272,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
   });
   if (!parsed.success) {
     throw new Error(`invalid control-plane configuration: ${parsed.error.message}`);
+  }
+  if (
+    parsed.data.deploymentEnvironment === 'production' &&
+    parsed.data.detectorPolicyFile === undefined
+  ) {
+    throw new Error(
+      'invalid control-plane configuration: CONTROL_PLANE_DETECTOR_POLICY_FILE is required when CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production',
+    );
   }
   return parsed.data;
 }

@@ -5,6 +5,7 @@ import { buildApp } from './app.js';
 import type { ControlPlaneConfig } from './config.js';
 
 const VALID_TOKEN = 'a'.repeat(32);
+const AGENT_TOKEN = 'b'.repeat(32);
 const CONFIG: ControlPlaneConfig = {
   port: 0,
   host: '127.0.0.1',
@@ -15,6 +16,7 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  maxRegisteredScopesPerTenant: 10_000,
   rateLimitMax: 120,
   rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
@@ -94,6 +96,26 @@ describe('buildApp: secure defaults (task.md §9.1)', () => {
 
     expect(res.statusCode).toBe(401);
     expect(res.body).not.toContain('totally-wrong-token-value');
+    await app.close();
+  });
+
+  it('keeps effective policy inspection operator-only', async () => {
+    const app = await buildApp({
+      store: fakeStore,
+      preflightStore: fakePreflightStore,
+      pool: fakePool,
+      config: { ...CONFIG, agentApiTokens: [AGENT_TOKEN] },
+    });
+    await app.ready();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/policies/effective?tenant=t1&environment=prod&agentId=a1',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
     await app.close();
   });
 });

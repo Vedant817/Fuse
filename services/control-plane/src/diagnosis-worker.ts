@@ -11,6 +11,7 @@ import {
   renderLocalIncidentCardHtml,
   type EvidenceBundle,
 } from '@fuse/diagnosis';
+import { loadConfig, normalizeTokens, type ScopedToken } from './config.js';
 
 export interface DiagnosisWorkerConfig {
   mcpServerUrl: string | undefined;
@@ -23,28 +24,88 @@ export interface DiagnosisWorkerConfig {
    * Slack posting, an *inbound* unverified action could trigger a real
    * resume, so this one is never allowed to silently no-op-open. */
   slackSigningSecret: string | undefined;
-  /** The operator-tier token used to call the real `/v1/breaker/resume`
-   * API on a verified Slack resume submission — a Slack action is just
-   * another authorized caller of the existing enforcement API. */
+  /** Validated operator-tier tokens used to call the real
+   * `/v1/breaker/resume` API on a verified Slack resume submission.
+   * Selection is deferred until the submission's tenant is known; see
+   * `selectOperatorTokenForTenant`. */
+  operatorTokens?: readonly ScopedToken[];
+  /** @deprecated Compatibility for callers that manually construct this
+   * config. `loadDiagnosisWorkerConfig` only exposes an unscoped token
+   * here, so the legacy route fails closed rather than sending a
+   * `tenant:token` config entry as the bearer credential. */
   operatorToken: string | undefined;
 }
 
-function firstToken(raw: string | undefined): string | undefined {
-  if (!raw) return undefined;
-  const first = raw.split(',')[0]?.trim();
-  return first && first.length > 0 ? first : undefined;
+function hasAmbiguousTenantBindings(tokens: readonly ScopedToken[]): boolean {
+  const tenantsByToken = new Map<string, Set<string>>();
+  for (const entry of tokens) {
+    const tenants = tenantsByToken.get(entry.token) ?? new Set<string>();
+    tenants.add(entry.tenant);
+    tenantsByToken.set(entry.token, tenants);
+  }
+  return [...tenantsByToken.values()].some((tenants) => tenants.size > 1);
+}
+
+/**
+ * Parses operator tokens through the control plane's own configuration
+ * loader instead of maintaining a second, subtly different parser here.
+ * Invalid, placeholder, or ambiguously-bound token lists disable Slack
+ * resume fail-closed; outbound incident posting remains available.
+ */
+function parseOperatorTokens(raw: string | undefined): ScopedToken[] {
+  if (!raw) return [];
+  try {
+    const entries = loadConfig({
+      DATABASE_URL: 'postgresql://config-validation.invalid/fuse',
+      CONTROL_PLANE_API_TOKENS: raw,
+    }).apiTokens;
+    const tokens = normalizeTokens(entries);
+    return hasAmbiguousTenantBindings(tokens) ? [] : tokens;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Selects the least-privileged usable operator credential for one tenant:
+ * an exact tenant binding wins, with a wildcard accepted only as an
+ * explicit fallback. No match, malformed config, and a token value bound
+ * to multiple tenants all return undefined.
+ */
+export function selectOperatorTokenForTenant(
+  config: Pick<DiagnosisWorkerConfig, 'operatorTokens' | 'operatorToken'>,
+  tenant: string,
+): string | undefined {
+  if (tenant.length === 0) return undefined;
+
+  // `operatorToken` is retained only for existing manually-constructed
+  // configs/tests. Loaded production config always supplies
+  // `operatorTokens`, including an empty array on invalid input.
+  const tokens =
+    config.operatorTokens ??
+    (config.operatorToken ? [{ tenant: '*', token: config.operatorToken }] : []);
+  if (hasAmbiguousTenantBindings(tokens)) return undefined;
+
+  return (
+    tokens.find((entry) => entry.tenant === tenant)?.token ??
+    tokens.find((entry) => entry.tenant === '*')?.token
+  );
 }
 
 export function loadDiagnosisWorkerConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): DiagnosisWorkerConfig {
+  const operatorTokens = parseOperatorTokens(env['CONTROL_PLANE_API_TOKENS']);
   return {
     mcpServerUrl: env['FUSE_SIGNOZ_MCP_URL'],
     slackBotToken: env['SLACK_BOT_TOKEN'],
     slackChannel: env['SLACK_INCIDENT_CHANNEL'] ?? '#fuse-incidents',
     localSnapshotDir: env['FUSE_INCIDENT_SNAPSHOT_DIR'] ?? '/tmp/fuse-incidents',
     slackSigningSecret: env['SLACK_SIGNING_SECRET'],
-    operatorToken: firstToken(env['CONTROL_PLANE_API_TOKENS']),
+    operatorTokens,
+    // Never expose a tenant-prefixed config entry as a bearer token. This
+    // compatibility field is intentionally wildcard-only.
+    operatorToken: operatorTokens.find((entry) => entry.tenant === '*')?.token,
   };
 }
 
@@ -56,6 +117,10 @@ export interface DiagnosisTrigger {
   reason: string;
   correlationId: string;
   startsAt: string;
+  /** Present for direct SDK detector enforcement. SigNoz webhook alerts do
+   * not carry the original score/threshold, so that path leaves this absent
+   * and diagnosis must not invent numeric evidence. */
+  detectorResult?: DetectorResult;
 }
 
 type Logger = (msg: string, meta?: Record<string, unknown>) => void;
@@ -98,25 +163,28 @@ export async function runDiagnosisAndNotify(
       log,
     );
 
-    // Score/threshold are unknown at this point (this event came from a
-    // real SigNoz alert notification, not @fuse/detectors directly, which
-    // is the process-local buffer that computed the original score) —
-    // 1/1 with `fired: true` is an honest placeholder, not a real
-    // measurement; the reason string carries the real detail instead.
-    const syntheticDetectorResult: DetectorResult = {
+    const detectorResult: DetectorResult = trigger.detectorResult ?? {
       detector,
       detectorVersion: `${detector}-signoz-alert`,
       scope: trigger.scope,
       fired: true,
-      score: 1,
-      threshold: 1,
+      // Required by the shared detector-result shape but never presented as
+      // evidence: `measurementAvailable=false` selects wording that states
+      // the webhook omitted the original measurement.
+      score: 0,
+      threshold: 0,
       windowStart: windowStart.toISOString(),
       windowEnd: windowEnd.toISOString(),
       evidence: [trigger.reason],
       dedupeKey: trigger.correlationId,
     };
 
-    const diagnosis = buildDiagnosis(syntheticDetectorResult, evidence, windowEnd);
+    const diagnosis = buildDiagnosis(
+      detectorResult,
+      evidence,
+      windowEnd,
+      trigger.detectorResult !== undefined,
+    );
     const card = buildIncidentCardBlocks(diagnosis, {
       correlationId: trigger.correlationId,
     });
@@ -129,6 +197,11 @@ export async function runDiagnosisAndNotify(
     });
     if (!slackResult.posted) {
       log('Slack incident post not delivered', { reason: slackResult.reason });
+    } else {
+      log('Slack incident post delivered', {
+        channel: config.slackChannel,
+        ts: slackResult.ts,
+      });
     }
   } catch (err) {
     // Belt-and-braces: every awaited step above already degrades on its

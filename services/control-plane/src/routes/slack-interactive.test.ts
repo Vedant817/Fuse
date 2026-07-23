@@ -186,6 +186,76 @@ describe('registerSlackInteractiveRoute', () => {
     await app.close();
   });
 
+  it('uses the token bound to the submitted incident tenant', async () => {
+    executeAuthorizedResume.mockResolvedValue({ resumed: true, state: 'armed' });
+    const app = buildApp({
+      operatorToken: undefined,
+      operatorTokens: [
+        { tenant: 'tenant-a', token: 'token-for-a' },
+        { tenant: 'tenant-b', token: 'token-for-b' },
+      ],
+    });
+    await app.ready();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      type: 'view_submission',
+      user: { id: 'U123' },
+      view: {
+        id: 'V123',
+        private_metadata: JSON.stringify({
+          tenant: 'tenant-b',
+          environment: 'prod',
+          agentId: 'agent-1',
+        }),
+        state: { values: { reason_block: { reason_input: { value: 'fixed' } } } },
+      },
+    };
+    const rawBody = `payload=${encodeURIComponent(JSON.stringify(bodyObj))}`;
+    const res = await post(app, rawBody, {
+      'x-slack-signature': sign(timestamp, rawBody),
+      'x-slack-request-timestamp': timestamp,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(executeAuthorizedResume).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: expect.objectContaining({ tenant: 'tenant-b' }) }),
+      expect.objectContaining({ operatorToken: 'token-for-b' }),
+    );
+    await app.close();
+  });
+
+  it('fails closed when no operator token matches the submitted tenant', async () => {
+    const app = buildApp({
+      operatorToken: undefined,
+      operatorTokens: [{ tenant: 'tenant-a', token: 'token-for-a' }],
+    });
+    await app.ready();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      type: 'view_submission',
+      user: { id: 'U123' },
+      view: {
+        id: 'V123',
+        private_metadata: JSON.stringify({
+          tenant: 'tenant-b',
+          environment: 'prod',
+          agentId: 'agent-1',
+        }),
+        state: { values: { reason_block: { reason_input: { value: 'fixed' } } } },
+      },
+    };
+    const rawBody = `payload=${encodeURIComponent(JSON.stringify(bodyObj))}`;
+    const res = await post(app, rawBody, {
+      'x-slack-signature': sign(timestamp, rawBody),
+      'x-slack-request-timestamp': timestamp,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ response_action: 'errors' });
+    expect(executeAuthorizedResume).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('returns a Slack modal error response when the resume call fails', async () => {
     executeAuthorizedResume.mockResolvedValue({
       resumed: false,

@@ -1,6 +1,10 @@
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
-import { extractTenantFromRequest, requireBearerAuth } from './auth.js';
+import {
+  extractTenantFromRequest,
+  extractTenantFromWebhookRequest,
+  requireBearerAuth,
+} from './auth.js';
 import type { ScopedToken } from './config.js';
 
 const TOKEN_A = 'a'.repeat(32);
@@ -272,6 +276,62 @@ describe('extractTenantFromRequest', () => {
     await app.ready();
     const res = await app.inject({ method: 'POST', url: '/echo', payload: {} });
     expect(res.json().tenant).toBeUndefined();
+    await app.close();
+  });
+});
+
+describe('tenant-scoped grouped webhook authentication', () => {
+  const TENANT_TOKEN: ScopedToken = {
+    tenant: 't1',
+    token: 'webhook-tenant-token-0000000001',
+  };
+  const WILDCARD_TOKEN = 'webhook-wildcard-token-0000001';
+
+  async function buildWebhookApp() {
+    const app = Fastify();
+    app.addHook(
+      'preHandler',
+      requireBearerAuth(
+        [TENANT_TOKEN, WILDCARD_TOKEN],
+        [TENANT_TOKEN, WILDCARD_TOKEN],
+        extractTenantFromWebhookRequest,
+      ),
+    );
+    app.post('/webhook', async () => ({ ok: true }));
+    await app.ready();
+    return app;
+  }
+
+  const alert = (tenant: string) => ({ labels: { 'fuse.tenant': tenant } });
+
+  it('accepts a tenant token only when every grouped alert matches', async () => {
+    const app = await buildWebhookApp();
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { authorization: `Bearer ${TENANT_TOKEN.token}` },
+      payload: { alerts: [alert('t1'), alert('t1')] },
+    });
+    const crossTenant = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { authorization: `Bearer ${TENANT_TOKEN.token}` },
+      payload: { alerts: [alert('t1'), alert('t2')] },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(crossTenant.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('keeps the explicit wildcard escape hatch for mixed-tenant SigNoz groups', async () => {
+    const app = await buildWebhookApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { authorization: `Bearer ${WILDCARD_TOKEN}` },
+      payload: { alerts: [alert('t1'), alert('t2')] },
+    });
+    expect(response.statusCode).toBe(200);
     await app.close();
   });
 });

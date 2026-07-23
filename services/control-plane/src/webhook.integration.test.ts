@@ -24,6 +24,7 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  maxRegisteredScopesPerTenant: 10_000,
   rateLimitMax: 120,
   rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
@@ -47,6 +48,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  const registeredAgentIds: string[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -57,6 +59,17 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 30; index++) {
+      const agentId = `agent-registered-${index}-${randomUUID().slice(0, 8)}`;
+      await store.registerScope({
+        scope: { tenant: 't1', environment: 'test', agentId },
+        policyVersion: 'test-v1',
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `setup-${index}`,
+      });
+      registeredAgentIds.push(agentId);
+    }
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
@@ -80,7 +93,11 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
           labels: {
             fuse_tenant: 't1',
             fuse_environment: 'test',
-            fuse_agent_id: `agent-${randomUUID().slice(0, 8)}`,
+            fuse_agent_id:
+              registeredAgentIds.pop() ??
+              (() => {
+                throw new Error('registered webhook scope pool exhausted');
+              })(),
             fuse_detector: 'loop-signature',
           },
           annotations: { summary: 'loop detected' },
@@ -91,6 +108,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       ],
       ...overrides,
     };
+  }
+
+  function registeredAgentId(): string {
+    const agentId = registeredAgentIds.pop();
+    if (!agentId) throw new Error('registered webhook scope pool exhausted');
+    return agentId;
   }
 
   it('an agent token gets 403 on the webhook route (not a silent pass)', async () => {
@@ -183,7 +206,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('a resolved alert never auto-resumes — observed only, no state change', async () => {
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const agentId = registeredAgentId();
     const fingerprint = randomUUID();
     const startsAt = new Date().toISOString();
 
@@ -246,7 +269,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('duplicate delivery of the same alert (same fingerprint+startsAt) is idempotent — no double transition', async () => {
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const agentId = registeredAgentId();
     const payload = {
       status: 'firing',
       alerts: [
@@ -289,8 +312,8 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('processes a grouped delivery (multiple alerts, mixed firing/resolved) independently', async () => {
-    const agentA = `agent-${randomUUID().slice(0, 8)}`;
-    const agentB = `agent-${randomUUID().slice(0, 8)}`;
+    const agentA = registeredAgentId();
+    const agentB = registeredAgentId();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/webhooks/signoz',
@@ -393,7 +416,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('a genuinely already-tripped scope reports already-tripped, not breaker-disabled', async () => {
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const agentId = registeredAgentId();
     const labels = {
       fuse_tenant: 't1',
       fuse_environment: 'test',
@@ -427,7 +450,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('a disabled scope reports breaker-disabled on a fresh alert, not already-tripped, and stays disabled', async () => {
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const agentId = registeredAgentId();
     const scope = { tenant: 't1', environment: 'test', agentId };
 
     const disableRes = await app.inject({
@@ -468,7 +491,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   });
 
   it('accepts an alert comfortably within the freshness window', async () => {
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
+    const agentId = registeredAgentId();
     const freshStartsAt = new Date(Date.now() - 60 * 1000).toISOString(); // 1 min ago
     const res = await app.inject({
       method: 'POST',

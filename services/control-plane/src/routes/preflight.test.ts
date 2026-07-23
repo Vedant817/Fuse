@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PreflightStore } from '@fuse/breaker-store';
+import { UnknownScopeError, type PreflightStore } from '@fuse/breaker-store';
 import type { Scope } from '@fuse/contracts';
 import { registerPreflightRoutes } from './preflight.js';
 
@@ -77,6 +77,28 @@ describe('registerPreflightRoutes: fuse.preflight.state is actually recorded', (
       payload: { scope: { tenant: '' }, spans: [] },
     });
     expect(res.statusCode).toBe(400);
+    expect(recordMock).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('rejects an unregistered scope without emitting an arbitrary metric series', async () => {
+    const app = Fastify();
+    registerPreflightRoutes(
+      app,
+      fakeStore(async () => {
+        throw new UnknownScopeError('scope is not registered');
+      }),
+      CONFIG,
+    );
+    await app.ready();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      payload: { scope: SCOPE, spans: [] },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('unknown_scope');
     expect(recordMock).not.toHaveBeenCalled();
     await app.close();
   });

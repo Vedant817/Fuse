@@ -11,8 +11,10 @@ import {
   buildMissingFieldsFixture,
 } from '@fuse/preflight';
 import type { Scope } from '@fuse/contracts';
+import { UnknownScopeError } from './errors.js';
 import { runMigrations } from './migrate.js';
 import { PreflightStore } from './preflight-store.js';
+import { BreakerStore } from './store.js';
 
 function scopeFor(name: string): Scope {
   return {
@@ -26,6 +28,7 @@ describe('PreflightStore (Postgres integration)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let store: PreflightStore;
+  let breakerStore: BreakerStore;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -36,7 +39,19 @@ describe('PreflightStore (Postgres integration)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     store = new PreflightStore(pool);
+    breakerStore = new BreakerStore(pool);
   }, 120_000);
+
+  async function register(scope: Scope): Promise<Scope> {
+    await breakerStore.registerScope({
+      scope,
+      policyVersion: 'test-policy-v1',
+      actor: { type: 'manual', id: 'operator:test' },
+      reason: 'Preflight integration test registration',
+      correlationId: `register-${scope.agentId}`,
+    });
+    return scope;
+  }
 
   afterAll(async () => {
     await pool.end();
@@ -49,7 +64,7 @@ describe('PreflightStore (Postgres integration)', () => {
   });
 
   it('persists a protected evaluation and returns it via getResult', async () => {
-    const scope = scopeFor('healthy');
+    const scope = await register(scopeFor('healthy'));
     const now = Date.now();
     const result = await store.evaluate({
       scope,
@@ -64,7 +79,7 @@ describe('PreflightStore (Postgres integration)', () => {
   });
 
   it('persists hysteresis state across separate evaluate() calls (recovery does not commit early)', async () => {
-    const scope = scopeFor('hysteresis');
+    const scope = await register(scopeFor('hysteresis'));
     const t0 = Date.now();
 
     const broken = await store.evaluate({
@@ -93,7 +108,7 @@ describe('PreflightStore (Postgres integration)', () => {
   });
 
   it('an operator-disabled evaluation is persisted and read back correctly', async () => {
-    const scope = scopeFor('disabled');
+    const scope = await register(scopeFor('disabled'));
     const result = await store.evaluate({
       scope,
       spans: buildHealthyFixture(Date.now()),
@@ -113,7 +128,7 @@ describe('PreflightStore (Postgres integration)', () => {
     // never send `disabled` on routine reports. Before this fix, that
     // omission was treated as "evaluate normally," silently un-disabling
     // any scope an operator had just disabled.
-    const scope = scopeFor('disabled-stays-sticky');
+    const scope = await register(scopeFor('disabled-stays-sticky'));
     const disabled = await store.evaluate({
       scope,
       spans: [],
@@ -137,7 +152,7 @@ describe('PreflightStore (Postgres integration)', () => {
   });
 
   it('an explicit `disabled: false` re-enables a previously-disabled scope', async () => {
-    const scope = scopeFor('disabled-explicit-reenable');
+    const scope = await register(scopeFor('disabled-explicit-reenable'));
     await store.evaluate({
       scope,
       spans: [],
@@ -153,5 +168,23 @@ describe('PreflightStore (Postgres integration)', () => {
       disabled: false,
     });
     expect(reenabled.state).toBe('protected');
+  });
+
+  it('rejects an unregistered report without creating Preflight state', async () => {
+    const scope = scopeFor('unknown');
+    await expect(
+      store.evaluate({
+        scope,
+        spans: buildHealthyFixture(Date.now()),
+        config: DEFAULT_PREFLIGHT_CONFIG,
+      }),
+    ).rejects.toThrow(UnknownScopeError);
+
+    const persisted = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM preflight_state
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    expect(persisted.rows[0]?.count).toBe('0');
   });
 });

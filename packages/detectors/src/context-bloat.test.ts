@@ -34,6 +34,21 @@ describe('detectContextBloat', () => {
     expect(result.fired).toBe(false);
   });
 
+  it('stays quiet while an ordinary short conversation accumulates history (live-demo regression)', () => {
+    const steps: StepRecord[] = [1, 6, 11, 17].map((inputTokens, index) => ({
+      timestampMs: NOW_MS - (4 - index) * 1000,
+      canonicalShape: `normal-${index}`,
+      inputTokens,
+      outputTokens: 6,
+      estimatedCostUsd: 0.0001,
+    }));
+    const result = detectContextBloat(SCOPE, steps, DEFAULT_CONTEXT_BLOAT_CONFIG, NOW);
+    expect(result.fired).toBe(false);
+    expect(result.threshold).toBe(
+      DEFAULT_CONTEXT_BLOAT_CONFIG.minInputTokensForGrowthSignal,
+    );
+  });
+
   it('stays quiet on the loop fixture (tokens stay roughly flat, not growing)', () => {
     const result = detectContextBloat(
       SCOPE,
@@ -233,7 +248,7 @@ describe('detectContextBloat', () => {
   });
 
   it('reports a finite, JSON-serializable score for growth starting from a legitimate zero-token first step (regression: used to emit Infinity, which JSON.stringify silently turns into null)', () => {
-    const steps: StepRecord[] = [0, 10, 20, 30].map((inputTokens, i) => ({
+    const steps: StepRecord[] = [0, 3_000, 6_000, 9_000].map((inputTokens, i) => ({
       timestampMs: NOW_MS - (4 - i) * 1000,
       canonicalShape: `s${i}`,
       inputTokens,

@@ -32,3 +32,23 @@ export class CasContentionExhaustedError extends Error {
     this.name = 'CasContentionExhaustedError';
   }
 }
+
+/** The requested scope has not been explicitly registered by an operator.
+ * This is a caller/onboarding error, not a store outage. No state row,
+ * detector buffer, or metric series may be created for this scope. */
+export class UnknownScopeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnknownScopeError';
+  }
+}
+
+/** Registration would exceed the configured per-tenant scope ceiling.
+ * The limit check and insert are serialized in Postgres, so concurrent
+ * registrations cannot race past it. */
+export class ScopeCapacityExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ScopeCapacityExceededError';
+  }
+}

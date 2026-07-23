@@ -1,4 +1,9 @@
-import type { DetectorResult, Scope, StepObservationWire } from '@fuse/contracts';
+import type {
+  DetectorResult,
+  DetectorsConfig,
+  Scope,
+  StepObservationWire,
+} from '@fuse/contracts';
 import {
   DEFAULT_CONTEXT_BLOAT_CONFIG,
   DEFAULT_COST_VELOCITY_CONFIG,
@@ -6,6 +11,9 @@ import {
   detectContextBloat,
   detectCostVelocity,
   detectLoopSignature,
+  type ContextBloatConfig,
+  type CostVelocityConfig,
+  type LoopSignatureConfig,
   type StepRecord,
 } from '@fuse/detectors';
 import { getDetectorFiredGauge, getDetectorScoreGauge } from '@fuse/otel';
@@ -40,24 +48,46 @@ function scopeKey(scope: Scope): string {
 
 /**
  * Evaluates the three `@fuse/detectors` functions against real, in-order
- * step observations reported by an agent (task.md §4 — the previously
- * missing link between the pure detector library and any real telemetry).
- * Deliberately in-memory and per-process, not persisted: this is a live
- * "what does the trailing window look like right now" signal, the same
- * kind of state a SigNoz alert rule's own trailing-window query would hold
- * — not durable state like breaker/audit records. A control-plane restart
- * losing an in-flight run's buffer is an accepted characteristic (the next
- * few steps rebuild it), not a correctness bug, and is documented as such
- * rather than silently assumed away.
+ * step observations reported by an agent. The production HTTP route uses
+ * `evaluateWindow` with the SDK-carried complete bounded window, so control
+ * plane replicas are stateless for enforcement. The in-memory buffer remains
+ * only for direct library users of the compatibility `recordStep` API.
  */
 export class DetectorRunner {
   private readonly buffers = new Map<string, StepRecord[]>();
+  private readonly maxTrackedScopes: number;
+  private readonly loopConfig: LoopSignatureConfig;
+  private readonly contextBloatConfig: ContextBloatConfig;
+  private readonly costVelocityConfig: CostVelocityConfig;
 
   /** `maxTrackedScopes` defaults to the real production cap
    * (`MAX_TRACKED_SCOPES`); tests override it to a small number so the
    * cardinality-eviction behavior can be exercised without actually
    * creating thousands of scopes. */
-  constructor(private readonly maxTrackedScopes: number = MAX_TRACKED_SCOPES) {}
+  constructor(
+    options:
+      | number
+      | {
+          maxTrackedScopes?: number;
+          detectors?: DetectorsConfig;
+        } = {},
+  ) {
+    const normalized =
+      typeof options === 'number' ? { maxTrackedScopes: options } : options;
+    this.maxTrackedScopes = normalized.maxTrackedScopes ?? MAX_TRACKED_SCOPES;
+    this.loopConfig = {
+      ...DEFAULT_LOOP_SIGNATURE_CONFIG,
+      ...normalized.detectors?.['loop-signature'],
+    };
+    this.contextBloatConfig = {
+      ...DEFAULT_CONTEXT_BLOAT_CONFIG,
+      ...normalized.detectors?.['context-bloat'],
+    };
+    this.costVelocityConfig = {
+      ...DEFAULT_COST_VELOCITY_CONFIG,
+      ...normalized.detectors?.['cost-velocity'],
+    };
+  }
 
   /** Appends one step to its scope's buffer, prunes stale/overflowing
    * entries, evaluates all three detectors against the updated buffer, and
@@ -87,12 +117,46 @@ export class DetectorRunner {
       if (oldestKey !== undefined) this.buffers.delete(oldestKey);
     }
 
-    const results = [
-      detectLoopSignature(scope, buffer, DEFAULT_LOOP_SIGNATURE_CONFIG, now),
-      detectContextBloat(scope, buffer, DEFAULT_CONTEXT_BLOAT_CONFIG, now),
-      detectCostVelocity(scope, buffer, DEFAULT_COST_VELOCITY_CONFIG, now),
-    ];
+    return this.evaluateWindow(scope, buffer, now);
+  }
 
+  /**
+   * Evaluates a caller-supplied complete trailing window without relying on
+   * this process's in-memory buffer. The production HTTP route uses this
+   * form: the SDK carries the bounded window with every observation, so two
+   * load-balanced control-plane replicas make the same decision instead of
+   * splitting one agent's history between process-local Maps.
+   */
+  evaluateWindow(
+    scope: Scope,
+    steps: readonly StepObservationWire[],
+    now: Date = new Date(),
+    detectorOverrides?: DetectorsConfig,
+  ): DetectorResult[] {
+    const ordered = [...steps]
+      .filter((step) => step.timestampMs >= now.getTime() - MAX_BUFFER_AGE_MS)
+      .sort((a, b) => a.timestampMs - b.timestampMs)
+      .slice(-MAX_BUFFER_SIZE);
+    const results = [
+      detectLoopSignature(
+        scope,
+        ordered,
+        { ...this.loopConfig, ...detectorOverrides?.['loop-signature'] },
+        now,
+      ),
+      detectContextBloat(
+        scope,
+        ordered,
+        { ...this.contextBloatConfig, ...detectorOverrides?.['context-bloat'] },
+        now,
+      ),
+      detectCostVelocity(
+        scope,
+        ordered,
+        { ...this.costVelocityConfig, ...detectorOverrides?.['cost-velocity'] },
+        now,
+      ),
+    ];
     for (const result of results) {
       const attrs = {
         'fuse.detector': result.detector,

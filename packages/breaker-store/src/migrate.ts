@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
+// One stable, repository-specific 64-bit advisory-lock key. A session lock
+// covers the migrations-table check and every pending migration, preventing
+// two release jobs from both selecting and applying the same file.
+const MIGRATION_LOCK_KEY = '5065534519711111796';
 
 async function ensureMigrationsTable(client: pg.PoolClient): Promise<void> {
   await client.query(`
@@ -20,7 +24,10 @@ async function ensureMigrationsTable(client: pg.PoolClient): Promise<void> {
 export async function runMigrations(pool: pg.Pool): Promise<string[]> {
   const client = await pool.connect();
   const applied: string[] = [];
+  let lockAcquired = false;
   try {
+    await client.query('SELECT pg_advisory_lock($1::bigint)', [MIGRATION_LOCK_KEY]);
+    lockAcquired = true;
     await ensureMigrationsTable(client);
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((f) => f.endsWith('.sql'))
@@ -47,6 +54,11 @@ export async function runMigrations(pool: pg.Pool): Promise<string[]> {
     }
     return applied;
   } finally {
+    if (lockAcquired) {
+      await client
+        .query('SELECT pg_advisory_unlock($1::bigint)', [MIGRATION_LOCK_KEY])
+        .catch(() => {});
+    }
     client.release();
   }
 }

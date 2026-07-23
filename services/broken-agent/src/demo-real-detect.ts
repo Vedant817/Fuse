@@ -64,6 +64,26 @@ function scopeFor(agentId: string): Scope {
   return { tenant: 'demo', environment: 'local-demo', agentId };
 }
 
+async function registerScope(scope: Scope): Promise<void> {
+  const res = await fetch(`${CONTROL_PLANE_URL}/v1/scopes/register`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${OPERATOR_TOKEN}`,
+    },
+    body: JSON.stringify({
+      scope,
+      policyVersion: 'fuse-production-v1',
+      actor: { type: 'manual', id: 'user:demo-operator' },
+      reason: 'real detector demo scope',
+      correlationId: `demo-register-${randomUUID()}`,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`scope registration failed: HTTP ${res.status} ${await res.text()}`);
+  }
+}
+
 interface BreakerStatus {
   state: string;
   epoch: number;
@@ -93,6 +113,7 @@ async function main(): Promise<void> {
   });
 
   const scope = scopeFor(`agent-real-detect-${randomUUID().slice(0, 8)}`);
+  await registerScope(scope);
   fmt.kv('Scope', `${scope.tenant}/${scope.environment}/${scope.agentId}`);
   const guard = new FuseGuard({
     scope,

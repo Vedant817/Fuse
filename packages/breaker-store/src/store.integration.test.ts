@@ -6,7 +6,12 @@ import {
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, Scope } from '@fuse/contracts';
-import { StoreUnavailableError, IdempotencyConflictError } from './errors.js';
+import {
+  IdempotencyConflictError,
+  ScopeCapacityExceededError,
+  StoreUnavailableError,
+  UnknownScopeError,
+} from './errors.js';
 import { runMigrations } from './migrate.js';
 import { BreakerStore } from './store.js';
 
@@ -38,13 +43,40 @@ describe('BreakerStore (Postgres integration)', () => {
     store = new BreakerStore(pool);
   }, 120_000);
 
+  async function register(scope: Scope, targetStore = store): Promise<Scope> {
+    await targetStore.registerScope({
+      scope,
+      policyVersion: 'test-policy-v1',
+      actor: MANUAL_ACTOR,
+      reason: 'integration test registration',
+      correlationId: `register-${scope.agentId}`,
+    });
+    return scope;
+  }
+
   afterAll(async () => {
     await pool.end();
     await container.stop();
   });
 
-  it('permit() lazily initializes an unseen scope as armed', async () => {
+  it('rejects an unseen scope without creating a durable row, then permits it after explicit registration', async () => {
     const scope = scopeFor('lazy-init');
+    await expect(store.permit(scope, 'corr-unknown')).rejects.toThrow(UnknownScopeError);
+    const beforeRegistration = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM breaker_state
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    expect(beforeRegistration.rows[0]?.count).toBe('0');
+
+    const registration = await store.registerScope({
+      scope,
+      policyVersion: 'test-policy-v1',
+      actor: MANUAL_ACTOR,
+      reason: 'approved test scope',
+      correlationId: 'corr-register',
+    });
+    expect(registration.created).toBe(true);
     const result = await store.permit(scope, 'corr-1');
     expect(result.allowed).toBe(true);
     expect(result.state).toBe('armed');
@@ -52,7 +84,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('trips a breaker and denies the next permit check', async () => {
-    const scope = scopeFor('trip-then-deny');
+    const scope = await register(scopeFor('trip-then-deny'));
     await store.permit(scope, 'corr-0');
 
     const tripResult = await store.trip({
@@ -75,7 +107,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('duplicate trip delivery (same idempotency key) returns the original outcome, not a new transition', async () => {
-    const scope = scopeFor('dup-trip');
+    const scope = await register(scopeFor('dup-trip'));
     const req = {
       scope,
       reason: 'loop detected',
@@ -87,13 +119,18 @@ describe('BreakerStore (Postgres integration)', () => {
     };
     const first = await store.trip(req);
     const second = await store.trip(req);
-    expect(first).toEqual(second);
-    if (first.kind !== 'applied') throw new Error('unreachable');
+    if (first.kind !== 'applied' || second.kind !== 'applied') {
+      throw new Error('unreachable');
+    }
+    expect(first.replayed).toBeUndefined();
+    expect(second.replayed).toBe(true);
+    const { replayed: _replayed, ...secondOutcome } = second;
+    expect(secondOutcome).toEqual(first);
     expect(first.record.epoch).toBe(1); // only one real transition happened
   });
 
   it('reusing an idempotency key with a different request body is rejected', async () => {
-    const scope = scopeFor('idem-conflict');
+    const scope = await register(scopeFor('idem-conflict'));
     const base = {
       scope,
       policyVersion: 'demo-hardcoded-threshold-v1',
@@ -109,7 +146,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('is idempotent at the domain level too: tripping an already-tripped breaker with a new key no-ops without changing epoch', async () => {
-    const scope = scopeFor('already-tripped-noop');
+    const scope = await register(scopeFor('already-tripped-noop'));
     await store.trip({
       scope,
       reason: 'first alert',
@@ -135,7 +172,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('rejects a policy-driven resume during cooldown but allows manual override', async () => {
-    const scope = scopeFor('cooldown');
+    const scope = await register(scopeFor('cooldown'));
     await store.trip({
       scope,
       reason: 'loop',
@@ -173,7 +210,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('disable overrides enforcement even while tripped, and trip attempts while disabled stay quiet', async () => {
-    const scope = scopeFor('disable-override');
+    const scope = await register(scopeFor('disable-override'));
     await store.trip({
       scope,
       reason: 'loop',
@@ -216,7 +253,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('a stale expectedEpoch is rejected rather than silently applied', async () => {
-    const scope = scopeFor('stale-epoch');
+    const scope = await register(scopeFor('stale-epoch'));
     await store.permit(scope, 'corr-0'); // creates epoch 0
     const result = await store.trip({
       scope,
@@ -234,7 +271,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('survives concurrent trip requests for the same scope: exactly one real transition, rest no-op', async () => {
-    const scope = scopeFor('concurrent-trip');
+    const scope = await register(scopeFor('concurrent-trip'));
     await store.permit(scope, 'corr-0');
     const results = await Promise.all(
       Array.from({ length: 10 }, (_, i) =>
@@ -266,7 +303,7 @@ describe('BreakerStore (Postgres integration)', () => {
     // ON CONFLICT) that it should have replayed the winner's response would
     // still commit its own audit_log row first — fabricating phantom
     // "duplicate observed" audit entries for what was actually one event.
-    const scope = scopeFor('same-key-concurrent');
+    const scope = await register(scopeFor('same-key-concurrent'));
     await store.permit(scope, 'corr-0');
     const idempotencyKey = `idem-samekey-${randomUUID()}`;
     const req = {
@@ -281,9 +318,19 @@ describe('BreakerStore (Postgres integration)', () => {
     const N = 8;
     const results = await Promise.all(Array.from({ length: N }, () => store.trip(req)));
 
-    // Every caller observes an identical response.
-    const first = results[0];
-    for (const r of results) expect(r).toEqual(first);
+    // Every caller observes identical domain data, but only the invocation
+    // that committed is marked non-replayed so downstream side effects run
+    // exactly once.
+    const originals = results.filter(
+      (result) => result.kind === 'applied' && result.replayed !== true,
+    );
+    expect(originals).toHaveLength(1);
+    const first = originals[0]!;
+    for (const result of results) {
+      if (result.kind !== 'applied') throw new Error('unreachable');
+      const { replayed: _replayed, ...domainResult } = result;
+      expect(domainResult).toEqual(first);
+    }
 
     // Exactly one real state transition occurred.
     const record = await store.getRecord(scope);
@@ -300,7 +347,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('concurrent trips with distinct actors/reasons/correlationIds: every response and every persisted audit row reflects its OWN caller, not the winner (regression for actor/reason/correlationId mismatch bug)', async () => {
-    const scope = scopeFor('actor-mismatch');
+    const scope = await register(scopeFor('actor-mismatch'));
     await store.permit(scope, 'corr-0');
 
     const callers = ['A', 'B', 'C'].map((label) => ({
@@ -379,7 +426,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('noopReason is populated for no-op transitions (already-tripped, breaker-disabled) and absent for a genuine transition', async () => {
-    const scope = scopeFor('noop-reason');
+    const scope = await register(scopeFor('noop-reason'));
 
     const realTrip = await store.trip({
       scope,
@@ -437,7 +484,7 @@ describe('BreakerStore (Postgres integration)', () => {
   });
 
   it('restart recovery: a new BreakerStore instance against the same database sees the persisted state', async () => {
-    const scope = scopeFor('restart-recovery');
+    const scope = await register(scopeFor('restart-recovery'));
     await store.trip({
       scope,
       reason: 'loop',
@@ -474,5 +521,62 @@ describe('BreakerStore (Postgres integration)', () => {
     } finally {
       await deadPool.end();
     }
+  });
+
+  it('registerScope is idempotent and preserves the original registration evidence', async () => {
+    const scope = scopeFor('registration-idempotency');
+    const first = await store.registerScope({
+      scope,
+      policyVersion: 'policy-original',
+      actor: MANUAL_ACTOR,
+      reason: 'original approval',
+      correlationId: 'corr-original',
+    });
+    const replay = await store.registerScope({
+      scope,
+      policyVersion: 'policy-different',
+      actor: { type: 'manual', id: 'user:bob' },
+      reason: 'later duplicate',
+      correlationId: 'corr-replay',
+    });
+
+    expect(first.created).toBe(true);
+    expect(replay.created).toBe(false);
+    expect(replay.registration).toEqual(first.registration);
+    expect(replay.breaker).toEqual(first.breaker);
+  });
+
+  it('serializes concurrent registrations so they cannot race past the per-tenant cap', async () => {
+    const tenant = `capacity-${randomUUID()}`;
+    const cappedStore = new BreakerStore(pool, () => new Date(), 2);
+    const scopes = ['a', 'b', 'c'].map((agentId) => ({
+      tenant,
+      environment: 'test',
+      agentId,
+    }));
+    const outcomes = await Promise.allSettled(
+      scopes.map((scope) =>
+        cappedStore.registerScope({
+          scope,
+          policyVersion: 'v1',
+          actor: MANUAL_ACTOR,
+          reason: 'capacity race',
+          correlationId: `corr-${scope.agentId}`,
+        }),
+      ),
+    );
+
+    expect(outcomes.filter((result) => result.status === 'fulfilled')).toHaveLength(2);
+    const rejected = outcomes.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBeInstanceOf(ScopeCapacityExceededError);
+
+    const persisted = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM registered_scopes WHERE tenant=$1',
+      [tenant],
+    );
+    expect(persisted.rows[0]?.count).toBe('2');
   });
 });

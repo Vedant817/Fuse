@@ -12,6 +12,7 @@ import {
   CasContentionExhaustedError,
   IdempotencyConflictError,
   StoreUnavailableError,
+  UnknownScopeError,
   type BreakerStore,
   type TransitionResult,
 } from '@fuse/breaker-store';
@@ -51,6 +52,15 @@ async function respondWithTransition(
       .code(200)
       .send({ record: result.record, auditEvent: result.auditEvent, noop: result.noop });
   } catch (err) {
+    if (err instanceof UnknownScopeError) {
+      const httpErr = new FuseHttpError(
+        'unknown_scope',
+        'scope must be registered before breaker operations are allowed',
+        404,
+        correlationId,
+      );
+      return reply.code(httpErr.httpStatus).send(httpErr.toBody());
+    }
     if (err instanceof StoreUnavailableError) {
       const httpErr = new FuseHttpError(
         'store_unavailable',

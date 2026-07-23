@@ -22,6 +22,7 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  maxRegisteredScopesPerTenant: 10_000,
   rateLimitMax: 120,
   rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
@@ -41,12 +42,20 @@ const CONFIG: ControlPlaneConfig = {
   preflightMinRecoveryDwellMs: 60_000,
 };
 
-function scopeFor(name: string): Scope {
+const registeredScopes: Scope[] = [];
+
+function freshScope(name: string): Scope {
   return {
     tenant: 't1',
     environment: 'test',
     agentId: `agent-${name}-${randomUUID().slice(0, 8)}`,
   };
+}
+
+function scopeFor(name: string): Scope {
+  const scope = registeredScopes.pop();
+  if (!scope) throw new Error(`registered test scope pool exhausted at ${name}`);
+  return scope;
 }
 
 describe('control-plane HTTP API (Postgres integration)', () => {
@@ -63,6 +72,17 @@ describe('control-plane HTTP API (Postgres integration)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 40; index++) {
+      const scope = freshScope(`registered-${index}`);
+      await store.registerScope({
+        scope,
+        policyVersion: 'test-v1',
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `setup-${index}`,
+      });
+      registeredScopes.push(scope);
+    }
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
@@ -249,7 +269,7 @@ describe('control-plane HTTP API (Postgres integration)', () => {
   });
 
   it('returns 404 unknown_scope for status on a never-seen agent', async () => {
-    const scope = scopeFor('never-seen');
+    const scope = freshScope('never-seen');
     const res = await app.inject({
       method: 'GET',
       url: `/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
@@ -310,6 +330,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  const agentScopes: Scope[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -320,6 +341,17 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 10; index++) {
+      const scope = freshScope(`agent-token-${index}`);
+      await store.registerScope({
+        scope,
+        policyVersion: 'test-v1',
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `agent-token-setup-${index}`,
+      });
+      agentScopes.push(scope);
+    }
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({
       store,
@@ -335,6 +367,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        maxRegisteredScopesPerTenant: 10_000,
         rateLimitMax: 120,
         rateLimitWindowMs: 60_000,
         storeOutageMode: 'fail-closed',
@@ -363,12 +396,18 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
     await container.stop();
   });
 
+  function agentScope(name: string): Scope {
+    const scope = agentScopes.pop();
+    if (!scope) throw new Error(`registered agent-token scope pool exhausted at ${name}`);
+    return scope;
+  }
+
   it('an agent token can call /v1/permit', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/v1/permit',
       headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: scopeFor('agent-permit-ok'), correlationId: 'c1' },
+      payload: { scope: agentScope('agent-permit-ok'), correlationId: 'c1' },
     });
     expect(res.statusCode).toBe(200);
   });
@@ -379,7 +418,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
       url: '/v1/breaker/trip',
       headers: { authorization: `Bearer ${AGENT_TOKEN}` },
       payload: {
-        scope: scopeFor('agent-cannot-trip'),
+        scope: agentScope('agent-cannot-trip'),
         reason: 'attempted by an agent-scoped token',
         policyVersion: 'v1',
         cooldownSeconds: 60,
@@ -393,7 +432,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
   });
 
   it('an agent token gets 403 on /v1/breaker/resume — cannot self-assert a manual-actor cooldown override', async () => {
-    const scope = scopeFor('agent-cannot-resume');
+    const scope = agentScope('agent-cannot-resume');
     // Operator trips it first.
     await app.inject({
       method: 'POST',
@@ -443,6 +482,7 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  const tenantScopes = new Map<string, Scope[]>();
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -453,6 +493,25 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (const tenant of ['tenant-a', 'tenant-b']) {
+      const scopes: Scope[] = [];
+      for (let index = 0; index < 20; index++) {
+        const scope: Scope = {
+          tenant,
+          environment: 'test',
+          agentId: `agent-registered-${index}-${randomUUID().slice(0, 8)}`,
+        };
+        await store.registerScope({
+          scope,
+          policyVersion: 'test-v1',
+          actor: { type: 'system', id: 'test:setup' },
+          reason: 'integration test registration',
+          correlationId: `${tenant}-${index}`,
+        });
+        scopes.push(scope);
+      }
+      tenantScopes.set(tenant, scopes);
+    }
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({
       store,
@@ -468,6 +527,7 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        maxRegisteredScopesPerTenant: 10_000,
         rateLimitMax: 120,
         rateLimitWindowMs: 60_000,
         storeOutageMode: 'fail-closed',
@@ -497,11 +557,9 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
   });
 
   function scopeForTenant(tenant: string, name: string): Scope {
-    return {
-      tenant,
-      environment: 'test',
-      agentId: `agent-${name}-${randomUUID().slice(0, 8)}`,
-    };
+    const scope = tenantScopes.get(tenant)?.pop();
+    if (!scope) throw new Error(`registered ${tenant} test scope exhausted at ${name}`);
+    return scope;
   }
 
   it("tenant A's token can trip tenant A's own breaker", async () => {
@@ -544,13 +602,14 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
     expect(res.json().error).toBe('unauthorized');
 
     // Confirm it genuinely never happened — tenant B's own token still
-    // sees a fresh, never-tripped scope, not something A already tripped.
+    // sees the registered scope in its initial armed state.
     const statusRes = await app.inject({
       method: 'GET',
       url: `/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
       headers: { authorization: `Bearer ${TENANT_B_TOKEN.token}` },
     });
-    expect(statusRes.statusCode).toBe(404); // unknown_scope — never touched
+    expect(statusRes.statusCode).toBe(200);
+    expect(statusRes.json().record.state).toBe('armed');
   });
 
   it("tenant B's token cannot resume a scope tripped under tenant A", async () => {

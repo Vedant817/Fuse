@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { DetectorResultSchema } from './detector.js';
 import { ScopeSchema } from './scope.js';
 
+export const MAX_STEP_OBSERVATIONS_PER_REQUEST = 200;
+
 /**
  * The wire shape for one reported step, mirroring `@fuse/detectors`'
  * `StepRecord` field for field (task.md §4: the detector-runner evaluates
@@ -25,7 +27,7 @@ export type StepObservationWire = z.infer<typeof StepObservationSchema>;
  * batches spans, so a bursty agent doesn't make one HTTP call per step. */
 export const ObserveStepsRequestSchema = z.object({
   scope: ScopeSchema,
-  steps: z.array(StepObservationSchema).min(1).max(200),
+  steps: z.array(StepObservationSchema).min(1).max(MAX_STEP_OBSERVATIONS_PER_REQUEST),
 });
 export type ObserveStepsRequest = z.infer<typeof ObserveStepsRequestSchema>;
 
@@ -35,5 +37,11 @@ export type ObserveStepsRequest = z.infer<typeof ObserveStepsRequestSchema>;
  * score` gauges reflect, without a separate read path. */
 export const ObserveStepsResponseSchema = z.object({
   results: z.array(DetectorResultSchema),
+  enforcement: z.array(
+    z.object({
+      detector: DetectorResultSchema.shape.detector,
+      outcome: z.enum(['tripped', 'already-tripped', 'breaker-disabled']),
+    }),
+  ),
 });
 export type ObserveStepsResponse = z.infer<typeof ObserveStepsResponseSchema>;

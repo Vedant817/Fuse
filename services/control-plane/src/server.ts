@@ -5,6 +5,7 @@ import { bootstrapOtel, type FuseOtelHandle } from '@fuse/otel';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { createShutdownHandler } from './shutdown.js';
+import { loadDetectorPolicyFile } from './policy-loader.js';
 
 async function assertSchemaReady(pool: pg.Pool): Promise<void> {
   try {
@@ -46,10 +47,20 @@ async function main(): Promise<void> {
   });
   await assertSchemaReady(pool);
 
-  const store = new BreakerStore(pool);
+  const store = new BreakerStore(pool, undefined, config.maxRegisteredScopesPerTenant);
   const preflightStore = new PreflightStore(pool);
   const detectorRunner = new DetectorRunner();
-  const app = await buildApp({ store, preflightStore, detectorRunner, pool, config });
+  const detectorPolicyResolver = config.detectorPolicyFile
+    ? await loadDetectorPolicyFile(config.detectorPolicyFile)
+    : undefined;
+  const app = await buildApp({
+    store,
+    preflightStore,
+    detectorRunner,
+    pool,
+    config,
+    ...(detectorPolicyResolver ? { detectorPolicyResolver } : {}),
+  });
 
   const shutdown = createShutdownHandler({
     log: app.log,

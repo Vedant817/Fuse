@@ -6,7 +6,11 @@ import {
   type PermitResponse,
   type Scope,
 } from '@fuse/contracts';
-import { StoreUnavailableError, type BreakerStore } from '@fuse/breaker-store';
+import {
+  StoreUnavailableError,
+  UnknownScopeError,
+  type BreakerStore,
+} from '@fuse/breaker-store';
 import { getBreakerDecisionCounter } from '@fuse/otel';
 
 function correlationIdOf(request: FastifyRequest): string {
@@ -32,7 +36,7 @@ function recordDecision(scope: Scope, result: PermitResponse): void {
 export function registerPermitRoute(
   app: FastifyInstance,
   store: BreakerStore,
-  storeOutageMode: OutageMode,
+  resolveStoreOutageMode: OutageMode | ((scope: Scope) => OutageMode),
 ): void {
   app.post('/v1/permit', async (request, reply) => {
     const correlationId = correlationIdOf(request);
@@ -52,7 +56,20 @@ export function registerPermitRoute(
       recordDecision(parsed.data.scope, result);
       return reply.code(200).send(result);
     } catch (err) {
+      if (err instanceof UnknownScopeError) {
+        const httpErr = new FuseHttpError(
+          'unknown_scope',
+          err.message,
+          404,
+          correlationId,
+        );
+        return reply.code(httpErr.httpStatus).send(httpErr.toBody());
+      }
       if (err instanceof StoreUnavailableError) {
+        const storeOutageMode =
+          typeof resolveStoreOutageMode === 'function'
+            ? resolveStoreOutageMode(parsed.data.scope)
+            : resolveStoreOutageMode;
         request.log.error(
           { err, scope: parsed.data.scope },
           'store unavailable during permit check',

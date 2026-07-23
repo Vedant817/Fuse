@@ -15,11 +15,19 @@ import type {
   DisableRequest,
   EnableRequest,
   PermitResponse,
+  RegisterScopeRequest,
+  RegisterScopeResponse,
   ResumeRequest,
   Scope,
+  ScopeRegistration,
   TripRequest,
 } from '@fuse/contracts';
-import { CasContentionExhaustedError, IdempotencyConflictError } from './errors.js';
+import {
+  CasContentionExhaustedError,
+  IdempotencyConflictError,
+  ScopeCapacityExceededError,
+  UnknownScopeError,
+} from './errors.js';
 import { withStoreErrors } from './pool.js';
 import {
   type BreakerAuditRow,
@@ -35,6 +43,11 @@ export type TransitionResult =
       auditEvent: BreakerAuditEvent;
       noop: boolean;
       noopReason?: NoopReason;
+      /** Internal delivery metadata: true when this result was loaded from
+       * the idempotency snapshot rather than committed by this invocation.
+       * HTTP mutation responses deliberately omit it, but side effects such
+       * as Slack notification must only run for the original commit. */
+      replayed?: boolean;
     }
   | {
       kind: 'rejected';
@@ -44,7 +57,35 @@ export type TransitionResult =
 
 const MAX_CAS_ATTEMPTS = 5;
 const IDEMPOTENCY_TTL_INTERVAL = "interval '7 days'";
-const SYSTEM_INIT_ACTOR: Actor = { type: 'system', id: 'system:lazy-init' };
+export const DEFAULT_MAX_REGISTERED_SCOPES_PER_TENANT = 10_000;
+
+interface RegisteredScopeRow {
+  tenant: string;
+  environment: string;
+  agent_id: string;
+  policy_version: string;
+  registered_at: Date;
+  registered_by_type: Actor['type'];
+  registered_by_id: string;
+  registration_reason: string;
+}
+
+function rowToRegistration(row: RegisteredScopeRow): ScopeRegistration {
+  return {
+    scope: {
+      tenant: row.tenant,
+      environment: row.environment,
+      agentId: row.agent_id,
+    },
+    policyVersion: row.policy_version,
+    registeredAt: row.registered_at.toISOString(),
+    registeredBy: {
+      type: row.registered_by_type,
+      id: row.registered_by_id,
+    },
+    reason: row.registration_reason,
+  };
+}
 
 function hashRequest(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -56,7 +97,6 @@ interface ExecuteTransitionArgs {
   correlationId: string;
   actor: Actor;
   reason: string;
-  policyVersionForInit: string;
   expectedEpoch?: number | undefined;
   requestForHash: unknown;
   now: Date;
@@ -67,13 +107,19 @@ export class BreakerStore {
   constructor(
     private readonly pool: pg.Pool,
     private readonly clock: () => Date = () => new Date(),
-  ) {}
+    private readonly maxRegisteredScopesPerTenant: number = DEFAULT_MAX_REGISTERED_SCOPES_PER_TENANT,
+  ) {
+    if (
+      !Number.isSafeInteger(maxRegisteredScopesPerTenant) ||
+      maxRegisteredScopesPerTenant < 1
+    ) {
+      throw new RangeError('maxRegisteredScopesPerTenant must be a positive integer');
+    }
+  }
 
-  private async ensureRecordExists(
+  private async insertInitialRecord(
     client: pg.PoolClient,
-    scope: Scope,
-    policyVersion: string,
-    actor: Actor,
+    req: RegisterScopeRequest,
     now: Date,
   ): Promise<void> {
     await client.query(
@@ -82,15 +128,150 @@ export class BreakerStore {
        VALUES ($1,$2,$3,'armed',0,'initialized',$4,NULL,$5,$6,$7)
        ON CONFLICT (tenant, environment, agent_id) DO NOTHING`,
       [
-        scope.tenant,
-        scope.environment,
-        scope.agentId,
-        policyVersion,
+        req.scope.tenant,
+        req.scope.environment,
+        req.scope.agentId,
+        req.policyVersion,
         now.toISOString(),
-        actor.type,
-        actor.id,
+        req.actor.type,
+        req.actor.id,
       ],
     );
+  }
+
+  private async assertScopeRegisteredWithClient(
+    client: pg.PoolClient,
+    scope: Scope,
+  ): Promise<void> {
+    const registered = await client.query<{ registered: number }>(
+      `SELECT 1 AS registered
+         FROM registered_scopes
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    if (registered.rows.length === 0) {
+      throw new UnknownScopeError(
+        `scope ${scope.tenant}/${scope.environment}/${scope.agentId} is not registered`,
+      );
+    }
+  }
+
+  async assertScopeRegistered(scope: Scope): Promise<void> {
+    return withStoreErrors(async () => {
+      const client = await this.pool.connect();
+      try {
+        await this.assertScopeRegisteredWithClient(client, scope);
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async isScopeRegistered(scope: Scope): Promise<boolean> {
+    return withStoreErrors(async () => {
+      const { rows } = await this.pool.query<{ registered: number }>(
+        `SELECT 1 AS registered
+           FROM registered_scopes
+          WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+        [scope.tenant, scope.environment, scope.agentId],
+      );
+      return rows.length > 0;
+    });
+  }
+
+  async getRegistration(scope: Scope): Promise<ScopeRegistration | null> {
+    return withStoreErrors(async () => {
+      const { rows } = await this.pool.query<RegisteredScopeRow>(
+        `SELECT * FROM registered_scopes
+          WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+        [scope.tenant, scope.environment, scope.agentId],
+      );
+      return rows.length > 0 ? rowToRegistration(rows[0]!) : null;
+    });
+  }
+
+  /**
+   * Registers and initializes one scope atomically. A transaction-scoped
+   * advisory lock serializes registration by tenant, making the count+insert
+   * ceiling race-free across control-plane replicas. Repeating a registration
+   * for an existing scope is an idempotent read of the original metadata.
+   */
+  async registerScope(req: RegisterScopeRequest): Promise<RegisterScopeResponse> {
+    return withStoreErrors(async () => {
+      const client = await this.pool.connect();
+      const now = this.clock();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext('scope-registration/' || $1)::bigint)",
+          [req.scope.tenant],
+        );
+
+        const existing = await client.query<RegisteredScopeRow>(
+          `SELECT * FROM registered_scopes
+            WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+          [req.scope.tenant, req.scope.environment, req.scope.agentId],
+        );
+        if (existing.rows.length > 0) {
+          const breaker = await client.query<BreakerStateRow>(
+            `SELECT * FROM breaker_state
+              WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+            [req.scope.tenant, req.scope.environment, req.scope.agentId],
+          );
+          await client.query('COMMIT');
+          return {
+            registration: rowToRegistration(existing.rows[0]!),
+            breaker: rowToRecord(breaker.rows[0]!),
+            created: false,
+          };
+        }
+
+        const count = await client.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM registered_scopes WHERE tenant=$1',
+          [req.scope.tenant],
+        );
+        if (Number(count.rows[0]!.count) >= this.maxRegisteredScopesPerTenant) {
+          throw new ScopeCapacityExceededError(
+            `tenant ${req.scope.tenant} has reached its registered-scope limit of ${this.maxRegisteredScopesPerTenant}`,
+          );
+        }
+
+        const registration = await client.query<RegisteredScopeRow>(
+          `INSERT INTO registered_scopes
+             (tenant, environment, agent_id, policy_version, registered_at,
+              registered_by_type, registered_by_id, registration_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           RETURNING *`,
+          [
+            req.scope.tenant,
+            req.scope.environment,
+            req.scope.agentId,
+            req.policyVersion,
+            now.toISOString(),
+            req.actor.type,
+            req.actor.id,
+            req.reason,
+          ],
+        );
+        await this.insertInitialRecord(client, req, now);
+        const breaker = await client.query<BreakerStateRow>(
+          `SELECT * FROM breaker_state
+            WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
+          [req.scope.tenant, req.scope.environment, req.scope.agentId],
+        );
+        await client.query('COMMIT');
+        return {
+          registration: rowToRegistration(registration.rows[0]!),
+          breaker: rowToRecord(breaker.rows[0]!),
+          created: true,
+        };
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
   }
 
   async getRecord(scope: Scope): Promise<BreakerRecord | null> {
@@ -106,18 +287,12 @@ export class BreakerStore {
   async permit(
     scope: Scope,
     correlationId: string,
-    defaultPolicyVersion = 'unversioned',
+    _defaultPolicyVersion = 'unversioned',
   ): Promise<PermitResponse & { record: BreakerRecord }> {
     return withStoreErrors(async () => {
       const client = await this.pool.connect();
       try {
-        await this.ensureRecordExists(
-          client,
-          scope,
-          defaultPolicyVersion,
-          SYSTEM_INIT_ACTOR,
-          this.clock(),
-        );
+        await this.assertScopeRegisteredWithClient(client, scope);
         const { rows } = await client.query<BreakerStateRow>(
           `SELECT * FROM breaker_state WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
           [scope.tenant, scope.environment, scope.agentId],
@@ -195,19 +370,15 @@ export class BreakerStore {
                 `idempotency key ${args.idempotencyKey} was already used with a different request`,
               );
             }
-            return row.response_snapshot;
+            return row.response_snapshot.kind === 'applied'
+              ? { ...row.response_snapshot, replayed: true }
+              : row.response_snapshot;
           }
 
           for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             try {
               await client.query('BEGIN');
-              await this.ensureRecordExists(
-                client,
-                args.scope,
-                args.policyVersionForInit,
-                SYSTEM_INIT_ACTOR,
-                args.now,
-              );
+              await this.assertScopeRegisteredWithClient(client, args.scope);
               const currentRes = await client.query<BreakerStateRow>(
                 `SELECT * FROM breaker_state WHERE tenant=$1 AND environment=$2 AND agent_id=$3`,
                 [args.scope.tenant, args.scope.environment, args.scope.agentId],
@@ -335,7 +506,9 @@ export class BreakerStore {
                     `idempotency key ${args.idempotencyKey} was already used with a different request`,
                   );
                 }
-                return row.response_snapshot;
+                return row.response_snapshot.kind === 'applied'
+                  ? { ...row.response_snapshot, replayed: true }
+                  : row.response_snapshot;
               }
 
               return result;
@@ -366,7 +539,6 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
-      policyVersionForInit: req.policyVersion,
       expectedEpoch: req.expectedEpoch,
       requestForHash: req,
       now,
@@ -389,7 +561,6 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
-      policyVersionForInit: 'unversioned',
       expectedEpoch: req.expectedEpoch,
       requestForHash: req,
       now,
@@ -406,7 +577,6 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
-      policyVersionForInit: 'unversioned',
       requestForHash: req,
       now,
       computeOutcome: (current) =>
@@ -422,7 +592,6 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
-      policyVersionForInit: 'unversioned',
       requestForHash: req,
       now,
       computeOutcome: (current) =>

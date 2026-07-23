@@ -24,6 +24,7 @@ const CONFIG: ControlPlaneConfig = {
   dbPoolIdleTimeoutMs: 30_000,
   dbPoolConnectionTimeoutMs: 2_000,
   dbStatementTimeoutMs: 5_000,
+  maxRegisteredScopesPerTenant: 10_000,
   rateLimitMax: 120,
   rateLimitWindowMs: 60_000,
   storeOutageMode: 'fail-closed',
@@ -64,6 +65,11 @@ describe('Preflight API (real Postgres + control plane)', () => {
   // — proves the configured Preflight thresholds are actually wired into the
   // live HTTP route, not just parsed correctly in config.ts isolation.
   let appWidenedStaleness: FastifyInstance;
+  const registeredScopes: Array<{
+    tenant: string;
+    environment: string;
+    agentId: string;
+  }> = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -74,6 +80,21 @@ describe('Preflight API (real Postgres + control plane)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 30; index++) {
+      const registeredScope = {
+        tenant: 't1',
+        environment: 'test',
+        agentId: `agent-registered-${index}-${randomUUID().slice(0, 8)}`,
+      };
+      await store.registerScope({
+        scope: registeredScope,
+        policyVersion: 'test-v1',
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `setup-${index}`,
+      });
+      registeredScopes.push(registeredScope);
+    }
     const preflightStore = new PreflightStore(pool);
     app = await buildApp({ store, preflightStore, pool, config: CONFIG });
     await app.ready();
@@ -94,11 +115,9 @@ describe('Preflight API (real Postgres + control plane)', () => {
   });
 
   function scope() {
-    return {
-      tenant: 't1',
-      environment: 'test',
-      agentId: `agent-${randomUUID().slice(0, 8)}`,
-    };
+    const registeredScope = registeredScopes.pop();
+    if (!registeredScope) throw new Error('registered test scope pool exhausted');
+    return registeredScope;
   }
 
   it('rejects unauthenticated requests', async () => {
@@ -111,7 +130,11 @@ describe('Preflight API (real Postgres + control plane)', () => {
   });
 
   it('returns 404 unknown_scope for status on a scope never reported', async () => {
-    const s = scope();
+    const s = {
+      tenant: 't1',
+      environment: 'test',
+      agentId: `agent-unregistered-${randomUUID().slice(0, 8)}`,
+    };
     const res = await app.inject({
       method: 'GET',
       url: `/v1/preflight/status?tenant=${s.tenant}&environment=${s.environment}&agentId=${s.agentId}`,

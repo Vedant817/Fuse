@@ -31,6 +31,7 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
   let controlPlane: FastifyInstance;
   let controlPlaneUrl: string;
   let fakeProvider: FakeProvider;
+  const registeredScopes: Scope[] = [];
 
   beforeAll(async () => {
     pgContainer = await new PostgreSqlContainer('postgres:16-alpine')
@@ -41,6 +42,21 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
     pool = new pg.Pool({ connectionString: pgContainer.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 4; index++) {
+      const scope: Scope = {
+        tenant: 't1',
+        environment: 'test',
+        agentId: `agent-registered-${index}-${randomUUID().slice(0, 8)}`,
+      };
+      await store.registerScope({
+        scope,
+        policyVersion: POLICY_VERSION,
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `setup-${index}`,
+      });
+      registeredScopes.push(scope);
+    }
     const preflightStore = new PreflightStore(pool);
     controlPlane = await buildApp({
       store,
@@ -64,6 +80,7 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        maxRegisteredScopesPerTenant: 10_000,
         rateLimitMax: 120,
         rateLimitWindowMs: 60_000,
         preflightWindowMs: 5 * 60_000,
@@ -91,11 +108,9 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
   });
 
   function scopeFor(name: string): Scope {
-    return {
-      tenant: 't1',
-      environment: 'test',
-      agentId: `agent-${name}-${randomUUID().slice(0, 8)}`,
-    };
+    const scope = registeredScopes.pop();
+    if (!scope) throw new Error(`registered scope pool exhausted at ${name}`);
+    return scope;
   }
 
   it('trips automatically once the hardcoded call-count threshold is exceeded, denying the very next call', async () => {

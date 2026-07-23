@@ -67,7 +67,7 @@ describe('runAnalyzerVerifier', () => {
   it('loop scenario reports a small, bounded, repeating set of canonicalShapes to the detector reporter', async () => {
     const guard = allowingGuard();
     const observed: string[] = [];
-    vi.spyOn(guard, 'recordStepObservation').mockImplementation((step) => {
+    vi.spyOn(guard, 'recordStepObservation').mockImplementation(async (step) => {
       observed.push(step.canonicalShape);
     });
 

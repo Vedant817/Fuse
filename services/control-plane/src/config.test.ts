@@ -32,12 +32,22 @@ describe('loadConfig token parsing', () => {
     ]);
   });
 
-  it('treats an entry with an empty tenant part (leading colon) as a plain token, not a parse error', () => {
-    const config = loadConfig({
-      ...BASE_ENV,
-      CONTROL_PLANE_API_TOKENS: `:${'a'.repeat(16)}`,
-    });
-    expect(config.apiTokens).toEqual([`:${'a'.repeat(16)}`]);
+  it('rejects an entry with an empty tenant instead of widening it to wildcard', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: `:${'a'.repeat(16)}`,
+      }),
+    ).toThrow(/require both a non-empty tenant and token/);
+  });
+
+  it('rejects an entry with an empty token instead of accepting the tenant name as a wildcard bearer', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: 'production-tenant:',
+      }),
+    ).toThrow(/require both a non-empty tenant and token/);
   });
 
   it('rejects a tenant-scoped token whose token part is shorter than 16 characters', () => {
@@ -159,6 +169,23 @@ describe('loadConfig listener and rate-limit options', () => {
     expect(config.port).toBe(8090);
     expect(config.rateLimitMax).toBe(120);
     expect(config.rateLimitWindowMs).toBe(60_000);
+  });
+
+  it('requires an explicit detector policy file in production', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+      }),
+    ).toThrow(/CONTROL_PLANE_DETECTOR_POLICY_FILE is required/);
+
+    expect(
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+        CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+      }).detectorPolicyFile,
+    ).toBe('/etc/fuse/policies/production.json');
   });
 
   it('parses explicit rate-limit overrides', () => {

@@ -1,4 +1,9 @@
-import type { Scope, StepObservationWire } from '@fuse/contracts';
+import {
+  MAX_STEP_OBSERVATIONS_PER_REQUEST,
+  type OutageMode,
+  type Scope,
+  type StepObservationWire,
+} from '@fuse/contracts';
 
 export interface StepObservationReporterOptions {
   scope: Scope;
@@ -15,25 +20,34 @@ export interface StepObservationReporterOptions {
    * sustained control-plane outage, the freshest evidence matters more
    * than complete history. */
   maxBufferSize?: number;
+  /** Detector telemetry is enforcement-critical. The production default is
+   * fail-closed: if Fuse cannot durably evaluate this completed call, the
+   * caller receives an error and cannot silently begin its next call. */
+  outageMode?: OutageMode;
   onFlushError?: ((err: unknown) => void) | undefined;
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_BATCH_SIZE = 200;
-const DEFAULT_MAX_BUFFER_SIZE = 2_000;
+// Must remain equal to ObserveStepsRequestSchema's max(200). Keeping more
+// observations would make the SDK emit a request that the control plane
+// rejects, after which every subsequent fail-closed report would also fail.
+const MAX_WIRE_STEPS = MAX_STEP_OBSERVATIONS_PER_REQUEST;
+const DEFAULT_MAX_BUFFER_SIZE = MAX_WIRE_STEPS;
 
 /**
- * Batches `StepObservation`s and periodically reports them to
- * `POST /v1/detectors/observe`, entirely off the request critical path —
- * the same shape as `PreflightReporter` (task.md §4: detector evaluation is
- * a live signal feeding a SigNoz alert rule, not an enforcement mechanism
- * in its own right, so a reporting failure here must never affect whether
- * a guarded call proceeds). Every flush failure is swallowed (after
- * `onFlushError`) rather than thrown, and a failed batch is never retried.
+ * Carries a bounded trailing window to `POST /v1/detectors/observe`. Sending
+ * the complete window makes detector evaluation independent of which
+ * control-plane replica receives a request. `recordAndFlush` is the
+ * enforcement-critical API and defaults fail-closed; the older buffered
+ * `record`/timer API remains for explicitly asynchronous integrations.
  */
 export class StepObservationReporter {
-  private buffer: StepObservationWire[] = [];
+  private history: StepObservationWire[] = [];
   private timer: ReturnType<typeof setInterval> | undefined;
+  private sequence = 0;
+  private lastSentSequence = 0;
+  private flushChain: Promise<void> = Promise.resolve();
   private readonly options: Required<
     Omit<StepObservationReporterOptions, 'onFlushError'>
   > & {
@@ -41,6 +55,16 @@ export class StepObservationReporter {
   };
 
   constructor(options: StepObservationReporterOptions) {
+    const maxBufferSize = options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE;
+    if (
+      !Number.isInteger(maxBufferSize) ||
+      maxBufferSize <= 0 ||
+      maxBufferSize > MAX_WIRE_STEPS
+    ) {
+      throw new RangeError(
+        `maxBufferSize must be an integer from 1 to ${MAX_WIRE_STEPS}`,
+      );
+    }
     this.options = {
       scope: options.scope,
       controlPlaneUrl: options.controlPlaneUrl.replace(/\/+$/, ''),
@@ -48,19 +72,34 @@ export class StepObservationReporter {
       fetchImpl: options.fetchImpl ?? fetch,
       flushIntervalMs: options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
       maxBatchSize: options.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
-      maxBufferSize: options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
+      maxBufferSize,
+      outageMode: options.outageMode ?? 'fail-closed',
       onFlushError: options.onFlushError,
     };
   }
 
   record(step: StepObservationWire): void {
-    this.buffer.push(step);
-    if (this.buffer.length > this.options.maxBufferSize) {
-      this.buffer.splice(0, this.buffer.length - this.options.maxBufferSize);
+    this.history.push(step);
+    this.sequence += 1;
+    if (this.history.length > this.options.maxBufferSize) {
+      this.history.splice(0, this.history.length - this.options.maxBufferSize);
     }
-    if (this.buffer.length >= this.options.maxBatchSize) {
-      void this.flush();
+    if (this.sequence - this.lastSentSequence >= this.options.maxBatchSize) {
+      // `record` is the explicitly asynchronous compatibility API, so it
+      // cannot propagate a fail-closed rejection to its caller. Consume the
+      // rejection after `sendWindow` reports it through `onFlushError`;
+      // `recordAndFlush` separately awaits its own serialized flush.
+      void this.flush().catch(() => undefined);
     }
+  }
+
+  /** Records and synchronously evaluates a completed call before control is
+   * returned to the agent. A sequential agent that awaits this method can
+   * therefore not dispatch its next guarded call before a detector-triggered
+   * trip has committed. */
+  async recordAndFlush(step: StepObservationWire): Promise<void> {
+    this.record(step);
+    await this.flush();
   }
 
   /** Starts the background flush timer. Idempotent. Unref'd so holding a
@@ -81,8 +120,20 @@ export class StepObservationReporter {
   }
 
   async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const requestedSequence = this.sequence;
+    if (requestedSequence <= this.lastSentSequence) return;
+    const run = this.flushChain.then(async () => {
+      if (requestedSequence <= this.lastSentSequence) return;
+      await this.sendWindow(requestedSequence);
+    });
+    // Keep the internal chain usable after a fail-closed rejection while
+    // returning the original rejection to the caller that must stop.
+    this.flushChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async sendWindow(requestedSequence: number): Promise<void> {
+    const window = [...this.history];
     try {
       const res = await this.options.fetchImpl(
         `${this.options.controlPlaneUrl}/v1/detectors/observe`,
@@ -92,16 +143,20 @@ export class StepObservationReporter {
             'content-type': 'application/json',
             authorization: `Bearer ${this.options.apiToken}`,
           },
-          body: JSON.stringify({ scope: this.options.scope, steps: batch }),
+          body: JSON.stringify({ scope: this.options.scope, steps: window }),
         },
       );
       if (!res.ok) {
-        this.options.onFlushError?.(
-          new Error(`step observation report rejected with HTTP ${res.status}`),
-        );
+        throw new Error(`step observation report rejected with HTTP ${res.status}`);
       }
+      this.lastSentSequence = Math.max(this.lastSentSequence, requestedSequence);
     } catch (err) {
       this.options.onFlushError?.(err);
+      if (this.options.outageMode === 'fail-closed') throw err;
+      // In fail-open mode this observation is intentionally allowed to be
+      // skipped. A later observation still carries the complete retained
+      // window, so the detector can catch up when service recovers.
+      this.lastSentSequence = Math.max(this.lastSentSequence, requestedSequence);
     }
   }
 }

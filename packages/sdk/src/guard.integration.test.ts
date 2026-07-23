@@ -30,6 +30,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
   let controlPlane: FastifyInstance;
   let controlPlaneUrl: string;
   let fakeProvider: FakeProvider;
+  const registeredScopes: Scope[] = [];
 
   beforeAll(async () => {
     pgContainer = await new PostgreSqlContainer('postgres:16-alpine')
@@ -40,6 +41,21 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     pool = new pg.Pool({ connectionString: pgContainer.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    for (let index = 0; index < 20; index++) {
+      const scope: Scope = {
+        tenant: 't1',
+        environment: 'test',
+        agentId: `agent-registered-${index}-${randomUUID().slice(0, 8)}`,
+      };
+      await store.registerScope({
+        scope,
+        policyVersion: POLICY_VERSION,
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'integration test registration',
+        correlationId: `setup-${index}`,
+      });
+      registeredScopes.push(scope);
+    }
     const preflightStore = new PreflightStore(pool);
     controlPlane = await buildApp({
       store,
@@ -63,6 +79,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
         dbPoolIdleTimeoutMs: 30_000,
         dbPoolConnectionTimeoutMs: 2_000,
         dbStatementTimeoutMs: 5_000,
+        maxRegisteredScopesPerTenant: 10_000,
         rateLimitMax: 120,
         rateLimitWindowMs: 60_000,
         preflightWindowMs: 5 * 60_000,
@@ -91,11 +108,9 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
   });
 
   function scopeFor(name: string): Scope {
-    return {
-      tenant: 't1',
-      environment: 'test',
-      agentId: `agent-${name}-${randomUUID().slice(0, 8)}`,
-    };
+    const scope = registeredScopes.pop();
+    if (!scope) throw new Error(`registered scope pool exhausted at ${name}`);
+    return scope;
   }
 
   function guardFor(scope: Scope): FuseGuard {
@@ -143,6 +158,41 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     }
 
     expect(fakeProvider.requestCount() - before).toBe(3);
+  });
+
+  it('a real detector observation commits a trip before the next provider call', async () => {
+    const scope = scopeFor('detector-trip-next-call-zero');
+    const guard = guardFor(scope);
+    const before = fakeProvider.requestCount();
+
+    await guard.guard(() => callFakeProvider(fakeProvider.url));
+    expect(fakeProvider.requestCount() - before).toBe(1);
+
+    // Exactly the documented context-bloat ceiling fires (>= 100,000).
+    // recordStepObservation awaits the control-plane evaluation and the
+    // atomic breaker trip before returning to the sequential agent.
+    await guard.recordStepObservation({
+      timestampMs: Date.now(),
+      canonicalShape: 'context-at-ceiling',
+      inputTokens: 100_000,
+      outputTokens: 1,
+      estimatedCostUsd: 0,
+    });
+
+    const status = await fetch(
+      `${controlPlaneUrl}/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      { headers: { authorization: `Bearer ${API_TOKEN}` } },
+    );
+    expect(status.status).toBe(200);
+    expect(((await status.json()) as { record: { state: string } }).record.state).toBe(
+      'tripped',
+    );
+
+    await expect(guard.guard(() => callFakeProvider(fakeProvider.url))).rejects.toThrow(
+      BreakerTrippedError,
+    );
+    expect(fakeProvider.requestCount() - before).toBe(1);
+    guard.stopStepObservationReporting();
   });
 
   it('after a committed trip, zero provider requests occur — sequential calls', async () => {

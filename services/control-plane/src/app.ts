@@ -5,7 +5,11 @@ import type pg from 'pg';
 import { FuseHttpError } from '@fuse/contracts';
 import type { BreakerStore, PreflightStore } from '@fuse/breaker-store';
 import type { ControlPlaneConfig } from './config.js';
-import { extractTenantFromRequest, requireBearerAuth } from './auth.js';
+import {
+  extractTenantFromRequest,
+  extractTenantFromWebhookRequest,
+  requireBearerAuth,
+} from './auth.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerPermitRoute } from './routes/permit.js';
 import { registerBreakerRoutes } from './routes/breaker.js';
@@ -13,7 +17,10 @@ import { registerWebhookRoutes } from './routes/webhook.js';
 import { registerPreflightRoutes } from './routes/preflight.js';
 import { registerDetectorRoutes } from './routes/detectors.js';
 import { registerSlackInteractiveRoute } from './routes/slack-interactive.js';
+import { registerScopeRoutes } from './routes/scopes.js';
+import { registerPolicyRoutes } from './routes/policies.js';
 import { DetectorRunner } from './detector-runner.js';
+import type { DetectorPolicyResolver } from './policy-loader.js';
 import {
   loadDiagnosisWorkerConfig,
   type DiagnosisWorkerConfig,
@@ -24,11 +31,10 @@ const MAX_BODY_BYTES = 64 * 1024;
 export interface BuildAppDeps {
   store: BreakerStore;
   preflightStore: PreflightStore;
-  /** Defaults to a fresh in-memory `DetectorRunner` if omitted — most
-   * callers (existing tests, most of the app's own lifecycle) don't need
-   * to observe or control its buffer directly. Pass one explicitly only
-   * when a test needs to assert on it or share it with a fixed clock. */
+  /** Defaults to a stateless `DetectorRunner` if omitted. Pass one
+   * explicitly only when a test needs a controlled implementation. */
   detectorRunner?: DetectorRunner;
+  detectorPolicyResolver?: DetectorPolicyResolver;
   /** Defaults to `loadDiagnosisWorkerConfig()` (reads env) if omitted. */
   diagnosisConfig?: DiagnosisWorkerConfig;
   pool: pg.Pool;
@@ -104,7 +110,16 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   ];
 
   app.addHook('preHandler', async (request, reply) => {
-    if (request.url.startsWith('/v1/permit')) {
+    if (
+      request.url.startsWith('/v1/scopes/') ||
+      request.url.startsWith('/v1/policies/')
+    ) {
+      await requireBearerAuth(
+        operatorTokens,
+        allKnownTokens,
+        extractTenantFromRequest,
+      )(request, reply);
+    } else if (request.url.startsWith('/v1/permit')) {
       // Any known token (operator or agent-scoped) may check a permit. A
       // token bound to a specific tenant (not the '*' wildcard) may only
       // check permits for that tenant's own scope.
@@ -131,9 +146,9 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       )(request, reply);
     } else if (request.url.startsWith('/v1/detectors/')) {
       // An agent reports its own step telemetry for detector evaluation —
-      // same trust tier as permit/Preflight reporting (it never mutates
-      // enforcement state, only the in-memory detector buffer), and the
-      // same tenant-scoping rule applies.
+      // same trust tier as permit/Preflight reporting. A firing detector
+      // atomically trips that registered scope, so tenant binding and the
+      // explicit scope registry bound this self-denial capability.
       await requireBearerAuth(
         agentAllowedTokens,
         allKnownTokens,
@@ -142,14 +157,14 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     } else if (request.url.startsWith('/v1/webhooks/')) {
       // The SigNoz alert webhook — its own least-privilege tier: this
       // token can only cause a trip for the scope named in an alert's own
-      // labels, never resume/disable/force-trip arbitrarily. Deliberately
-      // NOT tenant-bound even if configured with a `tenant:token` entry —
-      // a single SigNoz instance may legitimately watch multiple tenants,
-      // and one webhook delivery can carry alerts for several scopes at
-      // once. See config.ts's `webhookTokens` doc comment and
-      // docs/threat-model.md §3 for this still-open, separately-tracked
-      // hardening item.
-      await requireBearerAuth(webhookAllowedTokens, allKnownTokens)(request, reply);
+      // labels, never resume/disable/force-trip arbitrarily. Tenant-bound
+      // credentials must match every alert in a grouped delivery; a plain
+      // wildcard token is the explicit escape hatch for a shared SigNoz.
+      await requireBearerAuth(
+        webhookAllowedTokens,
+        allKnownTokens,
+        extractTenantFromWebhookRequest,
+      )(request, reply);
     } else if (request.url.startsWith('/v1/breaker/')) {
       // Force-trip/resume/disable/enable/status require an operator token;
       // an agent-scoped or webhook-scoped token is a valid credential but
@@ -164,7 +179,27 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     }
   });
 
-  registerPermitRoute(app, deps.store, deps.config.storeOutageMode);
+  registerPermitRoute(
+    app,
+    deps.store,
+    deps.detectorPolicyResolver
+      ? (scope) => deps.detectorPolicyResolver!.resolve(scope).storeOutageMode
+      : deps.config.storeOutageMode,
+  );
+  registerScopeRoutes(app, deps.store);
+  registerPolicyRoutes(
+    app,
+    deps.store,
+    (scope) =>
+      deps.detectorPolicyResolver?.resolve(scope) ?? {
+        policyVersion: deps.config.webhookDefaultPolicyVersion,
+        cooldownSeconds: deps.config.webhookDefaultCooldownSeconds,
+        storeOutageMode: deps.config.storeOutageMode,
+        controlPlaneOutageMode: 'fail-closed',
+        detectors: {},
+        notificationRoutes: ['slack'],
+      },
+  );
   registerBreakerRoutes(app, deps.store);
   registerWebhookRoutes(app, deps.store, deps.config, diagnosisConfig);
   registerSlackInteractiveRoute(
@@ -181,7 +216,14 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     maxEvidenceStalenessMs: deps.config.preflightMaxEvidenceStalenessMs,
     minRecoveryDwellMs: deps.config.preflightMinRecoveryDwellMs,
   });
-  registerDetectorRoutes(app, deps.detectorRunner ?? new DetectorRunner());
+  registerDetectorRoutes(app, deps.detectorRunner ?? new DetectorRunner(), deps.store, {
+    policyVersion: deps.config.webhookDefaultPolicyVersion,
+    cooldownSeconds: deps.config.webhookDefaultCooldownSeconds,
+    ...(deps.detectorPolicyResolver
+      ? { resolvePolicy: (scope) => deps.detectorPolicyResolver!.resolve(scope) }
+      : {}),
+    diagnosisConfig,
+  });
 
   app.setErrorHandler((err, request, reply) => {
     if (reply.sent) return;
