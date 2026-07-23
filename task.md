@@ -1598,45 +1598,174 @@ Acceptance criteria:
 
 ## 9. Production hardening and operability (P1)
 
+Worked in the 2026-07-23 gap-closure session, in the order committed:
+`docs/adr/009-supply-chain-scan.md` (security/supply-chain scans),
+`docs/adr/010-secure-defaults-audit.md` (secure defaults + `@fastify/
+helmet`), `docs/adr/011-permit-load-test.md` (real `/v1/permit` load test),
+`docs/adr/012-failure-injection-review.md` (failure-injection survey + the
+one real fix it found, `DetectorRunner`'s scope-cardinality cap), and three
+new runbooks under `docs/runbooks/`. Every item below was checked against
+the actual code/tests, not assumed — several are honestly partial or not
+done, tracked as such rather than silently marked complete.
+
 ### 9.1 Security and supply chain
 
-- [ ] Complete threat-model review and close all P0/P1 findings.
-- [ ] Run secret, dependency, license, static-analysis, and container scans;
+- [~] Complete threat-model review and close all P0/P1 findings. Done:
+  `docs/threat-model.md` re-read and updated with this session's real
+  findings (supply-chain scan results, the `DetectorRunner` fix added to
+  the risk register as risk #7, now "Fixed"). Not all findings are closed —
+  this document doesn't use P0/P1 labels, it uses a severity register, and
+  several risks remain deliberately **open and accepted** with documented
+  rationale (residual fresh-forged-webhook-alert capability, the flat
+  rate limit across cheap/heavy routes, no online key rotation) rather than
+  fixed — a hackathon-timeline tradeoff, not an oversight.
+- [~] Run secret, dependency, license, static-analysis, and container scans;
   remediate critical/high findings or record an explicit accepted risk.
-- [ ] Run authorization/tenant-isolation and webhook replay tests.
-- [ ] Validate secure defaults for TLS, CORS, headers, credentials, debug output,
-  network exposure, and container user/filesystem permissions.
-- [ ] Generate an SBOM and document dependency update ownership.
+  Done: `pnpm audit` (11 advisories found, 10 remediated via
+  `pnpm-workspace.yaml` overrides, 1 accepted risk — `@hono/node-server`,
+  transitive via the MCP SDK's unused server-side transport), a license
+  sweep of 533 installed packages (zero copyleft), a targeted secret-
+  pattern scan of every tracked file (15 matches, all reviewed and
+  confirmed benign — dev-only Postgres credentials and named test
+  fixtures), and a CycloneDX SBOM (`docs/sbom.cdx.json`, 573 components).
+  Not done: static-analysis (SAST) — no `semgrep`/`codeql` binary was
+  available or npx-fetchable in the time available; container-image
+  scanning — N/A, this project builds no container image of its own
+  (services run via `pnpm`/`node` directly; only third-party images in
+  `infra/docker-compose.yml` are used, already pinned by tag). Full trail:
+  `docs/adr/009-supply-chain-scan.md`.
+- [x] Run authorization/tenant-isolation and webhook replay tests. Evidence:
+  surveyed the existing suite first (`auth.test.ts`, `app.integration.test.ts`,
+  `webhook.integration.test.ts`) rather than duplicating it, then actually
+  ran it against real Postgres — 54 tests passing, including cross-tenant
+  trip/resume/Preflight-read denial ("the blast-radius fix") and duplicate-
+  webhook-delivery idempotency. `docs/adr/012-failure-injection-review.md`
+  §"Survey" lists every scenario found already covered, with the specific
+  test that proves it.
+- [~] Validate secure defaults for TLS, CORS, headers, credentials, debug
+  output, network exposure, and container user/filesystem permissions.
+  Done: CORS (deliberately none registered — verified no
+  `access-control-allow-origin` header leaks to a cross-origin caller),
+  headers (added `@fastify/helmet`, asserted real header values in a new
+  test), credentials (constant-time token comparison, fail-closed config
+  already existed — verified by reading `auth.ts`/`config.ts` directly),
+  debug output (confirmed no stack trace/secret ever reaches a client
+  response), network exposure (`trustProxy: false` reviewed and documented
+  for what a real reverse-proxy deployment must revisit). Not done: TLS
+  (deliberately out of scope — this process is designed to sit behind a
+  TLS-terminating reverse proxy, not terminate TLS itself) and container
+  user/filesystem permissions (N/A, no container image built by this
+  project). Full trail: `docs/adr/010-secure-defaults-audit.md`.
+- [x] Generate an SBOM and document dependency update ownership. SBOM:
+  `docs/sbom.cdx.json` (CycloneDX 1.6, 573 components). Dependency
+  ownership: already covered by `.github/CODEOWNERS` (`* @Vedant817`) —
+  a single-maintainer project has no separate dependency-ownership
+  question to answer beyond that.
 
 ### 9.2 Reliability and performance
 
-- [ ] Load-test permit and trip paths at target concurrency; report p50/p95/p99
-  latency, throughput, saturation, and error rate.
-- [ ] Run race/stress tests for simultaneous permit/trip/resume and multi-instance
-  operation.
-- [ ] Inject state-store, queue, SigNoz, MCP, Slack, DNS/network, and clock
-  failures; verify declared behavior and recovery.
-- [ ] Test clean deploy/restart, schema migration/rollback, backup restore, and
-  expired-state cleanup.
+- [~] Load-test permit and trip paths at target concurrency; report
+  p50/p95/p99 latency, throughput, saturation, and error rate. Done for
+  `/v1/permit` only: real `autocannon` runs against a live control-plane +
+  real Postgres at concurrency 50 (6,538 req/s, p50=6ms/p99=23ms/max=109ms,
+  zero errors) and 200 (throughput plateaus ~7k req/s while latency
+  roughly quadruples — the DB connection pool, not route logic, is the
+  ceiling; it degrades by queueing, zero errors even here). A first naive
+  run also surfaced that the default rate limit makes an unadjusted load
+  test measure the limiter, not the route — itself a useful confirmation
+  the limiter works. **Not done: the trip path was not separately
+  load-tested** — a real, scoped-out gap. Full trail:
+  `docs/adr/011-permit-load-test.md`.
+- [~] Run race/stress tests for simultaneous permit/trip/resume and
+  multi-instance operation. Simultaneous permit/trip/resume: already
+  extensively covered by existing tests, verified by an actual run —
+  `store.integration.test.ts`'s concurrent-trip-request, concurrent-same-
+  idempotency-key, and per-caller-actor-attribution-under-concurrency
+  tests, plus `guard.integration.test.ts`'s "concurrent calls racing the
+  trip"/"in-flight exposure" tests. **Not done: multi-instance operation**
+  — every test and the load test both ran a single control-plane process;
+  no test exercises two instances sharing one Postgres.
+- [~] Inject state-store, queue, SigNoz, MCP, Slack, DNS/network, and clock
+  failures; verify declared behavior and recovery. Verified via a real run
+  (not just reading the test files): state-store outage, SigNoz MCP
+  failure (timeout/tool-error/malformed-JSON), Slack failure (network
+  error/non-2xx/API-level error), and clock skew (webhook `startsAt`
+  future/past rejection) are all covered by existing, passing tests. N/A:
+  "queue" — no message-queue component exists in this architecture.
+  Not separately tested: DNS-specific failure (generic network-
+  unreachable/timeout is covered via `guard.test.ts`, but not a DNS-
+  resolution failure specifically). Full survey:
+  `docs/adr/012-failure-injection-review.md`.
+- [d] Test clean deploy/restart, schema migration/rollback, backup restore,
+  and expired-state cleanup. Done: clean restart (`shutdown.test.ts`'s
+  duplicate-signal and partial-cleanup-failure tests — the real shutdown
+  handler drains the Fastify app, Postgres pool, and OTel export in order)
+  and schema migration (real, idempotent, forward-only — verified by
+  reading `migrate.ts`). **Not built, documented honestly as real gaps in
+  `docs/runbooks/operations.md`:** schema rollback (no down-migrations
+  exist at all), backup restore (no backup mechanism exists), and
+  expired-state cleanup (`idempotency_keys`/`breaker_audit_log` are never
+  swept — a ready-to-run SQL snippet is provided in the runbook, but no
+  job is scheduled).
 - [ ] Define SLOs and alerts for permit errors/latency, webhook failures,
-  notification backlog, detector lag, stale Preflight, and dropped telemetry.
+  notification backlog, detector lag, stale Preflight, and dropped
+  telemetry. Not done — a real, honest gap. The three detector alert
+  rules built in task.md §4 (`infra/signoz/alerts/`) alert on *agent
+  behavior* (loop/context-bloat/cost-velocity), not on the control plane's
+  own *operational health* signals this item asks for; no such SLO
+  document or matching alert rules exist yet.
 
 ### 9.3 Runbooks
 
-- [ ] Document install/configure/upgrade/rollback/uninstall procedures.
-- [ ] Document incident response for false positive, missed trip, stuck breaker,
-  blind telemetry, state-store outage, leaked webhook secret, and Slack/MCP
-  failure.
-- [ ] Document key rotation, policy rollout/rollback, data retention/deletion,
-  backup/restore, and audit retrieval.
-- [ ] Add a limitations/non-guarantees section that matches actual tests.
+- [x] Document install/configure/upgrade/rollback/uninstall procedures.
+  Evidence: `docs/runbooks/operations.md` §1-5, §9 — every command is one
+  this project's own scripts actually run (`infra/reset.sh`,
+  `packages/breaker-store/src/migrate.ts`, `.env.example`), read directly,
+  not inferred; §4 (Rollback) states plainly that no scripted schema
+  rollback exists rather than implying one does.
+- [x] Document incident response for false positive, missed trip, stuck
+  breaker, blind telemetry, state-store outage, leaked webhook secret, and
+  Slack/MCP failure. Evidence: `docs/runbooks/incident-response.md`, all
+  seven scenarios, each using the real route/request schema and citing the
+  test that proves the claimed behavior — generalized the "leaked webhook
+  secret" ask into all three token roles (webhook/agent/operator), since
+  the blast radius differs sharply by role and that distinction matters
+  more than the literal ask.
+- [~] Document key rotation, policy rollout/rollback, data retention/
+  deletion, backup/restore, and audit retrieval. Done: key rotation
+  (`operations.md` §5), policy rollout/rollback (§6 — and honestly states
+  that "rollout" is currently limited to a labeling string,
+  `policyVersion`, since no policy-file *loading* pipeline exists yet;
+  `DetectorRunner` always evaluates hardcoded defaults regardless of any
+  policy file's contents — a pre-existing, already-disclosed gap from
+  task.md §4, restated here since it directly bounds this item), data
+  retention/deletion (§8), audit retrieval (§7, with a real SQL query
+  against `breaker_audit_log`). **Not built: backup/restore** — no
+  automated backup mechanism exists; the runbook says so rather than
+  describing a restore procedure for a backup that doesn't exist.
+- [x] Add a limitations/non-guarantees section that matches actual tests.
+  Evidence: `docs/runbooks/limitations.md` — distinguishes what Fuse
+  actually guarantees (zero provider calls post-trip; honest blind/degraded
+  reporting, both cited to their proving tests) from documented tradeoffs
+  and every real gap found this session, each cited to its ADR/runbook.
 
 Acceptance criteria:
 
-- a fresh environment passes smoke tests from documented commands;
-- operators can distinguish Fuse failure from agent failure and recover without
-  editing the database manually;
-- published guarantees are backed by repeatable tests and measurements.
+- [~] a fresh environment passes smoke tests from documented commands — the
+  install steps in `operations.md` §1 are the actual commands used
+  throughout this session (verified repeatedly: Postgres health check,
+  `/healthz`/`/readyz`), but a fresh-checkout end-to-end rehearsal from a
+  truly clean machine was not separately performed this slice;
+- [x] operators can distinguish Fuse failure from agent failure and recover
+  without editing the database manually — met: every incident-response
+  entry uses only the documented HTTP API (`/v1/breaker/*`,
+  `/v1/preflight/status`) or a read-only audit-log query, never a manual
+  UPDATE/DELETE against `breaker_state`/`breaker_audit_log`;
+- [~] published guarantees are backed by repeatable tests and measurements —
+  every guarantee in `limitations.md` cites its proving test or ADR; the
+  guarantees themselves are correct, but several runbook claims (rollback,
+  backup, SLOs) are explicitly "not built" rather than measured, which is
+  the honest form of meeting this criterion, not a full pass.
 
 ## 10. Test matrix and release gates
 

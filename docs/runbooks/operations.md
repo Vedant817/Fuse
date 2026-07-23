@@ -58,7 +58,8 @@ grounded in this session's actual measurements (not guesses):
   default to `fail-closed` (deny on an unreachable store/control-plane).
   This is the safer default for cost protection but means a Postgres or
   control-plane outage also stops all guarded LLM calls — a deliberate
-  tradeoff (see §3's "store outage" incident entry), not a bug.
+  tradeoff (see `docs/runbooks/incident-response.md`'s "Postgres (state
+  store) outage" entry), not a bug.
 - **Token roles** (`CONTROL_PLANE_API_TOKENS` / `_AGENT_API_TOKENS` /
   `_WEBHOOK_TOKENS`): least-privilege by construction (an agent token gets
   403, not a silent pass, on `/v1/breaker/*`) — see
@@ -93,7 +94,7 @@ runner has no "down" migrations — only forward `*.sql` files
 change today means either:
 
 - Restoring Postgres from a backup taken before the migration ran (there is
-  no automated backup job either — see §6), or
+  no automated backup job either — see §8), or
 - Hand-writing and applying a reverse `*.sql` migration.
 
 Rolling back the **application code** alone (no schema change involved) is
@@ -126,7 +127,56 @@ per-token expiry — a leaked token is valid until manually removed from the
 env var and the process restarted. This is a known, documented limitation
 (`docs/threat-model.md` §9, risk #4), not an oversight.
 
-## 6. Retention
+## 6. Policy rollout/rollback
+
+**Stated plainly, this is more limited than "policy rollout" implies.**
+`packages/contracts/src/policy.ts`'s `DetectorsConfigSchema` (task.md §4)
+defines what a versioned per-detector policy file _would_ look like, and
+`packages/detectors/src/policy-defaults.test.ts` guards that its defaults
+stay in sync with the detectors' own hardcoded constants — but there is no
+policy-file _loading_ pipeline anywhere in the running system yet.
+`DetectorRunner` (`services/control-plane/src/detector-runner.ts`) always
+evaluates every scope against the hardcoded `DEFAULT_LOOP_SIGNATURE_CONFIG`/
+`DEFAULT_CONTEXT_BLOAT_CONFIG`/`DEFAULT_COST_VELOCITY_CONFIG` constants,
+regardless of any policy file's contents — this was already disclosed when
+built (task.md §4's evidence: "Policy-version propagation into alerts/trips
+is not yet wired — no policy-file loading pipeline exists anywhere in the
+system yet"), not a new finding, but worth restating here since it directly
+bounds what "rollout" can mean today.
+
+What **does** exist and can be "rolled out" today: `policyVersion` is a
+plain label (`CONTROL_PLANE_WEBHOOK_POLICY_VERSION`) stamped onto every
+webhook-driven trip and stored in `breaker_audit_log` — changing it (env
+var + restart) changes the label future trips carry, for audit/traceability
+purposes, but changes no actual detector behavior. Rolling out a genuine
+threshold change today means editing the `DEFAULT_*_CONFIG` constants in
+`packages/detectors/src/*.ts` directly and redeploying — there is no
+runtime reload, no A/B rollout, and no automated rollback beyond reverting
+that code change.
+
+## 7. Audit retrieval
+
+Every breaker state transition (trip/resume/disable/enable, including
+no-ops from a duplicate idempotency key) is a row in `breaker_audit_log`
+(`packages/breaker-store/migrations/0001_init.sql`), indexed by
+`(tenant, environment, agent_id, created_at DESC)`. To retrieve the history
+for a specific incident:
+
+```sql
+SELECT created_at, from_state, to_state, actor_type, actor_id, reason,
+       correlation_id, policy_version, noop
+FROM breaker_audit_log
+WHERE tenant = 'T' AND environment = 'E' AND agent_id = 'A'
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+`correlation_id` ties a row back to the triggering request (an alert's
+`signoz:${fingerprint}:${startsAt}`, or whatever `correlationId` an operator
+call supplied) — use it to cross-reference a specific Slack incident card
+or webhook delivery with its exact resulting transition(s).
+
+## 8. Retention
 
 **Real, verified gap, not previously documented as a runbook item:**
 neither `breaker_audit_log` nor `idempotency_keys`
@@ -150,3 +200,29 @@ long must "who tripped this and why" remain queryable), not a technical
 default this runbook can set for you. Decide a retention window and add a
 `DELETE ... WHERE created_at < now() - interval '...'` job once you have,
 rather than leaving it unbounded indefinitely.
+
+## 9. Uninstall
+
+Stop the control-plane process (SIGTERM — see §3 for why that's already a
+graceful drain), then tear down local infrastructure:
+
+```bash
+docker compose -f infra/docker-compose.yml down
+```
+
+This stops and removes the `fuse-postgres`/`fuse-signoz-mcp` containers but
+**does not** delete `infra/data/postgres` (the bind-mounted volume in
+`docker-compose.yml`) — the breaker/audit/Preflight state survives a
+teardown by default, which is usually what you want. To also delete the
+actual state (a genuine, irreversible uninstall — confirm you want this
+before running it):
+
+```bash
+docker compose -f infra/docker-compose.yml down -v
+rm -rf infra/data/postgres
+```
+
+There is no separate self-hosted-SigNoz teardown documented here — see
+`infra/signoz-up.sh`'s own stack (ADR-005) for its lifecycle, since it is
+optional infrastructure independent of the breaker/control-plane's own
+state.
