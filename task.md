@@ -1769,33 +1769,154 @@ Acceptance criteria:
 
 ## 10. Test matrix and release gates
 
+Worked in the 2026-07-23 gap-closure session, after §9. Rather than write a
+new test matrix from scratch, this section audits the already-substantial
+suite built across §4/§7/§8/§9 against task.md's own categories — most were
+already covered incidentally while building those sections; this pass adds
+the handful of genuinely missing pieces (property/fuzz coverage beyond
+state transitions, an OpenAPI spec) and records the rest as verified, not
+assumed. Final tally from a real run at the end of this section: **396 unit
+tests + 83 integration tests (real Postgres via testcontainers) = 479
+tests, all passing.**
+
 ### 10.1 Automated test suites
 
-- [ ] Unit: breaker domain, policies, detector math, pricing, Preflight, redaction.
-- [ ] Property/fuzz: state transitions, schema/parser boundaries, detector
-  invariants, idempotency, and malformed webhook input.
-- [ ] Contract: provider adapter, SigNoz webhook/query payloads, MCP, Slack,
-  storage, policy schema, and OpenAPI.
-- [ ] Integration: middleware/control plane/store/queue, OTel export, alert trip,
-  diagnosis fallback, and interactive resume.
-- [ ] End-to-end: normal agent, each runaway mode, blocked-next-call proof,
+- [x] Unit: breaker domain, policies, detector math, pricing, Preflight,
+  redaction. All covered: `packages/breaker-core` (16 tests, incl.
+  fast-check state-transition properties), `packages/contracts`'
+  `policy.ts`/`policy-defaults.test.ts`, `packages/detectors` (43 tests
+  across all three detector math functions), `packages/otel/src/pricing.ts`
+  (unit-tested alongside the rest of `packages/otel`), `packages/preflight`
+  (13 tests). "Redaction" is implemented as field allowlisting, not pattern
+  scrubbing — `packages/diagnosis/src/evidence.ts`'s "maps only whitelisted
+  fields from real rows" test is the redaction test.
+- [x] Property/fuzz: state transitions, schema/parser boundaries, detector
+  invariants, idempotency, and malformed webhook input. State transitions
+  and idempotency were already covered
+  (`packages/breaker-core/src/transitions.test.ts`'s fast-check properties;
+  `store.integration.test.ts`'s concurrent-same-idempotency-key test).
+  **New this session:** `packages/detectors/src/invariants.property.test.ts`
+  fuzzes all three detectors' math with arbitrary step histories (asserts
+  `score`/`threshold` stay finite and every result is
+  `DetectorResultSchema`-valid — guards the exact "score:Infinity silently
+  serializes to null" bug class `context-bloat.ts`'s own comment
+  documents), and `packages/contracts/src/schema-fuzz.property.test.ts`
+  fuzzes core request/webhook/policy schemas with `fc.anything()`,
+  asserting `safeParse` never throws and that the webhook's 200-alert cap
+  actually rejects an oversized array. 19 new tests, all passing.
+- [x] Contract: provider adapter, SigNoz webhook/query payloads, MCP, Slack,
+  storage, policy schema, and OpenAPI. Provider adapter
+  (`packages/sdk/src/providers/openai-compatible.{test,integration.test}.ts`),
+  webhook payload (`packages/contracts/src/alert-webhook.ts` +
+  `webhook.integration.test.ts`), MCP (`packages/diagnosis/src/mcp-client.
+  test.ts`), Slack (`slack-client.test.ts`), storage
+  (`packages/breaker-store`'s full suite), policy schema
+  (`policy-defaults.test.ts`) were all already covered. **New this
+  session:** `docs/openapi.yaml` — a hand-authored OpenAPI 3.0 spec for all
+  13 real routes, schemas matching `packages/contracts` field-for-field,
+  validated with `redocly lint` (0 errors) and bundled to confirm every
+  `$ref` resolves.
+- [x] Integration: middleware/control plane/store/queue, OTel export, alert
+  trip, diagnosis fallback, and interactive resume. All covered and
+  re-verified by an actual run this session (not just reading the files):
+  `app.integration.test.ts` (21), `webhook.integration.test.ts` (15),
+  `preflight.integration.test.ts` (13), `store.integration.test.ts` +
+  `preflight-store.integration.test.ts` (20), `sdk.integration.test.ts` (2,
+  OTel export), `guard.integration.test.ts` (6). "Queue" is N/A — no
+  message-queue component exists in this architecture. Diagnosis fallback
+  and interactive resume: `diagnosis-worker.test.ts`,
+  `slack-interactive.test.ts`.
+- [x] End-to-end: normal agent, each runaway mode, blocked-next-call proof,
   telemetry regression/recovery, diagnosis, Slack, and authorized resume.
-- [ ] Security: forged/replayed alerts, stale Slack action, role/scope isolation,
-  secret/log leakage, prompt injection, oversized input, and abuse rate limits.
-- [ ] Performance/reliability: concurrency races, load, restart, dependency
-  outages, delayed/out-of-order telemetry, and recovery.
+  Normal agent + blocked-next-call proof:
+  `guard.integration.test.ts`'s "after a committed trip, zero provider
+  requests occur" (sequential and concurrent variants) and
+  `services/broken-agent`'s real demo scripts. Each runaway mode: the three
+  detector fixtures (`packages/detectors/src/fixtures.ts`) plus
+  `services/broken-agent/src/demo-real-detect.ts`'s live proof (§4).
+  Telemetry regression/recovery: `preflight.integration.test.ts`'s
+  hysteresis tests. Diagnosis/Slack/authorized resume: the full §7 chain,
+  proven end-to-end in `diagnosis-worker.test.ts` and
+  `slack-interactive.test.ts`.
+- [~] Security: forged/replayed alerts, stale Slack action, role/scope
+  isolation, secret/log leakage, prompt injection, oversized input, and
+  abuse rate limits. Forged/replayed alerts, stale Slack action, role/scope
+  isolation, secret/log leakage, oversized input (413, not a generic 500 —
+  `app.integration.test.ts`), and abuse rate limits (`app.integration.
+  test.ts`'s override test, plus the real load test in
+  `docs/adr/011-permit-load-test.md` that empirically confirmed the
+  limiter engages) are all covered. **"Prompt injection" does not map
+  cleanly onto this codebase's actual attack surface** — Fuse never parses
+  or executes LLM-generated content; diagnosis is deterministic template
+  text (task.md §7.2), not an LLM reading untrusted input. The closest real
+  analog — untrusted span/evidence content reaching a rendered surface
+  (Slack Block Kit, the local HTML snapshot) — is tested:
+  `incident-card.test.ts`'s "escapes HTML-significant characters in
+  diagnosis text". Noted here rather than silently claiming a literal
+  "prompt injection test" that would not mean anything concrete for this
+  system.
+- [x] Performance/reliability: concurrency races, load, restart, dependency
+  outages, delayed/out-of-order telemetry, and recovery. Concurrency races
+  (`store.integration.test.ts`, `guard.integration.test.ts`), load
+  (`docs/adr/011-permit-load-test.md`), restart (`shutdown.test.ts`),
+  dependency outages (state-store/SigNoz/MCP/Slack, per
+  `docs/adr/012-failure-injection-review.md`'s survey), delayed/out-of-order
+  telemetry (all three detectors have a dedicated "is invariant to
+  delayed/out-of-order delivery" test —
+  `loop-signature.test.ts`/`context-bloat.test.ts`/`cost-velocity.test.ts`).
 
 ### 10.2 Release checklist
 
-- [ ] All P0 tasks and agreed P1 tasks are complete with evidence.
-- [ ] Aggregate local and CI checks pass from a clean checkout.
-- [ ] No unresolved critical/high security finding or known breaker bypass.
-- [ ] Dashboard/alert exports and configuration examples match tested versions.
-- [ ] README quickstart and operator/developer docs pass a fresh-user rehearsal.
-- [ ] Version/changelog/release notes identify limitations and breaking changes.
-- [ ] Container/artifact provenance, checksums, SBOM, and rollback are available.
-- [ ] Final commit is pushed using verified `Vedant817` authentication and the
-  working tree is clean.
+- [~] All P0 tasks and agreed P1 tasks are complete with evidence. §1-§9 are
+  complete with evidence (each section's own task.md entry). §10 (this
+  section) is in progress; §11 has not started. Every completed section's
+  gaps are recorded honestly (search this file for "Not built"/"real gap")
+  rather than silently marked done.
+- [~] Aggregate local and CI checks pass from a clean checkout. `pnpm run
+  check` (format+lint+build+typecheck+test) and `pnpm run test:integration`
+  both pass in full from the current checkout — 479 tests total, verified
+  by an actual run this session, not assumed. **No CI exists** (task.md
+  §0/§12 scope) — "from a clean checkout" was not literally tested in a
+  fresh clone/container, only re-run in the existing working directory;
+  a genuinely fresh-machine rehearsal is a real, not-yet-done step.
+- [x] No unresolved critical/high security finding or known breaker bypass.
+  `pnpm audit` (`docs/adr/009-supply-chain-scan.md`) has exactly one
+  open finding (`@hono/node-server`, moderate, accepted risk with
+  documented reasoning — not critical/high, and not reachable in this
+  codebase's actual usage). No known breaker bypass exists — the
+  zero-provider-calls-post-trip guarantee is proven under concurrent load
+  (`guard.integration.test.ts`).
+- [x] Dashboard/alert exports and configuration examples match tested
+  versions. `infra/signoz/dashboards/fuse-agent-cost-health.json` and
+  `infra/signoz/alerts/*.json` are the exact files applied via
+  `infra/signoz-dashboard-up.sh`/`infra/signoz-alerts-up.sh` and
+  live-verified (ADR-006, ADR-008) — not separately-maintained examples
+  that could drift from what was actually tested.
+- [d] README quickstart and operator/developer docs pass a fresh-user
+  rehearsal. Not done as a literal fresh-user rehearsal this slice —
+  deferred to §11.2, which explicitly owns README polish. The runbooks
+  (`docs/runbooks/*.md`) were written from and cross-checked against real
+  commands, which is a partial substitute, not the same as an actual
+  fresh-user walkthrough.
+- [ ] Version/changelog/release notes identify limitations and breaking
+  changes. Not done — no `CHANGELOG.md` exists and `package.json` remains
+  at its initial `0.1.0`. A real, honest gap: this project has not cut a
+  release yet, so there is no changelog to write beyond what
+  `docs/runbooks/limitations.md` already covers narratively.
+- [~] Container/artifact provenance, checksums, SBOM, and rollback are
+  available. SBOM: yes (`docs/sbom.cdx.json`). Container provenance:
+  N/A — this project builds no container image of its own (services run
+  via `pnpm`/`node` directly; only pinned third-party images are
+  referenced). Checksums: not generated for any artifact (no release
+  artifact exists to checksum). Rollback: documented as **not available**
+  for schema changes (`docs/runbooks/operations.md` §4) — stated honestly
+  rather than implied.
+- [ ] Final commit is pushed using verified `Vedant817` authentication and
+  the working tree is clean. **Deliberately not done, per the user's
+  standing decision this session ("stay local for now")** — every commit
+  in §4 through §10 is local only, never pushed. Working tree is clean
+  after each commit (verified via `git status` before every commit this
+  session).
 
 ## 11. Demo, judging narrative, and submission
 
