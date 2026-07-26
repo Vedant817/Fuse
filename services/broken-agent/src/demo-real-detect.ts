@@ -87,6 +87,7 @@ async function registerScope(scope: Scope): Promise<void> {
 interface BreakerStatus {
   state: string;
   epoch: number;
+  updatedBy?: { type: string; id: string };
 }
 
 async function getBreakerStatus(scope: Scope): Promise<BreakerStatus> {
@@ -96,6 +97,29 @@ async function getBreakerStatus(scope: Scope): Promise<BreakerStatus> {
   );
   const body = (await res.json()) as { record: BreakerStatus };
   return body.record;
+}
+
+async function resumeDirectDetectorTrip(scope: Scope): Promise<void> {
+  const res = await fetch(`${CONTROL_PLANE_URL}/v1/breaker/resume`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${OPERATOR_TOKEN}`,
+    },
+    body: JSON.stringify({
+      scope,
+      reason:
+        'clear the synchronous Fuse detector trip so this demo can independently prove the SigNoz webhook path',
+      actor: { type: 'manual', id: 'user:demo-operator' },
+      correlationId: `demo-real-detect-resume-${randomUUID()}`,
+      idempotencyKey: `demo-real-detect-resume-${randomUUID()}`,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `direct-detector reset failed: HTTP ${res.status} ${await res.text()}`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -160,6 +184,26 @@ async function main(): Promise<void> {
   guard.stopStepObservationReporting();
   guard.stopPreflightReporting();
 
+  const postRunStatus = await getBreakerStatus(scope);
+  if (
+    postRunStatus.state === 'tripped' &&
+    !postRunStatus.updatedBy?.id.startsWith('system:signoz-webhook:')
+  ) {
+    fmt.info(
+      `The production pre-call path already tripped synchronously via ` +
+        `"${postRunStatus.updatedBy?.id ?? 'unknown'}". Clearing that trip once so the ` +
+        'separate SigNoz alert/webhook path can be proved without attribution ambiguity...',
+    );
+    await resumeDirectDetectorTrip(scope);
+    const resumed = await getBreakerStatus(scope);
+    if (resumed.state !== 'armed') {
+      throw new Error(
+        `expected the verification reset to arm the breaker, got ${resumed.state}`,
+      );
+    }
+    fmt.ok('Direct detector trip cleared; breaker is armed while SigNoz evaluates');
+  }
+
   fmt.act(
     'Waiting for the REAL SigNoz alert rule to evaluate and trip this scope ' +
       '(no manual trip call in this script) — SigNoz evaluates on a 1-minute cadence',
@@ -170,9 +214,17 @@ async function main(): Promise<void> {
   let tripped = false;
   while (Date.now() - waitStartedAt < MAX_WAIT_MS) {
     const status = await getBreakerStatus(scope);
-    if (status.state === 'tripped') {
+    if (
+      status.state === 'tripped' &&
+      status.updatedBy?.id.startsWith('system:signoz-webhook:')
+    ) {
       tripped = true;
       break;
+    }
+    if (status.state === 'tripped') {
+      throw new Error(
+        `breaker was tripped by "${status.updatedBy?.id ?? 'unknown'}", not the SigNoz webhook`,
+      );
     }
     fmt.info(
       `  ...still "${status.state}", ${Math.round((Date.now() - waitStartedAt) / 1000)}s elapsed`,
