@@ -48,6 +48,15 @@ is Node >=20, both compatible with this repository. After install,
 `pnpm audit --prod --audit-level low` reports
 `No known vulnerabilities found`, and all diagnosis/MCP tests pass.
 
+**Follow-up fix (2026-07-26):** a fresh supported-runtime audit found the new
+high-severity GHSA-c96f-x56v-gq3h advisory in Fastify's transitive
+`find-my-way@9.6.0` dependency (HTTP/2 denial of service). Added
+`find-my-way@<=9.6.0: >=9.6.1` to the workspace overrides; the lockfile
+resolved 9.7.0. After reinstall, `pnpm why find-my-way` reports only 9.7.0,
+`pnpm audit --prod --audit-level low` reports
+`No known vulnerabilities found`, and the 130 control-plane unit plus 49
+real-Postgres integration tests pass.
+
 ### 2. License compliance — package.json license fields on disk, not `license-checker` alone
 
 `npx license-checker --json --excludePrivatePackages` from the repo root
@@ -109,8 +118,9 @@ and 54 dependency graph entries.
 
 ## Consequences
 
-- `pnpm-workspace.yaml` now carries three version overrides
-  (`@hono/node-server@2.0.10`, `undici@<6.27.0`, `uuid@<11.1.1`) that must
+- `pnpm-workspace.yaml` now carries four version overrides
+  (`@hono/node-server@2.0.10`, `find-my-way@<=9.6.0`,
+  `undici@<6.27.0`, `uuid@<11.1.1`) that must
   be revisited if
   `@testcontainers/postgresql` ever bumps its own `undici`/`uuid` floor past
   these pins (they would become redundant, not wrong).

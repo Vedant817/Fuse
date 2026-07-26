@@ -1,10 +1,10 @@
 # Fuse demo script (task.md §11.1)
 
-Status: rehearsed live on 2026-07-23 against the real local stack (Postgres,
-control plane, self-hosted SigNoz with alert rules provisioned) — every
-number and output quoted below is from that actual run, not invented.
-Re-running will produce different scope IDs/timestamps but the same shape
-of result, unless noted otherwise.
+Status: rehearsed live on 2026-07-23 and independently re-verified on
+2026-07-26 against the real local stack (Postgres, control plane,
+self-hosted SigNoz with alert rules provisioned). Every number and output
+quoted below is measured, not invented. Re-running will produce different
+scope IDs/timestamps but the same shape of result, unless noted otherwise.
 
 ## Setup (once, before either beat)
 
@@ -31,14 +31,18 @@ supporting detail for judge questions):
    pnpm --filter @fuse/broken-agent run demo:real-detect
    ```
 
-   In-process, the loop scenario completes in ~100ms (20 calls, stopped by
-   the fixture's own safety ceiling) and step telemetry is flushed
-   immediately. **Then the script waits on the real SigNoz alert rule** —
-   in the rehearsed run, this took **210.9 seconds** (SigNoz's fixed
-   evaluation cadence plus notification delivery; two earlier runs recorded
-   231s/331s — see `docs/adr/006-signoz-alert-rule-provisioning.md`). This
-   is the honest cost of "a real observability platform, not a shortcut" —
-   say so on stage rather than editing it out.
+   The production SDK now reports each completed step synchronously so the
+   control plane can trip before the next call; this path correctly trips in
+   ~100ms. For this proof only, the script explicitly clears that
+   `system:detector:*` trip once, confirms the breaker is armed, and then
+   waits for a new trip whose `updatedBy.id` is
+   `system:signoz-webhook:*`. It refuses to accept the synchronous trip as
+   SigNoz evidence. On 2026-07-26 the independently attributed webhook trip
+   took **330.76 seconds** after re-arming (the earlier live runs measured
+   210.9s, 231s, and 331s — see
+   `docs/adr/006-signoz-alert-rule-provisioning.md`). This is the honest cost
+   of proving the external observability-platform path rather than the
+   faster production enforcement path.
 
 2. **The real, unscripted result**: both `context-bloat` and
    `loop-signature` fired — `context-bloat` about 11 seconds before
@@ -103,7 +107,7 @@ supporting detail for judge questions):
 
 ### Numbers to actually say on stage
 
-- Alert-to-trip latency: **~211 seconds** in the rehearsed run (be ready for
+- Alert-to-trip latency: **~331 seconds** in the latest verified run (be ready for
   "why so slow" — answer: SigNoz's own alert-evaluation cadence, not
   anything Fuse's own code adds; `/v1/permit`'s own p50 is 6ms,
   `docs/adr/011-permit-load-test.md`).

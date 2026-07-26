@@ -88,6 +88,11 @@ pnpm workspaces, one package/service per concern:
 - Docker (for local Postgres and for the testcontainers-based integration
   test suite — every integration test in this repo runs against a real,
   ephemeral Postgres container, not a mock)
+- Bash and `curl` for the SigNoz launch/provisioning scripts; `jq` and
+  Python 3 are additionally required by `infra/signoz-alerts-up.sh` and
+  `infra/signoz-dashboard-up.sh`. Shell scripts are pinned to LF checkout
+  endings via `.gitattributes` so they remain runnable from WSL/Git Bash on
+  Windows.
 
 ## Getting started
 

@@ -48,6 +48,12 @@ All notable changes to Fuse are documented here. The project follows
   symlink-resolved `import.meta.url`, which `pnpm deploy`'s production
   `node_modules/.pnpm/...` layout always mismatches. The migrate script now
   exits `0` with real applied migrations, not a silent no-op.
+- Updated Fastify's transitive `find-my-way` router from 9.6.0 to 9.7.0 to
+  remediate GHSA-c96f-x56v-gq3h (HTTP/2 denial of service).
+- Corrected `demo:real-detect` so it clears the newer synchronous detector
+  trip and only reports success after a separately attributed SigNoz webhook
+  trip; added Windows-safe LF shell checkouts and WSL Docker credential-helper
+  isolation for the SigNoz launcher.
 
 ### Operational notes
 

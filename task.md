@@ -2859,3 +2859,61 @@ the earlier checkmarks:
   Clean-slate gate re-run after the fix: `pnpm run check` — **454 unit tests**
   across every package — and `pnpm run test:integration` — **88 integration
   tests across 10 files** — both green.
+
+### Full supported-runtime verification and dependency advisory (2026-07-26)
+
+- The host initially selected Node 22.13.1 despite the repository's declared
+  Node >=24 production baseline. Installed and activated Node 24.0.0 through
+  the existing NVM for Windows installation, retained the declared pnpm
+  11.6.0 version, and verified `pnpm install --frozen-lockfile`.
+- `pnpm run check:full` passed under Node 24: formatter, linter, all builds,
+  strict type checks, **454 unit tests**, and **88 integration tests** against
+  real Testcontainers PostgreSQL.
+- A fresh `pnpm audit --prod --audit-level low` then found one new
+  high-severity advisory, GHSA-c96f-x56v-gq3h, in Fastify's transitive
+  `find-my-way@9.6.0` router. Added a narrowly scoped workspace override and
+  regenerated the lockfile; `pnpm why find-my-way` now reports only 9.7.0 and
+  the audit reports `No known vulnerabilities found`. Post-remediation narrow
+  verification passed: **130 control-plane unit tests** and **49
+  control-plane integration tests**. Full post-remediation and live-stack
+  evidence follows in this verification session's final report.
+- The documented Windows SigNoz launcher initially failed twice: CRLF shell
+  checkout endings made Bash reject `pipefail`, then Foundry inherited Docker
+  Desktop's Windows-only credential helper and failed with an `exec format
+  error`. Added `.gitattributes` (`*.sh text eol=lf`) and a WSL-only isolated
+  Docker config for this public-image Foundry cast. After installing the
+  missing user-scoped `jq` 1.8.2 dependency, the exact
+  `bash ./infra/signoz-up.sh` command completed idempotently against SigNoz
+  v0.133.0, and the alert/dashboard provisioners created the webhook channel,
+  all three rules, and the seven-panel cost-health dashboard.
+- The first `demo:real-detect` run falsely claimed a SigNoz alert trip in
+  132ms. Live breaker status proved the actor was actually the newer
+  synchronous `system:detector:loop-signature` path; the demo checked only
+  `state === "tripped"` and had become misleading as the architecture
+  evolved. Fixed it to clear that direct trip once, re-arm, and accept only a
+  later `system:signoz-webhook:*` trip. The corrected real run stayed armed
+  for **330.76 seconds** before the authenticated SigNoz webhook trip landed.
+- Live functional evidence: the narrated demo proved exactly three model
+  dispatches before trip and zero afterward, three of three additional calls
+  denied, authorized resume, Preflight `protected`, and a guarded real Groq
+  call (45 tokens). The complete Preflight beat returned
+  `protected/healthy` → `blind/missing-required-fields` →
+  `blind/recovering` → `protected/healthy` after the 60-second dwell.
+  Chromium rendered the real dashboard with armed permit, protected
+  Preflight, and all three detector series. SigNoz MCP's live evidence test
+  passed after least-privilege service-account provisioning.
+- Production/failure evidence: `docker build -t
+  fuse-control-plane:verification .` passed; the image ran as `node` with a
+  read-only root, all capabilities dropped and `no-new-privileges`, returning
+  `/healthz` and `/readyz` 200. Stopping only `fuse-postgres` left liveness
+  200, changed readiness to 503, and returned a fail-closed degraded permit;
+  restarting Postgres restored readiness and allowed permits without a Fuse
+  restart. Live Slack delivery was subsequently configured and verified
+  through the production `postIncidentCard` client against the real incident
+  channel (Slack message timestamp `1785052383.486849`). NVIDIA Build remains
+  externally blocked because the configured key returns HTTP 401. Both
+  offline/failure paths degrade without weakening enforcement.
+- Final post-change verification passed: `pnpm run check:full` completed
+  formatting, linting, every build, strict type checking, **454 unit tests**,
+  and **88 integration tests**; `pnpm audit --prod --audit-level low`
+  reported `No known vulnerabilities found`.
