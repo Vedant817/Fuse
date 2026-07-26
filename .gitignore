@@ -8,6 +8,8 @@ coverage/
 .DS_Store
 *.log
 .pnpm-store/
+.playwright-cli/
+output/
 infra/data/
 infra/signoz/pours/
 infra/signoz/casting.yaml.lock

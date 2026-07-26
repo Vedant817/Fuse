@@ -27,6 +27,24 @@ if ! command -v foundryctl >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
+# Docker Desktop can write a Windows-only credential helper
+# (`docker-credential-desktop.exe`) into the shared WSL Docker config. A Linux
+# `docker compose pull` launched by Foundry then fails with `exec format
+# error`, even though every image in this local stack is public. Isolate this
+# one Foundry invocation from that host credential store; Docker engine
+# connectivity still comes from Docker Desktop's WSL integration.
+foundry_docker_config=""
+docker_config_file="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+if grep -qi microsoft /proc/version 2>/dev/null &&
+  [ -f "$docker_config_file" ] &&
+  grep -Eq '"(credsStore|credHelpers)"' "$docker_config_file"; then
+  foundry_docker_config=$(mktemp -d)
+  echo '{}' >"$foundry_docker_config/config.json"
+  export DOCKER_CONFIG="$foundry_docker_config"
+  trap 'rm -rf "$foundry_docker_config"' EXIT
+  echo "==> Using an isolated Docker config for public SigNoz images (WSL credential-helper compatibility)."
+fi
+
 echo "==> Casting the self-hosted SigNoz stack (infra/signoz/casting.yaml)..."
 foundryctl cast -f casting.yaml
 
