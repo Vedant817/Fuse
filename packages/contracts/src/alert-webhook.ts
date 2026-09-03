@@ -13,6 +13,15 @@ import { ScopeSchema } from './scope.js';
  */
 export const SignozAlertStatusSchema = z.enum(['firing', 'resolved']);
 
+/** Breaker epochs cross the SigNoz boundary as metric-label strings, but the
+ * normalized event carries a number. Keep the value within JavaScript's exact
+ * integer range so the CAS epoch cannot be rounded on its way to storage. */
+export const SourceBreakerEpochSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
+
 export const SignozAlertmanagerAlertSchema = z.object({
   status: SignozAlertStatusSchema,
   labels: z.record(z.string(), z.string()),
@@ -66,5 +75,8 @@ export const NormalizedAlertEventSchema = z.object({
   reason: z.string().min(1).max(2000),
   fingerprint: z.string().min(1),
   startsAt: z.string().min(1),
+  /** Optional only so legacy SigNoz rules can be observed without mutating
+   * breaker state. Enforcement requires this field at the webhook route. */
+  sourceEpoch: SourceBreakerEpochSchema.optional(),
 });
 export type NormalizedAlertEvent = z.infer<typeof NormalizedAlertEventSchema>;

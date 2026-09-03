@@ -4,6 +4,7 @@ import { ActorSchema, BreakerRecordSchema } from './breaker-state.js';
 import { BreakerAuditEventSchema } from './audit.js';
 
 const IdempotencyKeySchema = z.string().min(1).max(200);
+const ExpectedEpochSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
 export const PermitRequestSchema = z.object({
   scope: ScopeSchema,
@@ -40,10 +41,9 @@ export const TripRequestSchema = z.object({
   actor: ActorSchema,
   correlationId: z.string().min(1).max(200),
   idempotencyKey: IdempotencyKeySchema,
-  /** Optional: reject the trip if the caller's view of the epoch is stale.
-   * Alert-driven trips normally omit this and apply blindly to whatever the
-   * current state is; operator tooling may set it for optimistic locking. */
-  expectedEpoch: z.number().int().nonnegative().optional(),
+  /** Optional for explicit force-trip callers. Direct detector and SigNoz
+   * fallback trips supply the source epoch before reaching the store. */
+  expectedEpoch: ExpectedEpochSchema.optional(),
 });
 export type TripRequest = z.infer<typeof TripRequestSchema>;
 
@@ -53,7 +53,7 @@ export const ResumeRequestSchema = z.object({
   actor: ActorSchema,
   correlationId: z.string().min(1).max(200),
   idempotencyKey: IdempotencyKeySchema,
-  expectedEpoch: z.number().int().nonnegative().optional(),
+  expectedEpoch: ExpectedEpochSchema,
 });
 export type ResumeRequest = z.infer<typeof ResumeRequestSchema>;
 
@@ -63,6 +63,7 @@ export const DisableRequestSchema = z.object({
   actor: ActorSchema,
   correlationId: z.string().min(1).max(200),
   idempotencyKey: IdempotencyKeySchema,
+  expectedEpoch: ExpectedEpochSchema,
 });
 export type DisableRequest = z.infer<typeof DisableRequestSchema>;
 
@@ -72,6 +73,7 @@ export const EnableRequestSchema = z.object({
   actor: ActorSchema,
   correlationId: z.string().min(1).max(200),
   idempotencyKey: IdempotencyKeySchema,
+  expectedEpoch: ExpectedEpochSchema,
 });
 export type EnableRequest = z.infer<typeof EnableRequestSchema>;
 

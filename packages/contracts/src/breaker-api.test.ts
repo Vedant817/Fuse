@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DisableRequestSchema,
+  EnableRequestSchema,
   PermitRequestSchema,
   ResumeRequestSchema,
   TripRequestSchema,
@@ -80,15 +81,36 @@ describe('TripRequestSchema', () => {
   });
 });
 
-describe('ResumeRequestSchema and DisableRequestSchema', () => {
+describe('epoch-bound operator mutation schemas', () => {
+  const valid = {
+    scope: SCOPE,
+    reason: 'operator action',
+    actor: ACTOR,
+    correlationId: 'c',
+    idempotencyKey: 'k',
+    expectedEpoch: 7,
+  };
+
+  it.each([
+    ['resume', ResumeRequestSchema],
+    ['disable', DisableRequestSchema],
+    ['enable', EnableRequestSchema],
+  ] as const)('requires a safe expectedEpoch for %s', (_name, schema) => {
+    expect(schema.safeParse(valid).success).toBe(true);
+
+    const { expectedEpoch: _expectedEpoch, ...unbound } = valid;
+    expect(schema.safeParse(unbound).success).toBe(false);
+    expect(schema.safeParse({ ...valid, expectedEpoch: -1 }).success).toBe(false);
+    expect(
+      schema.safeParse({ ...valid, expectedEpoch: Number.MAX_SAFE_INTEGER + 1 }).success,
+    ).toBe(false);
+  });
+
   it('rejects resume with an empty reason', () => {
     expect(
       ResumeRequestSchema.safeParse({
-        scope: SCOPE,
+        ...valid,
         reason: '',
-        actor: ACTOR,
-        correlationId: 'c',
-        idempotencyKey: 'k',
       }).success,
     ).toBe(false);
   });
@@ -96,10 +118,8 @@ describe('ResumeRequestSchema and DisableRequestSchema', () => {
   it('rejects disable with a non-string idempotency key', () => {
     expect(
       DisableRequestSchema.safeParse({
-        scope: SCOPE,
+        ...valid,
         reason: 'maintenance',
-        actor: ACTOR,
-        correlationId: 'c',
         idempotencyKey: 12345,
       }).success,
     ).toBe(false);

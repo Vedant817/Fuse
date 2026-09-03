@@ -91,6 +91,7 @@ describe('NormalizedAlertEventSchema', () => {
       reason: 'loop detected',
       fingerprint: 'abc123',
       startsAt: '2026-07-21T00:00:00Z',
+      sourceEpoch: 7,
     });
     expect(result.success).toBe(true);
   });
@@ -104,6 +105,27 @@ describe('NormalizedAlertEventSchema', () => {
         reason: 'x'.repeat(3000),
         fingerprint: 'abc123',
         startsAt: '2026-07-21T00:00:00Z',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts an unbound legacy event but rejects unsafe source epochs', () => {
+    const legacy = {
+      scope: { tenant: 't1', environment: 'prod', agentId: 'agent-1' },
+      status: 'firing',
+      detector: 'loop-signature',
+      reason: 'loop detected',
+      fingerprint: 'abc123',
+      startsAt: '2026-07-21T00:00:00Z',
+    };
+    expect(NormalizedAlertEventSchema.safeParse(legacy).success).toBe(true);
+    expect(
+      NormalizedAlertEventSchema.safeParse({ ...legacy, sourceEpoch: -1 }).success,
+    ).toBe(false);
+    expect(
+      NormalizedAlertEventSchema.safeParse({
+        ...legacy,
+        sourceEpoch: Number.MAX_SAFE_INTEGER + 1,
       }).success,
     ).toBe(false);
   });

@@ -28,6 +28,22 @@ export interface HeartbeatSignal {
   lastSeenAtMs: number;
 }
 
+export interface ExporterDeliverySignal {
+  status: 'success' | 'failure';
+  observedAtMs: number;
+  sourceInstanceId: string;
+  sequence: number;
+}
+
+export interface DetectorProtectionEvidence {
+  /** All three direct detectors aggregate within this one execution only. */
+  executionId: string;
+  /** Pricing status for each completed model call retained in that window. */
+  pricingStatuses: readonly ('available' | 'unavailable')[];
+  /** False when the direct observation endpoint could not acknowledge evidence. */
+  reportingAvailable: boolean;
+}
+
 export interface PreflightEvaluatorConfig {
   /** How far back `spans` is expected to cover — used only for
    * documentation/consistency; the evaluator itself trusts whatever

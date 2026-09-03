@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { evaluatePreflight } from './evaluator.js';
+import { evaluateDetectorProtection, evaluatePreflight } from './evaluator.js';
 import {
   buildEmptyFixture,
   buildHealthyFixture,
@@ -13,12 +13,17 @@ import type { PreflightResult } from '@fuse/contracts';
 const SCOPE = { tenant: 't1', environment: 'prod', agentId: 'agent-1' };
 const NOW = new Date('2026-07-21T00:00:00.000Z');
 const NOW_MS = NOW.getTime();
+function delivery(status: 'success' | 'failure', observedAtMs: number, sequence = 1) {
+  return { status, observedAtMs, sourceInstanceId: 'test-instance', sequence };
+}
+const OTLP_SUCCESS = delivery('success', NOW_MS);
 
 describe('evaluatePreflight', () => {
   it('reports protected on a fully healthy window (first evaluation, no hysteresis needed)', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -31,6 +36,7 @@ describe('evaluatePreflight', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
       spans: buildMissingFieldsFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -42,6 +48,7 @@ describe('evaluatePreflight', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
       spans: buildOrphanSpansFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -56,6 +63,7 @@ describe('evaluatePreflight', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
       spans,
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -96,6 +104,29 @@ describe('evaluatePreflight', () => {
     expect(result.state).toBe('blind');
   });
 
+  it('never treats future spans or heartbeats as current health evidence', () => {
+    const futureSpans = evaluatePreflight({
+      scope: SCOPE,
+      spans: buildHealthyFixture(NOW_MS + 60_000),
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(futureSpans.state).toBe('blind');
+    expect(futureSpans.reasonCode).toBe('no-signal');
+    expect(futureSpans.freshnessMs).toBeNull();
+
+    const futureHeartbeat = evaluatePreflight({
+      scope: SCOPE,
+      spans: [],
+      heartbeat: { lastSeenAtMs: NOW_MS + 60_000 },
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(futureHeartbeat.state).toBe('blind');
+    expect(futureHeartbeat.reasonCode).toBe('no-signal');
+    expect(futureHeartbeat.freshnessMs).toBeNull();
+  });
+
   it('treats all-stale spans (older than the staleness limit) as insufficient current evidence', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
@@ -103,6 +134,7 @@ describe('evaluatePreflight', () => {
         NOW_MS,
         DEFAULT_PREFLIGHT_CONFIG.maxEvidenceStalenessMs + 60_000,
       ),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -125,6 +157,7 @@ describe('evaluatePreflight', () => {
     const protectedResult = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -133,6 +166,7 @@ describe('evaluatePreflight', () => {
     const brokenResult = evaluatePreflight({
       scope: SCOPE,
       spans: buildMissingFieldsFixture(laterMs),
+      exporterDelivery: delivery('success', laterMs, 2),
       now: later,
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: protectedResult,
@@ -144,6 +178,7 @@ describe('evaluatePreflight', () => {
     const broken = evaluatePreflight({
       scope: SCOPE,
       spans: buildMissingFieldsFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -155,6 +190,7 @@ describe('evaluatePreflight', () => {
     const soon = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(soonMs),
+      exporterDelivery: delivery('success', soonMs, 2),
       now: new Date(soonMs),
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: broken,
@@ -175,6 +211,7 @@ describe('evaluatePreflight', () => {
     const later = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(laterMs),
+      exporterDelivery: delivery('success', laterMs, 3),
       now: new Date(laterMs),
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: soon,
@@ -188,6 +225,7 @@ describe('evaluatePreflight', () => {
     const broken = evaluatePreflight({
       scope: SCOPE,
       spans: buildMissingFieldsFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
     });
@@ -195,6 +233,7 @@ describe('evaluatePreflight', () => {
     const midDwell = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(midDwellMs),
+      exporterDelivery: delivery('success', midDwellMs, 2),
       now: new Date(midDwellMs),
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: broken,
@@ -206,6 +245,7 @@ describe('evaluatePreflight', () => {
     const regressed = evaluatePreflight({
       scope: SCOPE,
       spans: buildMissingFieldsFixture(regressMs),
+      exporterDelivery: delivery('success', regressMs, 3),
       now: new Date(regressMs),
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: midDwell,
@@ -219,6 +259,7 @@ describe('evaluatePreflight', () => {
     const stillPending = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(afterRegressMs),
+      exporterDelivery: delivery('success', afterRegressMs, 4),
       now: new Date(afterRegressMs),
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: regressed,
@@ -230,6 +271,7 @@ describe('evaluatePreflight', () => {
     const result = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
       disabled: true,
@@ -256,6 +298,7 @@ describe('evaluatePreflight', () => {
     const reenabled = evaluatePreflight({
       scope: SCOPE,
       spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: OTLP_SUCCESS,
       now: NOW,
       config: DEFAULT_PREFLIGHT_CONFIG,
       previous: disabled,
@@ -263,5 +306,87 @@ describe('evaluatePreflight', () => {
     // No previous non-disabled baseline to hold hysteresis against, so a
     // healthy reading commits immediately rather than entering "recovering".
     expect(reenabled.state).toBe('protected');
+  });
+
+  it('requires a successful OTLP acknowledgement before reporting protected', () => {
+    const neverConfirmed = evaluatePreflight({
+      scope: SCOPE,
+      spans: buildHealthyFixture(NOW_MS),
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(neverConfirmed.state).toBe('degraded');
+    expect(neverConfirmed.reasonCode).toBe('exporter-delivery-unconfirmed');
+
+    const failed = evaluatePreflight({
+      scope: SCOPE,
+      spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: delivery('failure', NOW_MS),
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(failed.state).toBe('blind');
+    expect(failed.reasonCode).toBe('exporter-delivery-failed');
+  });
+
+  it('keeps exporter failure authoritative when its rejected spans are stale', () => {
+    const result = evaluatePreflight({
+      scope: SCOPE,
+      spans: buildStaleFixture(
+        NOW_MS,
+        DEFAULT_PREFLIGHT_CONFIG.maxEvidenceStalenessMs + 1,
+      ),
+      heartbeat: { lastSeenAtMs: NOW_MS },
+      exporterDelivery: delivery('failure', NOW_MS),
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(result.state).toBe('blind');
+    expect(result.reasonCode).toBe('exporter-delivery-failed');
+  });
+
+  it('rejects a stale successful OTLP acknowledgement', () => {
+    const result = evaluatePreflight({
+      scope: SCOPE,
+      spans: buildHealthyFixture(NOW_MS),
+      exporterDelivery: delivery(
+        'success',
+        NOW_MS - DEFAULT_PREFLIGHT_CONFIG.maxEvidenceStalenessMs - 1,
+      ),
+      now: NOW,
+      config: DEFAULT_PREFLIGHT_CONFIG,
+    });
+    expect(result.state).toBe('blind');
+    expect(result.reasonCode).toBe('exporter-delivery-stale');
+  });
+});
+
+describe('evaluateDetectorProtection', () => {
+  it('degrades only cost velocity when execution pricing is unavailable', () => {
+    expect(
+      evaluateDetectorProtection({
+        executionId: 'execution-1',
+        pricingStatuses: ['available', 'unavailable'],
+        reportingAvailable: true,
+      }),
+    ).toEqual([
+      expect.objectContaining({ detector: 'loop-signature', status: 'protected' }),
+      expect.objectContaining({ detector: 'context-bloat', status: 'protected' }),
+      expect.objectContaining({
+        detector: 'cost-velocity',
+        status: 'degraded',
+        reasonCode: 'pricing-unavailable',
+      }),
+    ]);
+  });
+
+  it('degrades every detector when direct reporting is unavailable', () => {
+    expect(
+      evaluateDetectorProtection({
+        executionId: 'execution-1',
+        pricingStatuses: ['available'],
+        reportingAvailable: false,
+      }).every((status) => status.status === 'degraded'),
+    ).toBe(true);
   });
 });
