@@ -63,6 +63,12 @@ describe('control-plane HTTP API (Postgres integration)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -71,6 +77,9 @@ describe('control-plane HTTP API (Postgres integration)', () => {
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
     for (let index = 0; index < 40; index++) {
@@ -90,9 +99,11 @@ describe('control-plane HTTP API (Postgres integration)', () => {
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await pool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   function authed(overrides: Record<string, string> = {}) {
@@ -520,6 +531,10 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
   let pool: pg.Pool;
   let app: FastifyInstance;
   const agentScopes: Scope[] = [];
+  // See above: record mid-test pool errors loudly, ignore the teardown
+  // window where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -528,6 +543,9 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
     for (let index = 0; index < 10; index++) {
@@ -581,9 +599,11 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await pool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   function agentScope(name: string): Scope {
@@ -674,6 +694,10 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
   let pool: pg.Pool;
   let app: FastifyInstance;
   const tenantScopes = new Map<string, Scope[]>();
+  // See above: record mid-test pool errors loudly, ignore the teardown
+  // window where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -682,6 +706,9 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
     for (const tenant of ['tenant-a', 'tenant-b']) {
@@ -743,9 +770,11 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await pool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   function scopeForTenant(tenant: string, name: string): Scope {

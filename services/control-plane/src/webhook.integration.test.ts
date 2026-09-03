@@ -96,6 +96,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   let app: FastifyInstance;
   let replica: FastifyInstance;
   let store: FailableDirectTripStore;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
   const registeredAgentIds: string[] = [];
 
   beforeAll(async () => {
@@ -106,6 +112,11 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     replicaPool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    for (const tracked of [pool, replicaPool]) {
+      tracked.on('error', (err) => {
+        if (!tearingDownPool) poolErrors.push(err);
+      });
+    }
     await runMigrations(pool);
     store = new FailableDirectTripStore(pool);
     for (let index = 0; index < 50; index++) {
@@ -150,11 +161,13 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await replica.close();
     await pool.end();
     await replicaPool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   function firingAlert(

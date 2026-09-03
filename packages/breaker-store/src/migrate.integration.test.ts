@@ -14,6 +14,12 @@ describe('migration integrity (Postgres integration)', () => {
   let container: StartedPostgreSqlContainer;
   const pools: pg.Pool[] = [];
   const directories: string[] = [];
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -31,7 +37,9 @@ describe('migration integrity (Postgres integration)', () => {
   });
 
   afterAll(async () => {
+    tearingDownPool = true;
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   async function isolatedPool(): Promise<pg.Pool> {
@@ -42,6 +50,9 @@ describe('migration integrity (Postgres integration)', () => {
     const pool = new pg.Pool({
       connectionString: container.getConnectionUri(),
       options: `-c search_path=${schema}`,
+    });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
     });
     pools.push(pool);
     return pool;

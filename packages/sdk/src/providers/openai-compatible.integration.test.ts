@@ -34,6 +34,12 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
   let controlPlaneUrl: string;
   let mockProvider: MockOpenAiCompatibleServer;
   const registeredScopes: Scope[] = [];
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     pgContainer = await new PostgreSqlContainer('postgres:16-alpine')
@@ -42,6 +48,9 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: pgContainer.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
     for (let index = 0; index < 6; index++) {
@@ -104,10 +113,12 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await controlPlane.close();
     await pool.end();
     await pgContainer.stop();
     await mockProvider.close();
+    expect(poolErrors).toEqual([]);
   });
 
   function scopeFor(name: string): Scope {

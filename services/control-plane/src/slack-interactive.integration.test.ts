@@ -148,6 +148,12 @@ describe('Slack interactive resume (two replicas + real Postgres)', () => {
   let replica: FastifyInstance;
   let appUrl: string;
   let replicaUrl: string;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -157,6 +163,11 @@ describe('Slack interactive resume (two replicas + real Postgres)', () => {
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     replicaPool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    for (const tracked of [pool, replicaPool]) {
+      tracked.on('error', (err) => {
+        if (!tearingDownPool) poolErrors.push(err);
+      });
+    }
     await runMigrations(pool);
     store = new BreakerStore(pool);
 
@@ -180,11 +191,13 @@ describe('Slack interactive resume (two replicas + real Postgres)', () => {
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await replica.close();
     await pool.end();
     await replicaPool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   async function trip(target: Scope, expectedEpoch: number, label: string) {

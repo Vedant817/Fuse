@@ -14,6 +14,12 @@ describe('DiagnosisJobStore (Postgres integration)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let breakerStore: BreakerStore;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
   let jobs: DiagnosisJobStore;
 
   beforeAll(async () => {
@@ -23,14 +29,19 @@ describe('DiagnosisJobStore (Postgres integration)', () => {
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     breakerStore = new BreakerStore(pool);
     jobs = new DiagnosisJobStore(pool);
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await pool?.end();
     await container?.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   beforeEach(async () => {

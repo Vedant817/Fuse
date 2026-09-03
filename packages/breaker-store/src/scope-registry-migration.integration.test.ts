@@ -14,6 +14,12 @@ const migrationSql = (name: string): string =>
 describe('0003_scope_registry migration', () => {
   let container: StartedPostgreSqlContainer;
   let adminPool: pg.Pool;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine')
@@ -22,11 +28,16 @@ describe('0003_scope_registry migration', () => {
       .withPassword('fuse')
       .start();
     adminPool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    adminPool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await adminPool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   it('backfills breaker and Preflight-only legacy scopes before validating foreign keys', async () => {

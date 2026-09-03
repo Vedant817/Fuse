@@ -3858,3 +3858,32 @@ the earlier checkmarks:
   re-verified green on the exact committed tree (control-plane unit 217,
   integration: otel 4, breaker-store 55, control-plane 73, sdk 11,
   broken-agent 5). Working tree clean after push.
+
+### CI failure on first push and remediation (2026-09-03)
+
+- Remote CI run `33730255254` failed two jobs while every test passed:
+  1. `Dependency audit and SBOM`: `pnpm audit --prod --audit-level low`
+     reported 12 new advisories (4 moderate, 8 high) published after the last
+     local audit — fastify <5.12.1 (GHSA-w2qp-rph6-63g4, GHSA-3m5p-2c4r-xxw2),
+     fast-uri 3.x/4.x (GHSA-5jgf-p345-68v8, GHSA-f65p-4m7j-42xc,
+     GHSA-fph4-wmhf-6fwf, GHSA-jqff-g426-hqxp), qs via MCP-SDK express chain
+     (GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g).
+  2. `Quality and integration`: breaker-store integration passed 55/55 but
+     Vitest caught 2 unhandled `57P01` errors — raw `pg.Pool` objects have no
+     `'error'` listener, so backends terminated by testcontainer SIGTERM in
+     the `pool.end()`-to-`container.stop()` window became uncaught exceptions
+     (a slower-CI-only race; never reproduced locally).
+- Fix: fastify `^5.2.1` to `^5.12.1` in control-plane/sdk/broken-agent
+  manifests (single resolved 5.12.1), workspace overrides for
+  `fast-uri@>=3.0.0 <3.1.6` to 3.1.6, `fast-uri@>=4.0.0 <4.1.3` to 4.1.3, and
+  `qs@<6.16.0` to 6.16.0; `pnpm audit --prod --audit-level low` returns `No
+  known vulnerabilities found`. Remaining 14 full-audit findings are dev-only
+  test-tooling chains (testcontainers brace-expansion/undici, vitest
+  js-yaml/nanoid/postcss) that never ship; the CI gate is prod-scoped.
+- Fix: all 14 raw-pool integration suites (breaker-store 5, control-plane 5
+  files/7 suites, sdk 3, broken-agent 1) now attach an `'error'` recorder at
+  pool creation, set a teardown flag first in `afterAll`, and assert zero
+  recorded mid-test errors — teardown-window 57P01 is logged-not-thrown,
+  genuine mid-test idle errors still fail the suite. Verified locally:
+  breaker-store 55/55, control-plane 73/73, sdk 11/11, broken-agent 5/5 with
+  no unhandled-error sections, plus format/lint/typecheck green.

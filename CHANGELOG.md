@@ -71,6 +71,15 @@ All notable changes to Fuse are documented here. The project follows
   exits `0` with real applied migrations, not a silent no-op.
 - Updated Fastify's transitive `find-my-way` router from 9.6.0 to 9.7.0 to
   remediate GHSA-c96f-x56v-gq3h (HTTP/2 denial of service).
+- Remediated 12 production advisories reported by `pnpm audit --prod`:
+  Fastify to 5.12.1 (GHSA-w2qp-rph6-63g4, GHSA-3m5p-2c4r-xxw2), `fast-uri`
+  to 3.1.6/4.1.3 via workspace overrides (GHSA-5jgf-p345-68v8,
+  GHSA-f65p-4m7j-42xc, GHSA-fph4-wmhf-6fwf, GHSA-jqff-g426-hqxp), and `qs`
+  to 6.16.0 via workspace override (GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g).
+- Hardened integration-test teardown: suite-level Postgres pools now record
+  mid-test idle-client errors (still failing the suite) while ignoring the
+  teardown window where container SIGTERM (57P01) after `pool.end()` is
+  benign, fixing CI unhandled-error failures with all tests passing.
 - Corrected `demo:real-detect` to attribute the low-latency stop to the direct
   detector trip, prove zero provider dispatches on the next guarded call, and
   describe SigNoz as asynchronous corroboration/fallback.

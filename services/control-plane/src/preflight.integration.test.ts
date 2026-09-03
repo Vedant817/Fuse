@@ -81,6 +81,12 @@ describe('Preflight API (real Postgres + control plane)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
   let app: FastifyInstance;
+  // node-postgres emits 'error' on idle clients whose backend the server
+  // terminates; without a listener that is an uncaught exception. Record
+  // mid-test errors so the suite still fails loudly, but stop recording at
+  // teardown where container SIGTERM (57P01) after pool.end() is benign.
+  let tearingDownPool = false;
+  const poolErrors: unknown[] = [];
   // Same store/pool, but built with a widened preflightMaxEvidenceStalenessMs
   // — proves the configured Preflight thresholds are actually wired into the
   // live HTTP route, not just parsed correctly in config.ts isolation.
@@ -98,6 +104,9 @@ describe('Preflight API (real Postgres + control plane)', () => {
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    pool.on('error', (err) => {
+      if (!tearingDownPool) poolErrors.push(err);
+    });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
     await store.registerScope({
@@ -135,10 +144,12 @@ describe('Preflight API (real Postgres + control plane)', () => {
   }, 120_000);
 
   afterAll(async () => {
+    tearingDownPool = true;
     await app.close();
     await appWidenedStaleness.close();
     await pool.end();
     await container.stop();
+    expect(poolErrors).toEqual([]);
   });
 
   function scope() {
