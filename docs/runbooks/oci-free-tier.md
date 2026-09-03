@@ -15,9 +15,9 @@ allowances:
 - the existing reserved ngrok HTTPS hostname for the control-plane and Slack
   interactive endpoint.
 
-The tradeoffs are explicit: OCI may reclaim an idle Always Free VM, Neon Free
-is limited to 0.5 GB and 100 CU-hours per project, and ngrok Free has no
-availability SLA. Fuse remains fail-closed during an outage, but this topology
+The tradeoffs are explicit: OCI may reclaim an idle Always Free VM, free-service
+quotas and terms can change, and ngrok Free has no availability SLA. Fuse
+remains fail-closed during an outage, but this topology
 must not be described as highly available.
 
 ## 1. Accounts and values the owner must create
@@ -74,12 +74,13 @@ The checked-in `Release image` GitHub workflow verifies the full suite, builds
 both `linux/amd64` and `linux/arm64`, and publishes to
 `ghcr.io/vedant817/fuse-control-plane`.
 
-In GitHub, open **Actions → Release image → Run workflow** and set a version
-such as `v0.1.0-rc.1`. After it succeeds:
+First move the intended notes from `[Unreleased]` into a non-empty dated release
+section. In GitHub, open **Actions → Release image → Run workflow** and set the
+matching version, such as `vX.Y.Z-rc.1`. After it succeeds:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/vedant817/fuse-control-plane:v0.1.0-rc.1
+  ghcr.io/vedant817/fuse-control-plane:vX.Y.Z-rc.1
 ```
 
 Record the `linux/arm64` manifest-list digest. Deployment must use
@@ -108,21 +109,29 @@ dashboard, alert rules, and Slack webhook channel using the existing scripts.
 
 ## 5. Install secrets on the VM
 
-Create a root-owned runtime file:
+Create separate root-owned runtime and migration files:
 
 ```bash
 sudo install -d -m 700 /etc/fuse
 sudo install -m 600 /dev/null /etc/fuse/control-plane.env
+sudo install -m 600 /dev/null /etc/fuse/migration.env
 sudoedit /etc/fuse/control-plane.env
+sudoedit /etc/fuse/migration.env
 ```
 
-Populate it from the local ignored `.env`, replacing `DATABASE_URL` with the
-Neon pooled TLS URL and using host access for the local SigNoz services:
+Generate each bearer token independently with `openssl rand -hex 32`. Populate
+the runtime file from the local ignored `.env`, replacing `DATABASE_URL` with a
+Neon pooled TLS URL for a DML-only `fuse_runtime` role and using host access for
+the local SigNoz services:
 
 ```dotenv
-DATABASE_URL=postgresql://...neon.../fuse?sslmode=require
+DATABASE_URL=postgresql://fuse_runtime:...@...neon.../fuse?sslmode=require
+CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production
+CONTROL_PLANE_DETECTOR_POLICY_FILE=/app/policies/production.json
+CONTROL_PLANE_RATE_LIMIT_REDIS_URL=redis://redis:6379/0
 CONTROL_PLANE_API_TOKENS=demo:...
-CONTROL_PLANE_AGENT_API_TOKENS=demo:...
+CONTROL_PLANE_AGENT_API_TOKENS=demo:production:canary:...
+CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS=demo:production:canary:...
 CONTROL_PLANE_WEBHOOK_TOKENS=demo:...
 CONTROL_PLANE_STORE_OUTAGE_MODE=fail-closed
 CONTROL_PLANE_WEBHOOK_POLICY_VERSION=fuse-production-v1
@@ -131,6 +140,26 @@ SLACK_SIGNING_SECRET=...
 SLACK_INCIDENT_CHANNEL=C0BKFBTFR4H
 OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
 FUSE_SIGNOZ_MCP_URL=http://host.docker.internal:8020/mcp
+```
+
+The token portions represented by `...` must each be independent 64-character
+hex values; agent and exporter values must differ. The matching exporter runtime
+receives only the raw token as `FUSE_PREFLIGHT_EXPORTER_TOKEN`. The migration
+file contains only a DDL-authorized connection:
+
+```dotenv
+DATABASE_URL=postgresql://fuse_migrator:...@...neon.../fuse?sslmode=require
+```
+
+Create and grant the external roles as documented in
+`docs/runbooks/deployment.md`; Compose cannot enforce PostgreSQL privileges, but
+the separate env files prevent the migration container from receiving runtime
+API, Redis, Slack, or OTel secrets. Validate the runtime file through the same
+parser used at startup:
+
+```bash
+pnpm --filter @fuse/control-plane run build
+pnpm run validate:production-env -- /etc/fuse/control-plane.env
 ```
 
 Do not copy LLM provider keys to the control-plane VM. Groq/NVIDIA keys belong
@@ -143,12 +172,16 @@ From the repository checkout:
 ```bash
 export FUSE_CONTROL_PLANE_IMAGE='ghcr.io/vedant817/fuse-control-plane@sha256:...'
 export FUSE_ENV_FILE=/etc/fuse/control-plane.env
+export FUSE_MIGRATION_ENV_FILE=/etc/fuse/migration.env
 
 docker compose -f infra/production/oci-free/compose.yaml \
+  --env-file /etc/fuse/control-plane.env \
   --profile tools run --rm migrate
 docker compose -f infra/production/oci-free/compose.yaml \
+  --env-file /etc/fuse/control-plane.env \
   up -d control-plane
 docker compose -f infra/production/oci-free/compose.yaml \
+  --env-file /etc/fuse/control-plane.env \
   ps
 
 curl --fail http://127.0.0.1:8090/healthz
@@ -181,8 +214,9 @@ Before calling it deployed:
 1. register a dedicated `demo/production/canary` scope;
 2. confirm permit returns allowed;
 3. submit a 100,000-token detector observation;
-4. confirm the trip, next-call denial, PostgreSQL audit row, SigNoz evidence,
-   and Slack card;
+4. confirm the direct trip, next guarded-call denial, PostgreSQL audit and
+   diagnosis rows, exporter-role-reported Preflight, SigNoz evidence, and Slack
+   card;
 5. click **Resume (requires reason)** and confirm permit recovers;
 6. reboot the VM and confirm SigNoz, Fuse, and ngrok recover automatically;
 7. schedule OCI boot-volume backups and a monthly Neon logical export;

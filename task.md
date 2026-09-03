@@ -1,8 +1,15 @@
-# Fuse Production Build Plan
+# Fuse Internal Implementation Evidence Archive
 
-This is the live execution tracker derived from `Fuse_Hackathon_Brief.md`.
-Agents must update it as part of every completed slice. A checked box means the
-acceptance criteria were verified, not merely implemented.
+This file preserves chronological implementation notes, commands, test counts,
+historical gaps, and superseded decisions from the hackathon build. It is not a
+public product specification or the current architecture source. Verify current
+behavior against code, tests, `docs/architecture.md`, accepted ADRs, and
+`docs/runbooks/limitations.md`.
+
+Entries below are intentionally historical. A checked box means its acceptance
+criteria were verified at the time recorded; it does not certify current
+production readiness. Append concise evidence for new slices and avoid
+repeating broad claims already documented publicly.
 
 ## Status protocol
 
@@ -16,22 +23,25 @@ For each completed feature, add a short evidence note beneath its task with the
 test command/result, commit SHA, and any remaining risk. Work in critical-path
 order unless a dependency makes safe parallel work possible.
 
-## Product outcome and success measures
+## Current Product Outcome
 
 Fuse must demonstrate a trustworthy closed loop:
 
 1. Preflight tells whether an agent can be protected with current telemetry.
-2. OTel spans and metrics arrive in SigNoz with agent/task correlation.
-3. SigNoz detects loop repetition, context growth, or abnormal cost velocity.
-4. An authenticated alert atomically trips the correct agent's breaker.
-5. Middleware blocks the next model call and emits an auditable decision.
-6. Diagnosis uses SigNoz evidence to explain the likely cause and recommend a
-   bounded fix through Slack; resume requires policy or authorized human action.
+2. The SDK reports a bounded structural window to the direct detector route.
+3. A firing detector atomically trips the exact agent scope before the report
+   is acknowledged.
+4. Middleware blocks the next guarded provider dispatch and emits an auditable
+   decision.
+5. SigNoz asynchronously stores and visualizes OTel data, corroborates or falls
+   back with a source-epoch-bound alert, and supplies MCP diagnosis evidence.
+6. Durable diagnosis recommends a bounded fix; resume requires an authorized,
+   reasoned, epoch-bound human action.
 
 Demo success measures:
 
-- zero model-provider requests after the breaker trip is observed and before an
-  authorized resume;
+- zero guarded provider callbacks after the breaker trip commits and before an
+  authorized resume, excluding calls already past permit;
 - trip-to-enforcement latency is measured and visible;
 - prevented-call and avoided-cost estimates are labeled as estimates;
 - all three detector types have reproducible fixtures;
@@ -898,8 +908,9 @@ now true. See the dated entries in §12 for full evidence.
   gauges (`fuse.detector.score`, `fuse.detector.fired`); `infra/signoz/
   alerts/{loop-signature,context-bloat,cost-velocity}.json` are real,
   working `threshold_rule` definitions against `fuse.detector.fired`,
-  grouped by tenant/environment/agent_id so each scope gets its own alert
-  instance.
+  grouped by tenant/environment/agent_id/source_epoch so each breaker episode
+  gets its own alert instance and delayed delivery remains bound to the state
+  observed by the detector.
 - [x] Configure evaluation interval, window, pending duration, recovery, labels,
   annotations, severity, and routing without embedding credentials.
   Evidence: `evalWindow`/`frequency` set per rule (tuned to 15s/1m after
@@ -936,16 +947,16 @@ now true. See the dated entries in §12 for full evidence.
   `webhook.integration.test.ts` (§5.1) — that mechanism doesn't care where
   a delivery came from, but a live SigNoz-sourced duplicate was not
   separately manufactured this session.
-- [x] Measure alert-to-trip latency and verify it meets the documented budget.
+- [x] Measure historical SigNoz fallback latency; this is not direct enforcement latency.
   No prior budget existed to check against — this session establishes the
   first real measurement instead of an assumption. Three independent,
   single-fresh-scope runs (`services/broken-agent/src/
   demo-real-detect.ts`, no manual trip call anywhere in the script), all
   measured from run-end to observed trip, both real and attributed to
   `system:signoz-webhook:loop-signature` in the audit log:
-  - `evalWindow: "1m"` / `frequency: "1m"` (first rule config tried): **231s**.
+  - `evalWindow: "1m"` / `frequency: "1m"`: multi-minute delivery.
   - `evalWindow: "1m"` / `frequency: "15s"` (tightened, expecting an
-    improvement): **331s** on a clean single-scope run — essentially the
+    improvement): also multi-minute on a clean single-scope run - essentially the
     same order of magnitude, *not* meaningfully faster. Tightening
     `frequency` did not fix the dominant cost, which is most likely
     SigNoz's own internal alert-routing/dispatch delay (outside the rule's
@@ -997,7 +1008,8 @@ Acceptance criteria:
   configured username, a bearer token, so Fuse's webhook uses the same
   bearer mechanism as the rest of the API, with its own least-privilege
   token tier — see below); idempotency via a key derived from the alert's
-  own stable identity (`fingerprint`+`startsAt`), tested for duplicate
+  own stable identity (`fingerprint`+`startsAt`+source breaker epoch), hashed
+  into bounded correlation/idempotency fields, tested for duplicate
   delivery; and timestamp-freshness/replay-window rejection via
   `isStaleAlert` (`services/control-plane/src/routes/webhook.ts`), which
   rejects any alert whose `startsAt` is older than `webhookMaxAlertAgeMs`
@@ -1017,7 +1029,9 @@ Acceptance criteria:
   tenant/environment/agent scope. Evidence:
   `services/control-plane/src/signoz-alert-mapper.ts`'s
   `mapSignozAlertToNormalizedEvent` — tolerant of dotted/underscored label
-  key variants. Checked against the real self-hosted instance (ADR-005):
+  key variants and strict about the canonical bounded nonnegative
+  `fuse.source_epoch` value. Checked against the real self-hosted instance
+  (ADR-005):
   `signoz_metrics.distributed_time_series_v4`'s stored `labels` for
   `@fuse/otel`-emitted data show SigNoz preserves OTel attribute names
   verbatim (dots intact — `deployment.environment.name`, `service.name`),
@@ -1038,13 +1052,11 @@ Acceptance criteria:
   duplicate-delivery test — two identical deliveries produce identical
   `results[]` (the second replays the first's outcome verbatim via
   `BreakerStore`'s idempotency mechanism) and the breaker's epoch advances
-  exactly once. A real bug was caught and fixed here: the webhook initially
-  derived its `correlationId` from Fastify's per-request auto-generated ID,
-  which differs on every HTTP delivery — since the idempotency check hashes
-  the whole request including `correlationId`, this made every genuine
-  Alertmanager retry look like a *different* request and spuriously threw
-  `idempotency_conflict`. Fixed by deriving both the idempotency key and the
-  correlation ID passed to the store from the alert's own stable identity.
+  exactly once. The immutable source epoch is passed directly as
+  `expectedEpoch`; no retry changes the request hash based on current breaker
+  state. Both correlation and idempotency IDs are a fixed-size SHA-256 digest
+  of the alert episode identity, so an oversized SigNoz fingerprint is never
+  persisted in those contract-bounded fields.
 - [x] Handle resolved alerts according to explicit policy; never auto-resume
   solely because an alert resolved unless the policy deliberately allows it.
   Evidence: the webhook's default (and only implemented) behavior for
@@ -1053,10 +1065,8 @@ Acceptance criteria:
   the matching alert resolves. No opt-in auto-resume-on-resolve path
   exists yet (not required, avoids speculative abstraction).
 - [x] Return fast after durable acceptance when diagnosis/Slack work is
-  queued. The breaker trip is synchronously committed before a response and
-  diagnosis/Slack starts asynchronously. The trip/audit is durable; the
-  notification itself remains best-effort because no outbox exists (the
-  separate §5.3 item below remains open).
+  queued. The trip audit and diagnosis job now commit transactionally;
+  asynchronous delivery uses leases, bounded retry, dead-letter, and replay.
 - [x] Rate-limit abusive sources and emit safe audit/operational telemetry for
   accepted and rejected requests. Evidence: the webhook inherits the
   global `@fastify/rate-limit` policy (120/min by default, operator-tunable
@@ -1109,12 +1119,9 @@ get 403, not a silent pass, tested).
   retry loop's own bounded attempts, and no dedicated backpressure
   mechanism beyond the global rate limiter — acceptable at current scale,
   revisit under real load testing (§9.2).
-- [ ] Add durable work queue/outbox or document the smaller mechanism that
-  prevents accepted incidents from being lost before diagnosis/notification.
-  Not built. Diagnosis/Slack now exists and is launched after the durable
-  breaker commit; process termination in that small window can lose the
-  notification while leaving enforcement and its audit row correct. This is
-  an explicit best-effort notification limitation, not a breaker bypass.
+- [x] Add durable diagnosis work delivery. Migration `0005` adds one job per
+  trip audit; workers use leases, bounded retry/backoff and dead-letter.
+  Migration `0007` adds operator-attributed idempotent replay audit.
 - [~] Test restart recovery, store/queue outage, partial write, clock skew,
   duplicate delivery, and multi-instance concurrency. Done: restart
   recovery, store outage (`StoreUnavailableError` → 503), duplicate
@@ -1497,11 +1504,9 @@ Acceptance criteria:
 - [x] every diagnosis claim links to evidence or is labeled as a hypothesis —
   met: every `DiagnosisResult` carries `evidenceLinks` (possibly empty) and
   an explicit `limitations` array stating what is/isn't verified;
-- [x] diagnosis/Slack outages do not weaken the tripped breaker — met and
-  live-verified: the trip commits synchronously in the webhook route
-  before `runDiagnosisAndNotify` is even invoked (fire-and-forget, `void`),
-  and every downstream step (MCP fetch, Slack post) degrades rather than
-  throwing;
+- [x] diagnosis/Slack outages do not weaken the tripped breaker - the trip and
+  diagnosis job commit first, while the durable dispatcher retries bounded
+  downstream MCP/snapshot/Slack delivery independently;
 - [x] no interactive action bypasses control-plane authorization — met:
   `/v1/slack/interactive` is fail-closed on signature/timestamp
   verification, and the only enforcement action it can ever trigger
@@ -1655,7 +1660,9 @@ done, tracked as such rather than silently marked complete.
   `docs/adr/010-secure-defaults-audit.md` and
   `docs/runbooks/deployment.md`.
 - [x] Generate an SBOM and document dependency update ownership. SBOM:
-  `docs/sbom.cdx.json` plus the CI-generated CycloneDX 1.6 artifact. Dependency
+  originally `docs/sbom.cdx.json` plus the CI-generated CycloneDX 1.6 artifact;
+  the stale point-in-time checked-in snapshot was removed on 2026-08-24 in
+  favor of run-bound validated workspace/image artifacts. Dependency
   ownership: already covered by `.github/CODEOWNERS` (`* @Vedant817`) —
   a single-maintainer project has no separate dependency-ownership
   question to answer beyond that.
@@ -1708,13 +1715,16 @@ done, tracked as such rather than silently marked complete.
   production prerequisites, documented honestly:** schema rollback still
   has no down migrations, managed PostgreSQL must supply backup/PITR and a
   restore rehearsal, and audit-log retention is a business decision.
-- [ ] Define SLOs and alerts for permit errors/latency, webhook failures,
+- [~] Define SLOs and alerts for permit errors/latency, webhook failures,
   notification backlog, detector lag, stale Preflight, and dropped
-  telemetry. Not done — a real, honest gap. The three detector alert
-  rules built in task.md §4 (`infra/signoz/alerts/`) alert on *agent
-  behavior* (loop/context-bloat/cost-velocity), not on the control plane's
-  own *operational health* signals this item asks for; no such SLO
-  document or matching alert rules exist yet.
+  telemetry. The versioned `v1-provisional` operational contract now covers
+  permit p95/error/deny latency, detector observation failure/latency, webhook
+  auth/processing failures, diagnosis backlog/dead letters/lease renewal,
+  Redis readiness/outage, and Preflight stale/no-data plus sweeper health.
+  Static provisioning contracts and operations/deployment runbooks define
+  opening, resolution, no-data, and bounded-cardinality semantics. This remains
+  partial only because an OTel SDK dropped-export metric is still unavailable;
+  do not infer collector delivery health from application SLO metrics.
 
 ### 9.3 Runbooks
 
@@ -2100,6 +2110,33 @@ Add dated entries here rather than leaving important context only in chat.
 
 ### Verification evidence
 
+- 2026-08-24 (detector/demo realism): replaced broken-agent's exact-output
+  SHA-256 signature with the reusable public `StepShapeCanonicalizer`. The
+  helper normalizes timestamps, numbers, UUID/ULID/opaque IDs, uses keyed
+  token digests and bounded local Jaccard clusters, and exports only a
+  33-character versioned fingerprint. Tests cover volatile normalization,
+  paraphrases, progress boundaries, unrelated noise, low-information
+  collisions, fixed-size/no-raw-content output, eviction, and invalid options.
+  Broken-agent's loop now varies wording and volatile fields but produces the
+  same two-step cycle; context and normal/cost phases carry non-sensitive
+  structural progress labels. The cost scenario now uses
+  `fuse-synthetic/mock-cost-velocity-v1` with explicit estimated pricing
+  (50k input + 10k output = $0.175/call) and 700ms spacing, so four calls span
+  2.1s and cross the real unchanged `$0.50/60s` default. A fake clock keeps
+  tests sub-second. New end-to-end tests run each named scenario through
+  `runAnalyzerVerifier` and the real default detector functions, asserting the
+  exact fired set: loop -> loop-signature, context-bloat -> context-bloat,
+  cost-velocity -> cost-velocity; normal fires none. Evidence: focused SDK
+  74/74, OTel 28/28, detectors 44/44, and broken-agent 37/37; `pnpm run
+  check` passed format, lint, all builds/typechecks, and 564/564 unit tests;
+  broken-agent's real-Postgres integration suite passed 4/4; package packing
+  validated all three public tarballs; `pnpm audit --prod --audit-level high`
+  found no known vulnerabilities. Post-change review found no production-
+  default change and no raw-content export. Residual limitations: Jaccard is lexical,
+  not semantic; low-information normalized text can collide; fixed-key output
+  is dictionary-guessable/linkable; process-local clustering is order/window
+  dependent; input beyond the documented 32 KiB/512-token caps is ignored;
+  caller-provided structural labels are required to preserve progress reliably.
 - 2026-07-21: Brief reviewed; governance/tracker files created; Git initialized
   on `main`; repository-local `user.name` and `user.email` verified as
   `Vedant817` and `vedantmahajan271@gmail.com`. Initial commit evidence is in
@@ -2504,8 +2541,8 @@ Add dated entries here rather than leaving important context only in chat.
   attributed to actor `system:signoz-webhook:loop-signature` — verified
   independently via `docker exec ... psql`, not merely trusted from the
   script's own printed output. Measured latency and one genuine limitation
-  discovered are recorded in §4.5's own checklist entries above (231s and
-  331s across two clean single-scope runs; a third, overlapping-scope
+  discovered are recorded in §4.5's own historical checklist entries above
+  (multi-minute in two clean single-scope runs; a third, overlapping-scope
   attempt never fired at all, traced to SigNoz's rule `state` appearing to
   be per-rule rather than strictly per-group). Full clean-workspace
   verification after this slice: `pnpm run check` — 290 unit tests across
@@ -2670,10 +2707,9 @@ Add dated entries here rather than leaving important context only in chat.
   managed PostgreSQL/backup policy, registry image digest/scanner, external
   secret manager, and monitoring destinations before applying the generic
   Kubernetes base. These are environment ownership decisions, not code gaps.
-- **Accepted notification limitation:** enforcement/audit is durable, but
-  diagnosis/Slack has no durable outbox. A process crash immediately after a
-  committed trip can lose that notification; reconcile from
-  `breaker_audit_log`.
+- **Resolved notification limitation (2026-08-24):** trip audit and diagnosis
+  job acceptance are transactional. Delivery is at-least-once with leases,
+  retries, dead-letter listing, and audited replay.
 
 ### Decisions (2026-07-23, gap-closure session)
 
@@ -2917,3 +2953,900 @@ the earlier checkmarks:
   formatting, linting, every build, strict type checking, **454 unit tests**,
   and **88 integration tests**; `pnpm audit --prod --audit-level low`
   reported `No known vulnerabilities found`.
+
+### Release/build/deployment credibility repair (2026-08-24)
+
+- Forced every workspace build to discard only its own stale build metadata
+  before compilation and added the same stale-cache regression to CI. Local
+  reproduction retained 10 ignored
+  `tsconfig.tsbuildinfo` files, removed all 10 `dist` directories, then
+  `pnpm run build` regenerated all 10 outputs successfully.
+- Patched the 9 newly reported production advisories with narrow workspace
+  overrides (`fast-uri` 3.1.5/4.1.2, `ip-address` 10.3.1, `hono` 4.12.34)
+  and regenerated the lockfile. `pnpm install --frozen-lockfile` and
+  `pnpm audit --prod --audit-level low` both exited 0; the audit reported
+  `No known vulnerabilities found`.
+- Release now builds amd64 and arm64 candidates once, smoke-tests those exact
+  local images (migration CLI, hardened runtime, liveness, readiness), and
+  authenticates/pushes only afterward; the multi-architecture manifest is
+  assembled from those tested platform tags rather than rebuilt during
+  publish. Local equivalent evidence: amd64 image
+  `sha256:f73eabaac3a753b25a927e65346dabb44438086a4d3960644e07a394acfbbc0b`
+  and arm64 image
+  `sha256:245a0586c10d25b8d0de3c5e5b5c5761a925e904e26b5820507a561b4d33b803`
+  both applied migrations `0001` through `0004`, ran as `node` with a
+  read-only root, all capabilities dropped and `no-new-privileges`, and
+  returned 200 from `/healthz` and `/readyz`.
+- Startup and readiness now validate the complete required table/column set
+  and every required migration ledger entry. Five unit tests and two real
+  PostgreSQL integration tests pass; deleting the `0004` ledger row changed
+  readiness to 503 `schema_not_ready`, and restarting that exact image exited
+  1 instead of leaving an unlistening PID alive.
+- The Kustomize base now renders a distinctly named, suspended migration Job
+  template because plain `kubectl apply` has no migration-before-Deployment
+  ordering; the runnable standalone Job remains the explicit run-and-wait
+  path, and its completed immutable resource cannot collide with a later base
+  apply. `kubectl
+  kustomize | kubeconform v0.7.0 -strict -summary` validated all 11 resources
+  (11 valid, 0 invalid/errors/skipped). `actionlint` 1.7.7 passed both
+  workflows, and the canonical 201-line Apache-2.0 license text replaced the
+  prior abbreviated/non-canonical file.
+- Verification blocker outside this slice's ownership: the repository-wide
+  `pnpm run check` completes format, lint, every build, and every typecheck,
+  but currently fails 5 concurrent `services/broken-agent/src/
+  analyzer-verifier.test.ts` assertions. The new default fail-closed step
+  reporter returns `breaker-tripped` where those tests expect normal/safety
+  completion. The owned control-plane suites are green: 160 unit tests and 55
+  PostgreSQL integration tests. No commit or push was made per the explicit
+  request, so GitHub release execution/registry digest evidence remains
+  pending.
+
+### Distributed production rate limiting (2026-08-24)
+
+- Replaced the production-unsafe replica-local limiter with
+  `@fastify/rate-limit`'s documented ioredis integration. Production config now
+  requires `CONTROL_PLANE_RATE_LIMIT_REDIS_URL`, and `buildApp` independently
+  requires a connected `ready` Redis client; local/test still deliberately use
+  the plugin's in-memory store when no URL/client is supplied.
+- The Redis client uses a 2-second connect timeout, one retry per command, two
+  bounded reconnect attempts, no offline queue, and explicit startup `PING`.
+  Startup refuses to listen when Redis is unavailable; runtime storage errors
+  fail requests closed because `skipOnError` is explicitly `false`. Graceful
+  shutdown drains HTTP and diagnosis work, closes Redis, then closes PostgreSQL
+  and OTel.
+- Limiter keys never retain raw bearer credentials: authenticated keys contain
+  a stable, fixed-size SHA-256 base64url digest; health/unauthenticated requests
+  use IP. The 429 contract now returns stable `rate_limited` rather than being
+  rewritten to `invalid_request`.
+- Real Redis evidence (`redis:7.4.2-alpine`, generic Testcontainers): two
+  independent Fastify/ioredis instances shared one credential counter; the
+  third aggregate request returned 429; Redis contained one hashed key with no
+  token substring; health stored an IP key; stopping Redis caused runtime
+  requests to fail closed and a fresh client to reject startup within the
+  bounded window.
+- Verification: control-plane build and strict typecheck exited 0; 172/172 unit
+  tests and 57/57 integration tests passed; focused ESLint and Prettier passed;
+  `pnpm audit --prod --audit-level low` reported no known vulnerabilities;
+  OCI Compose `config --quiet` and `kubectl kustomize` passed. `kubeconform`
+  strict validation was not rerun because that executable is unavailable on
+  this host. No commit or push was made per the explicit request.
+
+### Epoch-bound SigNoz detector episodes (2026-08-24)
+
+- Replaced timestamp/current-state supersession inference with an immutable
+  source breaker epoch. `/v1/detectors/observe` reads one baseline breaker
+  record, emits `fuse.detector.score` and `fuse.detector.fired` with
+  `fuse.source_epoch`, and binds its direct CAS trip to that same epoch. If two
+  detectors fire from one window they retain the same metric epoch and at most
+  one direct transition is committed.
+- All three SigNoz detector rules now group by `fuse.source_epoch`, preserving
+  the episode in alert labels. The mapper accepts dotted/underscored keys but
+  only canonical base-10, nonnegative safe integers. Legacy/malformed unbound
+  firing alerts return stable `unbound-alert` without reading or mutating
+  breaker state.
+- The webhook passes the immutable source epoch as `expectedEpoch` and no
+  longer reads mutable current state or retries with `current.epoch - 1`.
+  Delayed epoch N delivery after direct trip plus authorized resume at N+2 is
+  rejected `stale-epoch`; the same epoch N alert trips as fallback when an
+  injected direct commit outage leaves state at N. Exact duplicate delivery
+  replays the original durable result with an unchanged request hash.
+- SigNoz fingerprints are hashed with the episode identity into a 71-character
+  `signoz:<sha256>` correlation/idempotency value before persistence. A 20,000
+  character fingerprint test proves both fields remain within the existing
+  200-character contract limit.
+- Verification: contracts unit suite 70/70; control-plane unit suite 186/186;
+  broken-agent unit suite 33/33; focused real-Postgres webhook integration
+  17/17; contracts/control-plane/broken-agent builds and strict typechecks all
+  exited 0; focused ESLint and Prettier passed. The three SigNoz JSON artifacts
+  passed Prettier parsing/format validation; live SigNoz rule re-provisioning
+  was not run in this slice. No commit or push was made per explicit request.
+
+### Diagnosis delivery operations hardening (2026-08-24)
+
+- Active diagnosis deliveries now renew their PostgreSQL lease every third of
+  the configured lease duration. Renewal is ownership- and expiry-conditional,
+  timers stop and in-progress renewals drain before completion, and a rejected
+  or failed renewal is treated as lost ownership: the stale worker does not
+  complete or retry the job. Real-PostgreSQL coverage proves renewal prevents a
+  second worker reclaim and expired owners cannot finalize work.
+- Slack `chat.postMessage` now receives a deterministic UUID-shaped
+  `client_msg_id`, derived by SHA-256 from the durable breaker audit plus
+  correlation identity and bounded to 36 characters. Retries and dead-letter
+  replay therefore cannot create provider-level duplicate incident cards even
+  if Slack accepted a request before Fuse lost its lease/response.
+- Added low-cardinality OTel instruments:
+  `fuse.diagnosis.queue.jobs` (`pending`/`running`/`dead-letter` only),
+  `fuse.diagnosis.delivery.latency`, and
+  `fuse.diagnosis.delivery.attempts` (finite outcome only). No tenant, audit,
+  worker, attempt number, or correlation identity is used as a metric label.
+- Added operator-only `GET /v1/diagnosis/jobs` with bounded filters, limit
+  1-100, stable keyset cursor pagination, and tenant token binding. Added
+  `POST /v1/diagnosis/jobs/{auditEventId}/replay`, requiring the exact scope,
+  manual actor, bounded reason, and idempotency key. Migration `0007` stores an
+  immutable replay audit. Transaction-level idempotency serialization makes a
+  duplicate request return the original result; pending, running, and succeeded
+  jobs cannot be replayed, and a cross-tenant scope is indistinguishable from a
+  missing job. OpenAPI and `.env.example` reflect the operations and worker
+  bounds.
+- Verification: edited package/control-plane builds and strict typechecks
+  exited 0; diagnosis unit 49/49; OTel unit 27/27; diagnosis-focused
+  control-plane unit 41/41; diagnosis store real-PostgreSQL integration 12/12;
+  complete control-plane integration 58/58; repository-wide ESLint and Prettier
+  checks passed; `git diff --check` passed (line-ending warnings only). The full
+  control-plane unit command currently has one unrelated concurrent failure in
+  `routes/health.test.ts`: its stale-ledger fixture removes current final
+  migration `0006` but still expects missing `0004`. This slice did not alter
+  that shared readiness test. No commit or push was made per explicit request.
+
+### Release workflow integrity completion (2026-08-24)
+
+- The release publisher now validates an OCI-compatible SemVer-like version
+  before any build (`v0.1.0` and prereleases accepted; empty, `latest`, build
+  metadata, leading-zero, and malformed values rejected). Every release run is
+  globally serialized because version and commit tags share registry state.
+- Each amd64/arm64 candidate is built exactly once with embedded BuildKit
+  attestations disabled, then smoke-tested before registry authentication. Each
+  architecture gets a fresh PostgreSQL database, applies all seven migrations
+  through `0007_diagnosis_job_replays.sql`, and starts with
+  `CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production`, the checked-in detector
+  policy, shared Redis, and an exact tenant/environment/agent-bound credential.
+  Readiness and an armed permit must pass, while that credential's wrong-scope
+  permit must return 403.
+- After smoke, the workflow authenticates and fail-closes unless it can prove
+  all six destination tags are absent. It then pushes only the tested local
+  platform images and creates version/commit manifests from those tags. The
+  final manifest must contain exactly two entries (`linux/amd64` and
+  `linux/arm64`), and both aliases must resolve to the same digest.
+- Release evidence now includes the pre-existing source CycloneDX SBOM plus a
+  final-image SPDX SBOM. Pinned official GitHub actions publish build-provenance
+  and SBOM attestations with the final manifest digest as subject and registry
+  referrers enabled. The publish job alone receives `packages: write`,
+  `attestations: write`, and OIDC `id-token: write`; all other permissions remain
+  read-only.
+- Production policy is now one JSON source consumed by release smoke,
+  Kustomize's generated ConfigMap, and OCI Compose. Kubernetes and the migration
+  template render with a digest placeholder, OCI Redis is digest-pinned, and the
+  deployment runbook uses exact-scope agent credentials, the Redis secret, a
+  verified manifest digest, and explicit migrate -> wait -> deploy ordering for
+  the current seven migrations.
+- Added `pnpm run test:release-workflow`, which YAML-parses both workflows and
+  locks in action SHA pins, least permissions, service/config/smoke requirements,
+  non-publishing candidate builds, tag refusal ordering, exactly-two-platform
+  assembly, digest-bound attestations, source-SBOM retention, and positive/
+  negative version fixtures. CI and release verification both run it.
+- Verification: native `actionlint` was absent, so the official
+  `rhysd/actionlint:1.7.7` container checked both workflows with zero findings;
+  Ruby/Psych parsed both YAML files; the structural test passed; `kubectl
+  kustomize infra/production/kubernetes` and digest-populated OCI Compose
+  `config --quiet` passed; `pnpm run check` passed formatting, lint, all builds,
+  strict typechecks, and 553/553 unit tests; schema readiness's focused unit
+  tests passed 48/48 and its real-PostgreSQL integration passed 2/2; `pnpm audit
+  --prod --audit-level low` reported no known vulnerabilities.
+- Final-image evidence: a fresh linux/amd64 production image applied exactly
+  seven migration ledger rows (`0001` through `0007`), ran as `node` with a
+  read-only root, all capabilities dropped and `no-new-privileges`, returned
+  200 from `/healthz` and `/readyz`, registered and permitted the exact
+  `release-tenant/production/release-agent` scope, and returned 403 when the
+  same agent credential requested `wrong-agent`. Isolated smoke containers,
+  network, and image were removed afterward.
+- GitHub/GHCR-only evidence remains impossible locally: no manifest or tag was
+  published, so registry collision behavior under GHCR's real error responses,
+  final multi-architecture digest equality, OIDC issuance, GitHub artifact
+  storage records, registry attestation referrers, and `gh attestation verify`
+  cannot be observed until an authorized workflow run. No commit or push was
+  made per the explicit request.
+
+### Public documentation and diligence reconciliation (2026-08-24)
+
+- Rewrote product, architecture, demo, security, operations, incident,
+  limitations, deployment, and API documentation around the current direct
+  detector hot path, epoch-bound SigNoz fallback, exporter-role-reported Preflight,
+  exact-scope production agent credentials, shared Redis, and durable diagnosis
+  queue. ADR-014 supersedes the earlier trigger ordering while preserving the
+  historical brief and provisioning ADRs.
+- Added sourced product strategy, a 30-day design-partner pilot, and a funding
+  diligence document. Customer outcomes, production usage, detector quality,
+  pricing, and ROI remain explicitly unverified hypotheses.
+- Validation: README is 220 lines; targeted and repository-wide Prettier passed;
+  Markdown local-link, documented-path, package-script, OpenAPI YAML, and 134
+  OpenAPI reference checks passed; stale-claim scans returned no matches.
+  `pnpm run check` passed format, lint, build, typecheck, and 564 unit tests.
+  `pnpm run test:integration` passed 121 tests, including real PostgreSQL and
+   Redis. `pnpm run test:package-consumer` built and consumed tarballs for
+   `@fuse/contracts`, `@fuse/otel`, and `@fuse/sdk`. No commit or push was made
+   per the explicit request.
+
+### Release publication and SBOM evidence hardening (2026-08-24)
+
+- Release is now manual-dispatch only. The source guard requires
+  `refs/heads/main`, verifies checkout equals `GITHUB_SHA`, fetches
+  `origin/main`, and requires the release commit to be its ancestor before
+  dependency installation or build. The privileged publisher uses the GitHub
+  `release` Environment; remote environment branch restrictions/reviewer rules
+  must be configured in repository settings.
+- Both exact local architecture candidates are built, production-smoked, and
+  scanned before GHCR authentication. The scanner action is SHA-pinned, Grype is
+  explicitly pinned to `v0.110.0`, high/critical findings fail an explicit
+  two-architecture gate, and both reports are retained even when the gate fails.
+  Successful candidates use only run/attempt-specific `staging-*` tags. Their
+  two-platform staging manifest, final-image SBOM, digest-bound attestations,
+  and retained evidence must all succeed before the only consumer-alias mutation
+  step promotes version, commit, and stable `latest` aliases.
+- Immutable-alias preflight accepts an absent alias or the exact candidate
+  digest, making partial/exact-digest reruns resumable, and rejects an existing
+  version or commit alias pointing elsewhere. Prereleases do not update
+  `latest`. Release input is normalized to `v`-prefixed SemVer and must match the
+  first dated changelog release beneath an empty `[Unreleased]`; current release
+  notes are labeled `0.2.0`.
+- Removed `docs/sbom.cdx.json`: its July point-in-time contents had drifted while
+  retaining an authoritative-looking path. CI/release now generate run-bound
+  CycloneDX workspace and SPDX image evidence. `validate-sbom.mjs` rejects an
+  empty/wrong-format BOM and requires expected runtime components; the image
+  check additionally requires deployed Fuse packages.
+- Local commands/results: `pnpm run test:release-workflow` passed all structural
+  invariants plus negative workflow, changelog, promotion-conflict, version, and
+  incomplete-SBOM fixtures. `docker run --rm -v "${PWD}:/repo" -w /repo
+  rhysd/actionlint:1.7.7 .github/workflows/ci.yml
+  .github/workflows/release.yml` exited 0 with no findings. `npx --yes
+  @cyclonedx/cdxgen@12.8.1 --type js --required-only --fail-on-error
+  --no-install-deps --spec-version 1.6 ...` exited 0, and the validator accepted
+  45 workspace components with every expected third-party runtime component.
+  Fresh amd64 `docker build --pull ... --tag
+  fuse-control-plane:release-evidence .` and arm64 `docker buildx build
+  --platform linux/arm64 --provenance=false --sbom=false --load ...` commands
+  both exited 0. Pinned Syft image digest
+  `sha256:5999d209a342e55e9edf70bf8930fb5b86d8f2a783fa401178372c50e21b1d36`
+  generated its SPDX 2.3 BOM; validation accepted 424 image components including
+  the expected Fuse and third-party runtime packages. `pnpm audit --prod
+  --audit-level low` reported `No known vulnerabilities found`.
+- Repository gate: the first `pnpm run check` reached unit tests after format,
+  lint, build, and typecheck but hit nine unrelated first-test 5-second timeouts
+  in the concurrently-started control-plane suite while the host was under
+  container scan/build load. The unchanged focused control-plane rerun passed
+  207/207, and the exact full `pnpm run check` rerun then exited 0: formatting,
+  lint, all builds/typechecks, 602 workspace unit tests, three SigNoz contract
+  tests, and two deployment contract tests passed.
+- **Release-blocking local result:** pinned Grype `v0.110.0` image digest
+  `sha256:af65fbc0c664691067788fe95ff88760b435543e45595eb2ca6f102fc476fbe1`
+  against each fresh amd64 and arm64 image exited 1 under `--fail-on high`, as
+  the workflow now will. Findings include fixable high/critical issues in Node
+  `24.14.0`, Alpine OpenSSL/musl, and npm-bundled `tar`/`minimatch` dependencies.
+  Remediation requires Dockerfile/base/dependency changes outside this
+  release-owned slice; publication intentionally remains blocked rather than
+  accepting or hiding the findings.
+- Remote-only checks remain: configure/verify the protected `release`
+  Environment; run from pushed `main`; observe GHCR staging and immutable-alias
+  conflict behavior, exact-digest rerun recovery, final amd64/arm64 manifest
+  equality, artifact retention, OIDC issuance, registry attestation referrers,
+  and `gh attestation verify`. No registry login, tag, attestation, commit, or
+  push occurred in this slice.
+
+### Strict operator mutation epoch binding (2026-08-24)
+
+- `resume`, `disable`, and `enable` now require a nonnegative safe-integer
+  `expectedEpoch` at the contract/OpenAPI boundary and pass it to the store CAS;
+  no force/unbound bypass exists. Exact idempotency replay is checked before
+  epoch comparison, while a new stale request returns structured `stale_epoch`.
+- Real-PostgreSQL evidence: breaker-store 20/20 passed, covering delayed
+  disable/enable, resume then retrip, historical exact replay, and 8-way
+  concurrent duplicates for all three actions. Focused control-plane tests 3/3,
+  webhook 17/17, SDK resume 1/1, Slack action 17/17, and Slack route 15/15 passed.
+  Contracts passed 81/81; touched-file ESLint/Prettier and breaker-store/
+  contracts build+typecheck passed; OpenAPI parsed with 152 references resolved.
+- Existing concurrent-work blockers remain outside this slice: full
+  control-plane integration has one Preflight 500, and control-plane/SDK/
+  broken-agent typechecks fail in detector-observation, Preflight-store, Redis
+  health-mock, and reporter types. No commit or push was made per request.
+
+### Diagnosis and operator-facing truthfulness (2026-08-24)
+
+- Replaced the incident diagnosis's absolute provider-dispatch claim with the
+  enforceable boundary: subsequent guarded permit checks are denied after a
+  committed trip. The card now also states that already-permitted calls may
+  complete and unguarded calls are outside Fuse enforcement.
+- Real diagnosis delivery reads the current committed Preflight result from the
+  same control plane's authenticated status route. The query carries the exact
+  incident tenant/environment/agent scope and the tenant-matching operator
+  credential, validates the returned scope, and renders `unknown` rather than
+  implying protection on no result, timeout, malformed/mismatched data, 429, or
+  store failure. Slack and local incident snapshots render the same state.
+- Fixed the incomplete `@fuse/sdk` and `@fuse/contracts` package introductions.
+  OpenAPI now documents the reusable global 429 response on all 17 operations;
+  health probes and Slack callbacks are explicitly not exempt.
+- Verification: diagnosis unit tests passed 52/52; focused diagnosis worker and
+  dispatcher tests passed 35/35, including tripped-card wording, degraded,
+  blind, unknown, exact-scope credential selection, missing-state 404, and store
+  503 behavior. Diagnosis build/typecheck, focused ESLint, focused Prettier, and
+  Ruby OpenAPI YAML parsing passed. The full control-plane typecheck remains
+  blocked by unrelated concurrent errors in detector fixtures, SDK test module
+  resolution, health Redis mock types, and new Preflight sweeper/store methods;
+  none reference the diagnosis files. No commit or push was made per the
+  explicit request.
+
+### Execution-scoped detector truthfulness and public SDK path (2026-08-24)
+
+- Detector observations now carry a validated 1-128 character execution ID and
+  a discriminated pricing status. Unpriced/unknown models leave estimated cost
+  `null`, never semantic `$0`. The supported SDK keeps a separate 200-step
+  trailing history and canonicalizer per execution, capped at 100 active
+  executions with one-hour idle/oldest eviction; explicit reset/end APIs release
+  lifecycle state. Legacy direct-API numeric observations remain accepted for
+  existing integrations, but the public step schema and SDK path require the new
+  identity and pricing fields.
+- `FuseGuard.runStep` is the supported permit -> provider -> OTel -> local
+  canonicalize -> synchronous direct-report composition used by the broken-agent
+  fixtures and README. A post-paid report failure returns the provider result,
+  retains evidence, and latches fail-closed denial at the next pre-call boundary.
+  Per-execution detector status keeps loop-signature and context-bloat protected
+  when pricing is unavailable while marking cost-velocity degraded.
+- Tests cover concurrent interleaved executions without mixed request windows,
+  lifecycle reset/end/eviction, unknown pricing, packed public SDK usage,
+  next-call latching, and loop/context/cost fixture behavior. Verification:
+  `pnpm run typecheck` passed all 10 projects; `pnpm run test` passed 601 unit
+  tests; `pnpm --filter @fuse/sdk run test:integration` passed 11/11 against real
+  PostgreSQL/control-plane HTTP and provider counters; focused ESLint/Prettier
+  and `git diff --check` passed; `pnpm run test:package-consumer` built, packed,
+  installed, typechecked, and executed `@fuse/contracts`, `@fuse/otel`, and
+  `@fuse/sdk` from an isolated non-workspace fixture. No commit or push was made
+  per the explicit request.
+- Residual risk: intentionally supported legacy direct-API callers do not gain
+  execution isolation until they adopt the new fields; callers can still bypass
+  protection by dispatching outside `runStep`/`guard`, and calls already past a
+  permit remain in flight. Pricing remains a static estimate table rather than
+  invoice reconciliation.
+- Aggregate `pnpm run check` reached repository-wide ESLint and stopped on the
+  unrelated concurrent release validator (`tools/release/validate-workflow.mjs:26`,
+  `structuredClone` reported by `no-undef`); the touched-file ESLint command
+  passed. The broken-agent integration suite passed the three permit/direct-
+  detector paths but retained its existing Preflight rejected-export failure
+  (status 404 instead of the expected blind result), outside this slice's
+  explicitly excluded Preflight reporter/store/routes ownership.
+
+### Redis health semantics and operational security (2026-08-24)
+
+- Health probes now bypass rate-limit storage. `/healthz` remains dependency-free
+  HTTP 200 during a Redis outage; production `/readyz` performs a bounded 750 ms
+  Redis `PING` before PostgreSQL/schema checks and returns structured HTTP 503
+  `{status:"not-ready",reason:"rate_limit_store_unavailable",dependency:"redis"}`.
+  Normal API traffic still uses `skipOnError: false`, and ioredis commands have a
+  one-second timeout in addition to bounded connect/request retries.
+- Real `redis:7.4.2-alpine` failure injection paused Redis under one running
+  control-plane process. Liveness stayed 200, readiness returned the Redis 503,
+  an actual `FuseGuard` in fail-closed mode left its provider callback uncalled,
+  and a fresh startup client refused service. Unpausing Redis restored readiness
+  and guarded provider dispatch through the same process/client without restart.
+- SigNoz provisioning now updates existing rules by ID rather than skipping
+  them, refetches persisted rules, and verifies every checked-in grouping. All
+  three detector contracts require and round-trip `fuse.source_epoch`.
+  Placeholder Slack Incoming Webhook URLs are rejected. API bodies are stored
+  only under a mode-0700 temporary directory and are never printed on failure;
+  request payloads use files rather than secret-bearing command arguments.
+- Production bearer credentials are independently required to contain at least
+  32 bytes by `loadConfig` and direct `buildApp` construction; deployment
+  examples generate 32 random bytes with `openssl rand -hex 32` and include a
+  no-value-printing production-env validator. Kubernetes and OCI Compose use
+  separate runtime/migration/maintenance secrets. Distinct tokenless service
+  accounts, DDL/DML/maintenance database role guidance, and a DNS/PostgreSQL-only
+  database-job NetworkPolicy constrain authority as far as checked manifests
+  can enforce it.
+- Verification: control-plane build and strict typecheck passed; 207/207
+  control-plane unit tests passed; focused health/rate-limit integration passed
+  4/4 against real PostgreSQL and Redis; SigNoz script contracts passed 3/3;
+  deployment secret/identity/network contracts passed 2/2; focused ESLint and
+  Prettier passed; `bash -n infra/signoz-alerts-up.sh`, `kubectl kustomize`, OCI
+  Compose `config --quiet`, and generated production config validation passed;
+  `pnpm audit --prod --audit-level low` reported no known vulnerabilities.
+- External residual validation: the provisioner was not applied to a live SigNoz
+  instance, so the pinned v0.133.0 server's real `PUT` response and persisted
+  `source_epoch` round-trip remain a deployment-time check. Target-cluster
+  admission, external PostgreSQL role grants, managed Redis TLS/auth/HA, and
+  secret-manager delivery also require environment-owner validation. No commit
+  or push was made per the explicit request.
+
+### Preflight liveness and multi-source correctness (2026-08-24)
+
+- Migration `0008_preflight_source_evidence.sql` now persists bounded structural
+  exporter evidence independently by tenant/environment/agent/source instance.
+  Monotonic sequence orders callbacks only within one source. PostgreSQL receipt
+  time drives liveness, so unrelated reporter wall clocks never supersede each
+  other. `compareExporterDeliverySignals` retains its public signature but now
+  returns `0` for distinct source instances (not comparable), replacing the
+  previous cross-source wall-clock total order.
+- The scope result is the worst active source result. A source remains active
+  for twice `preflightMaxEvidenceStalenessMs`, ensuring a dead/failing process
+  becomes stale and cannot be hidden immediately by a healthy peer; after that
+  retirement window a live peer may recover through the existing dwell. If no
+  source remains active, revalidation is blind. `GET /v1/preflight/status` now
+  performs persisted-evidence revalidation using database time before replying.
+  The existing report `revalidate` field remains accepted for compatibility,
+  but correctness no longer depends on a reporter issuing it.
+- The real server starts one non-overlapping Preflight sweeper after listen and
+  stops it through Fastify close. Each pass is capped at 100 oldest aggregate
+  rows and rotates work by committed `evaluated_at`; failures are contained and
+  retried by the next interval. Opening/recovery metric events are derived under
+  the same aggregate row lock and emitted only when that durable aggregate edge
+  is returned, whether the trigger is a report, status read, or sweep.
+- `PreflightReporter` now keeps one newest unacknowledged exporter result and one
+  in-flight request, with a 2,000-sample queue cap, 60 KiB serialized-body cap,
+  two-second hard request timeout, capped exponential backoff with jitter, and a
+  three-second drain bound. A fetch implementation that ignores `AbortSignal`
+  blocks further underlying requests instead of creating an unbounded pile; its
+  eventual settlement resumes delivery of the coalesced newest result.
+- Verification: contracts 81/81 unit; breaker-store 31/31 unit and 51/51 real-
+  PostgreSQL integration (including 18/18 Preflight store cases); SDK 86/86 unit
+  and 11/11 real-HTTP/PostgreSQL integration; control-plane 207/207 unit and
+  60/60 PostgreSQL/Redis integration. Focused tests cover reporter death using
+  PostgreSQL time, two active sources, cross-source clock skew, 503 then recovery
+  of failed-export evidence, sustained samples behind a hung fetch, exact body
+  size, bounded drain, non-overlapping bounded sweeps, read-time revalidation,
+  one opening/recovery metric edge, and migration readiness. Contracts,
+  breaker-store, SDK, and control-plane builds and strict typechecks passed;
+  touched-file ESLint and repository-wide Prettier passed; `git diff --check`
+  passed with line-ending warnings only.
+- Repository-wide `pnpm run check` passed formatting, then stopped at the
+  explicitly out-of-scope release validator
+  `tools/release/validate-workflow.mjs:26` (`structuredClone` reported undefined
+  by ESLint `no-undef`). Per the explicit ownership boundary, release workflows
+  and release tooling were not changed. Consequently the current release smoke
+  loop still names migrations only through `0007`; an owner must add `0008`
+  before that workflow can produce a ready image. Operations/deployment prose
+  that calls `0007` the latest migration is likewise stale.
+- Residual risks: no load test establishes how quickly the fixed batch-100
+  sweeper revisits very large multi-tenant scope sets; metric transport is not a
+  durable outbox, so a process crash after the DB commit but before OTel records
+  the edge can lose that metric; source-instance rows do not yet have a retention
+  policy and can grow with repeated process restarts. The twice-staleness active
+  window is deliberately conservative but may delay recovery from a dead peer.
+   No commit or push was made per request.
+
+### Provisional operational SLO metrics and SigNoz rules (2026-08-24)
+
+- Added infrastructure-wide, bounded-cardinality OTel instruments for permit,
+  detector observation, webhook, diagnosis lease renewal, Redis readiness,
+  and Preflight evaluation/sweep health. Tenant, agent, source epoch, job,
+  token, alert, and correlation identity are excluded from these SLO series;
+  existing scoped product metrics remain separate.
+- Added the versioned SigNoz v5/v2alpha1 artifact
+  `infra/signoz/alerts/operational-slos-v1-provisional.json` and a dedicated
+  resolved-capable `fuse-operations` Slack channel. Traffic rules treat absence
+  as idle; diagnosis queue, Redis, and sweeper health treat five missing
+  evaluations as no-data. Operational alerts cannot call the breaker webhook or
+  resume state.
+- Added static provisioning contracts that align every rule metric with
+  `packages/otel/src/metrics.ts`, reject unbounded infrastructure groupings,
+  prove explicit no-data policies, and verify persisted metric/version/schema/
+  no-data fields. The operations and deployment runbooks record provisional
+  targets, triage, cardinality caps, provisioning, and rollback-safe semantics.
+- Verification: `@fuse/otel` unit tests passed 31/31; focused control-plane
+  call-site tests passed 28/28 plus the authenticated-hook test 1/1; SigNoz
+  static/provisioning contracts passed 4/4; the OTel build and strict typecheck,
+  focused ESLint/Prettier, `bash -n infra/signoz-alerts-up.sh`, and
+  `git diff --check` passed. The aggregate control-plane unit run reached
+  208 passing tests but retained three concurrent exporter-credential fixture
+  failures; control-plane build/typecheck is independently blocked by a
+  duplicate property in the concurrently added
+  `slack-interactive.integration.test.ts:44`. Neither blocker is in this
+  slice's auth/release ownership, so it was not changed. Live application to
+  SigNoz v0.133.0 remains a deployment-time round-trip check. No commit or push
+  was requested.
+
+### Distributed webhook and Slack control-path race evidence (2026-08-24)
+
+- `webhook.integration.test.ts` now constructs two independent `buildApp`
+  replicas with separate pools sharing one real PostgreSQL container. Concurrent
+  identical SigNoz delivery returns the same durable result from both replicas
+  and produces exactly one armed-to-tripped audit and one diagnosis job. A
+  coordinated direct-detector baseline read races the epoch-matched SigNoz
+  fallback through the real store mutation path; either source may win, but the
+  final state is epoch 1 with one transition/job, and exact webhook replay is
+  stable. A delayed epoch-0 alert delivered only after resume and an epoch-2
+  retrip is durably stale, replays identically, and leaves the epoch-3 incident
+  plus both diagnosis jobs intact.
+- Added `slack-interactive.integration.test.ts`: two listening `buildApp`
+  replicas receive real HMAC-signed `application/x-www-form-urlencoded` Slack
+  submissions and call the real authenticated resume API against shared
+  PostgreSQL. Concurrent duplicate view IDs create exactly one Slack resume
+  audit; different view IDs racing one trip epoch permit exactly one resume and
+  return a stable stale-epoch modal error for the loser; an old card after
+  resume/retrip cannot alter the later episode. Exact tenant-token selection is
+  proven with same-agent-id scopes in two tenants: tenant B resumes while tenant
+  A remains tripped with zero Slack resume audits.
+- Focused verification before a concurrent out-of-scope Preflight edit:
+  `pnpm exec vitest run services/control-plane/src/webhook.integration.test.ts`
+  passed 20/20 and `pnpm exec vitest run
+  services/control-plane/src/slack-interactive.integration.test.ts` passed 4/4.
+  Focused ESLint, Prettier, and `git diff --check` passed. No mocks replace final
+  breaker mutations, and no production webhook/Slack code changed.
+- Later aggregate verification is currently blocked before test collection by
+  the concurrently edited, explicitly out-of-scope Preflight contract:
+  `packages/contracts/src/preflight.ts:127` calls `.strict()` on the
+  `ZodEffects` returned by `.superRefine()`. The contracts build reports TS2339,
+  and `pnpm --filter @fuse/control-plane run test:integration` reports the same
+  runtime `TypeError` in all six collected integration files. Preflight code was
+  not changed in this slice. No commit or push was made per request.
+
+### Enforcement E2E and permit-race closure (2026-08-24)
+
+- Replaced the broken-agent's direct operational-trip simulation with a
+  parameterized real-PostgreSQL, listening-control-plane, listening-model-server
+  proof for `loop-signature`, `context-bloat`, and `cost-velocity`. Every paid
+  request runs through `FuseGuard.runStep`, carries an execution ID, reports its
+  complete bounded window to `/v1/detectors/observe`, and stops with zero
+  additional provider requests. The captured acknowledgment fires only the
+  expected detector and carries non-empty structural evidence; a joined
+  `breaker_state`/`breaker_audit_log`/`diagnosis_jobs` query proves the trip and
+  diagnosis evidence committed first with the matching
+  `system:detector:<detector>` actor, version, score, and threshold.
+- Replaced the direct-provider in-flight simulation with an actual guarded race.
+  Controllable permit, commit, and provider barriers start eight guarded calls:
+  three complete permits before the atomic trip and may cross the real provider
+  HTTP boundary afterward; five attempts begun concurrently but released only
+  after commit are denied. A ninth post-commit call is also denied. The listening
+  provider records exactly three requests, all attributable to pre-commit
+  permits; no test dispatch bypasses `FuseGuard`.
+- Paused the real PostgreSQL container after one paid provider call and reported
+  retained firing context-bloat evidence. Reporting timed out without replacing
+  the paid result; the next guarded call failed closed with zero provider
+  requests. After PostgreSQL recovery, the first attempt was the mandatory
+  recovery barrier, retained evidence committed one attributed trip/diagnosis
+  row, and the following permit remained denied by durable tripped state.
+- Focused strict typechecking exposed a real SDK compile bug in the concurrently
+  added exporter-evidence credential path: `FuseGuard` passed an explicitly
+  undefined optional property under `exactOptionalPropertyTypes`. The smallest
+  production fix conditionally omits `exporterEvidenceToken`; no other production
+  code changed.
+- Verification: SDK and broken-agent builds and strict typechecks passed;
+  focused ESLint and Prettier passed; `git diff --check` passed with line-ending
+  warnings only. With the ignored generated contracts artifact temporarily
+  corrected to match the intended strict-object-before-refinement ordering,
+  `pnpm --filter @fuse/sdk exec vitest run
+  src/guard.integration.test.ts` passed 8/8 and `pnpm --filter
+  @fuse/broken-agent exec vitest run
+  src/analyzer-verifier.integration.test.ts` passed 5/5. That generated-only
+  diagnostic change was restored and is not part of the worktree.
+- Aggregate clean-source execution remains blocked before test collection by the
+  pre-existing, out-of-scope `packages/contracts/src/preflight.ts:127`
+  `.superRefine(...).strict()` runtime error documented immediately above. Per
+  the explicit ownership boundary, the contracts source was not changed. No
+  commit or push was made per request.
+
+### Diagnosis crash, lease, and replay correctness (2026-08-24)
+
+- Replay idempotency no longer reads mutable diagnosis queue state. Both the
+  initial replay and every matching duplicate reconstruct the original pending,
+  attempt-zero response from immutable incident fields plus the existing replay
+  audit's PostgreSQL transaction timestamp. Duplicates after the job is claimed
+  and after it succeeds return the same original job snapshot. No migration
+  `0009` is needed: `diagnosis_job_replay_audit.created_at` already captures the
+  exact `now()` used by the transactional requeue, so readiness and migration
+  documentation remain unchanged.
+- Added process-level real-PostgreSQL crash evidence. A separate Node process
+  claims attempt one through `DiagnosisJobStore`, enters the real Slack client,
+  and blocks with `chat.postMessage` in flight. The test hard-kills that process
+  without dispatcher stop or lease release, waits for expiry, then starts the
+  production `DiagnosisDispatcher`. The replacement reclaims attempt two; the
+  crashed worker identity cannot complete it; both Slack requests carry the same
+  deterministic UUID-shaped `client_msg_id`; and the replacement succeeds.
+- Added real PostgreSQL renewal-outage evidence. The test stops the actual
+  Testcontainers PostgreSQL container while a delivery is blocked, observes the
+  dispatcher's renewal failure/lost-ownership path, health-aware restarts and
+  reconnects PostgreSQL, and proves the stale worker still cannot finalize. A
+  replacement reclaims attempt two and a controlled downstream failure reaches
+  the bounded dead-letter state with the delivery error preserved.
+- Focused verification: breaker-store build and strict typecheck passed;
+  control-plane build and strict typecheck passed; touched-file ESLint and
+  Prettier passed; diagnosis dispatcher unit tests passed 8/8 and diagnosis route
+  unit tests passed 4/4. With a temporary out-of-workspace Vitest setup that only
+  bypassed the pre-existing Preflight import-time defect, the diagnosis store
+  real-PostgreSQL suite passed 12/12 and the new process/PostgreSQL dispatcher
+  integration suite passed 2/2 together. The checked-in diagnosis tests contain
+  no such bypass.
+- Standard Vitest collection remains blocked by the explicitly out-of-scope
+  `packages/contracts/src/preflight.ts:127` call to `.strict()` on a
+  `ZodEffects` after `.superRefine()`, producing the documented runtime
+  `TypeError` before diagnosis tests load. Preflight was not changed. Residual
+  semantics remain deliberately at-least-once: deterministic Slack identity
+  allows provider deduplication, but Fuse cannot make an external provider's
+  acceptance and its PostgreSQL completion commit one atomic transaction. No
+  commit or push was made per request.
+
+### Separate exact-scope Preflight exporter evidence credential (2026-08-24)
+
+- Split the trust boundary into strict contracts and routes. Ordinary agent or
+  operator reporting to `POST /v1/preflight/report` may submit bounded structural
+  observations but the contract rejects `exporterDelivery`. Only
+  `POST /v1/preflight/exporter-evidence` accepts a bounded exporter result and
+  its structural batch, and only the new exporter-evidence credential class can
+  call it. Exporter credentials receive 403 on permit, detector, status,
+  webhook, and operator routes.
+- Production startup now requires
+  `CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS` with at least one complete
+  `tenant:environment:agentId:token` binding. Missing, partial, wildcard,
+  shorter-than-32-byte, duplicate-within-role, or raw-token-reused-across-role
+  credentials fail startup. Development/test may explicitly omit the role for
+  structural-only Preflight or configure an explicit wildcard; neither behavior
+  is a production default. Placeholder errors no longer echo any token value.
+- `PreflightReporter` and `FuseGuard` accept a separate
+  `exporterEvidenceToken`. Real OTel callbacks use that token and the exporter
+  route; without it the reporter sends only structural samples with the ordinary
+  agent token and cannot establish `protected`. The shared Redis-backed global
+  limiter includes exporter credentials under hashed bearer keys, so replica
+  scaling does not multiply the allowance and raw tokens are not stored in
+  limiter keys.
+- `.env.example`, README/SDK references, Kubernetes runtime-secret guidance,
+  OCI Compose's required external secret, deployment/operations runbooks,
+  OpenAPI, architecture, ADR-014, limitations, demo/pilot/strategy docs, and the
+  threat model describe the role split. Public wording now says
+  exporter-role-reported evidence, not cryptographic or server-verified proof.
+- Required abuse evidence passes against real PostgreSQL/control-plane HTTP:
+  ordinary-agent forged success is rejected without creating protected state;
+  a wrong-scope exact exporter token receives 403; an exact valid exporter
+  report establishes protected; and the exporter token receives 403 from permit
+  and operator status. Real Redis tests prove the exporter route shares one
+  hashed token-keyed limit across two replicas. The supported OTel runtime
+  integration reports success/failure through the separate credential.
+- Verification: `pnpm run check` passed repository formatting, ESLint, all 10
+  builds and strict typechecks, 614 unit tests, 4 SigNoz contracts, and 3
+  deployment contracts. `pnpm run test:integration` passed 143/143 tests across
+  OTel, breaker store, control plane, SDK, and broken agent. Focused control-plane
+  Preflight/Redis integration passed 20/20; SDK guard passed 8/8; broken-agent
+  runtime passed 5/5. Production config validation, OCI Compose `config --quiet`,
+  `kubectl kustomize`, OpenAPI YAML parsing with 163 references resolved, and
+  `git diff --check` passed. One full-run-only SDK race assertion incorrectly
+  required concurrent callback order; it now compares the same three callbacks
+  order-independently without weakening count/membership/zero-post-trip checks.
+- Residual trust assumption: a bearer credential authenticates possession of
+  the exporter capability, not which code generated a report. The supported
+  Node runtime is in-process, so a fully compromised agent that can read the
+  exporter token can fabricate success. Process separation reduces this risk
+  only when the exporter and secret are actually isolated from the agent OS
+  identity/container; compromise of that exporter process, host, or secret
+  manager remains authoritative. No commit or push was made per request.
+
+### Checked-in OpenAPI validation and runtime conformance gate (2026-08-24)
+
+- Added `tools/openapi/validator.mjs`, using only the already-locked `yaml`
+  package and Node built-ins. It rejects invalid/duplicate-key YAML, external or
+  unresolved `$ref` values, duplicate/drifted operation IDs, route-inventory
+  drift, missing effective authentication, and missing reusable globally
+  applicable 400/401/403/429/500 responses. It resolves all 183 current local
+  references and explicitly locks the exporter-evidence and diagnosis-replay
+  request/response contracts. Slack HMAC is modeled as its own security scheme
+  rather than an unauthenticated override, and bearer checks reject anonymous
+  OR-alternatives. Negative Node tests prove broken references, operation IDs,
+  authentication, global errors, and response bodies fail the gate.
+- Corrected a stale operation-count assumption: the current contract has 18
+  operations, not 17, after `/v1/preflight/exporter-evidence` was added. No live
+  operation is omitted to preserve the older count. The OpenAPI drift fixed in
+  this slice includes the missing Preflight-status 400, reusable generic 500s,
+  health/readiness's real rate-limit exemption, complete diagnosis-job replay
+  fields, and the detector route's strict execution-scoped
+  available/unavailable pricing forms. The latter was reconciled again after a
+  concurrent contract slice removed its legacy input during verification.
+- Added a dependency-free contract test that imports the built control plane,
+  exercises representative real `buildApp().inject()` responses, and validates
+  their documented status and JSON bodies directly against the OpenAPI schemas.
+  Covered: permit, detector observe, ordinary-agent forged exporter evidence,
+  valid exact-scope exporter evidence, diagnosis list/replay, unauthenticated and
+  cross-tenant denial, rate limiting, generic internal error, liveness, ready,
+  and not-ready. Store interfaces are deterministic fakes because this test
+  checks HTTP/OpenAPI conformance rather than persistence; no second schema
+  source or Docker dependency was introduced.
+- `pnpm run test:openapi` is part of root `check` and an explicit CI step.
+  Verification: focused OpenAPI validation passed 5 negative/static tests plus
+  1 runtime conformance test; `pnpm run check` passed formatting, ESLint, all
+  builds and strict typechecks, 616 workspace unit tests, OpenAPI validation,
+  and the existing SigNoz/deployment contracts. A 148/148 aggregate integration
+  run passed before two concurrent out-of-scope contract/migration slices
+  completed. Two post-concurrency aggregate reruns each exposed a different
+  unrelated load-sensitive assertion: the diagnosis store's 60 ms delayed-retry
+  check and the SDK's asynchronous exporter-callback/status check; their
+  unchanged suites passed immediately in isolation (12/12 and 8/8). The focused
+  OpenAPI gate remained green. No core behavior, dependency, commit, or push was
+  made.
+
+### Migration integrity and Preflight source retention (2026-08-24)
+
+- `schema_migrations` now stores the SHA-256 digest of every applied SQL file.
+  Under the existing session advisory lock, the runner adds the checksum column
+  to legacy ledgers, backfills null entries from the shipped files once, makes
+  the column non-null, and verifies the complete applied ledger before executing
+  pending SQL. An altered or missing historical file fails closed. Historical
+  migration SQL was not rewritten.
+- `/readyz` consumes the same on-disk migration manifest and requires the exact
+  set of IDs and checksums, in addition to required tables and columns. A stale
+  ID, unexpected ID, missing checksum column, or content mismatch returns
+  `schema_not_ready` rather than accepting connectivity alone.
+- Each bounded Preflight sweep now deletes at most its batch size of expired
+  `preflight_source_evidence` rows. The active-source TTL remains twice
+  `preflightMaxEvidenceStalenessMs`; retention is four times staleness, leaving
+  another full active-source TTL before deletion. PostgreSQL receipt time plus
+  `FOR UPDATE SKIP LOCKED` retains active/refreshed rows and lets replicas divide
+  cleanup safely; repeated capped passes drain rows left by process restarts.
+- Verification: migration unit tests passed 5/5 and health route unit tests
+  passed 8/8; breaker-store and control-plane builds and strict typechecks
+  passed; touched TypeScript ESLint and touched-file Prettier passed. Focused
+  real-PostgreSQL tests passed migration integrity 3/3, Preflight store 19/19,
+  and health readiness 3/3. The complete breaker-store real-PostgreSQL suite
+  passed 55/55, including the existing legacy concurrent-upgrade test, after
+  updating one diagnosis test fixture to restore its deleted ledger row with the
+  required checksum. The real-Redis health/rate-limit integration passed 2/2.
+  No commit or push was made per request.
+
+### Strict public detector observations and tarball consumer proof (2026-08-24)
+
+- Removed the unshipped legacy detector-observation schema and its inferred
+  compatibility path. Public input and normalized detector types now require a
+  bounded `executionId` and explicit `pricingStatus`; unavailable pricing remains
+  `null` at the public boundary and cannot be mistaken for a free call. Contract
+  tests reject omitted identity/status and inconsistent pricing values, and all
+  direct typed fixtures were updated.
+- Upgraded the isolated packed-tarball consumer to compile installed declarations
+  for `@fuse/contracts`, `@fuse/otel`, `@fuse/sdk`, `@fuse/sdk/otel`, and
+  `@fuse/sdk/providers`. Type-level negative checks prove the required fields,
+  manifest checks pin the intended export map and declaration targets, and the
+  installed runtime rejects the former payload.
+- Runtime proof uses listening `127.0.0.1` fake control-plane and OTLP HTTP
+  receivers. Default `FuseGuard.runStep` reporting receives a firing detector
+  acknowledgment, the next fresh permit is denied with the provider callback
+  count unchanged, a real `gen_ai` span reaches `/v1/traces`, and successful
+  exporter evidence reaches `/v1/preflight/exporter-evidence` with the separate
+  `exporterEvidenceToken`. Ordinary structural Preflight reporting also runs;
+  neither reporting nor OTel is disabled. Tarball installation remains
+  `--offline` against an unreachable registry while execution permits localhost.
+- Verification: detector-observation contracts passed 12/12; focused contract,
+  SDK reporter/guard, and control-plane detector tests passed 72/72; and the
+  direct caller PostgreSQL suites passed 44/44. `pnpm run
+  test:package-consumer` built all workspaces, validated all three tarballs,
+  strictly compiled the external consumer, and passed the complete localhost
+  runtime proof. The final `pnpm run check:full` passed repository formatting,
+  ESLint, every build and strict typecheck, 616 unit tests, OpenAPI validation
+  and conformance, four SigNoz contracts, three deployment contracts, and
+  148 real PostgreSQL/Redis/HTTP integration tests. `git diff --check` passed
+  with line-ending notices only. No commit or push was made per request.
+
+### Unreleased truthfulness and exact scratch-image release smoke (2026-08-24)
+
+- Moved the previously dated `0.2.0` notes back under `[Unreleased]`. The
+  workspace/package manifests truthfully remain `0.1.0`; source-built container
+  metadata now defaults to `dev`. Release validation rejects the current
+  changelog and requires a maintainer to create a non-empty dated section for
+  the exact requested version before publication. Deployment examples use
+  `vX.Y.Z` placeholders and state that Unreleased notes are not pullable.
+- The release candidate smoke now runs before any registry authentication on
+  both exact loaded amd64/arm64 candidates. Each gets a fresh database and all
+  migrations through `0008_preflight_source_evidence.sql`, production policy,
+  shared Redis, and three independent exact-scope agent credentials plus three
+  distinct exporter-evidence credentials. A host-side verifier registers fresh
+  loop/context/cost scopes, reports exporter success, submits one isolated
+  firing window per detector, and requires only the matching detector to trip,
+  the next permit to remain denied, and one matching durable diagnosis job.
+- The same pre-auth smoke asserts UID/GID `1000:1000`, a configured healthcheck,
+  embedded Node `v24.19.0`, and failure to execute `/bin/sh`. It pauses Redis and
+  verifies liveness 200, structured readiness 503, non-2xx permit behavior, and
+  in-process recovery. PostgreSQL uses bounded stop/start rather than pause
+  because a frozen established TCP connection cannot deliver its server-side
+  statement timeout; it likewise requires liveness 200, structured readiness
+  503, non-2xx permit behavior, restored readiness, and the durable tripped
+  denial after recovery. Structural tests require the exact Node 24.19 immutable
+  digest, scratch/no-shell runtime, migration 0008, separate exporter role, all
+  three detectors, diagnosis/denial assertions, dependency failure injection,
+  Grype `v0.110.0` with `only-fixed: false` and no exclusions, and smoke/scan
+  ordering before GHCR login.
+- Local exact-image evidence: `docker buildx build --platform linux/amd64
+  --provenance=false --sbom=false --load --pull --build-arg VERSION=dev ...`
+  produced image ID
+  `sha256:0cb5e78e53b8c54c77b171c073b48271b70947707273933274d1b475bc9c1758`.
+  The scratch image applied exactly migrations `0001` through `0008`, started
+  with production configuration against real PostgreSQL 16 and Redis 7.4.2,
+  returned health/readiness 200, and passed the three-scope exporter/detector/
+  trip/denied-permit/diagnosis verifier. Image inspection returned user
+  `1000:1000`, OCI version `dev`, and Node `v24.19.0`; `/bin/sh` was absent.
+- Local dependency injection returned Redis readiness 503
+  `rate_limit_store_unavailable` with permit HTTP 500 and PostgreSQL readiness
+  503 `store_unavailable` with permit HTTP 500. Both permit paths therefore
+  failed closed, but currently expose generic `internal_error` rather than a
+  stable dependency-specific API error. After each dependency recovered,
+  readiness returned 200 and the loop scope still returned `allowed:false`,
+  `state:"tripped"`, `degraded:false`. Improving those runtime 500 contracts is
+  app-code work outside this release-owned slice and remains explicit follow-up.
+- Pinned Grype image `anchore/grype:v0.110.0@sha256:af65fbc0c664691067788fe95ff88760b435543e45595eb2ca6f102fc476fbe1`
+  scanned `docker:fuse-control-plane:release-truth-smoke` with `--fail-on high
+  --only-fixed=false`, no mounted configuration, ignore, exclusion, or
+  suppression, and exited 0: `No vulnerabilities found` (zero high/critical
+  findings). `pnpm run check` passed formatting, ESLint, all builds/typechecks,
+  616 unit tests, OpenAPI validation/conformance, four SigNoz contracts, and
+  three deployment contracts. `pnpm run test:release-workflow` and pinned
+  actionlint 1.7.7 both passed. No tag, registry login, image push, attestation,
+  commit, or publication occurred per request.
+
+### Stable Redis rate-limit outage contract (2026-08-24)
+
+- Raw ioredis failures from `@fastify/rate-limit`'s route-level `onRequest` hook
+  now return HTTP 503 `{error:"store_unavailable",message:"rate limit store is
+  unavailable; request denied",correlationId}`. The limiter key generator marks
+  the request immediately before its store increment and a `preParsing` hook
+  clears the marker only after `onRequest` completes. Translation additionally
+  requires the configured Redis client, so later authentication, parsing,
+  framework, and route failures retain their own contracts; an injected route
+  exception remains 500 `internal_error`. The existing 429 `rate_limited`
+  `FuseHttpError` is handled before the outage marker and remains unchanged.
+- Real `redis:7.4.2-alpine` pause evidence against a listening control plane
+  asserted the exact permit 503 body and caller-supplied correlation ID, then
+  exercised a fail-closed `FuseGuard` and observed zero provider callbacks.
+  `/healthz` stayed 200, `/readyz` retained its dependency-specific
+  `rate_limit_store_unavailable` 503, and unpausing Redis restored readiness and
+  provider dispatch through the same process/client without restart.
+- OpenAPI now defines the reusable `StoreUnavailable` response as covering both
+  the shared Redis limiter and route-specific PostgreSQL storage. Every one of
+  the 16 globally rate-limited operations is required by the checked-in
+  validator to reference that response at 503; health/readiness remain exempt.
+  Runtime conformance injects a limiter-store failure and validates the exact
+  response schema/body. The operations and incident-response runbooks record
+  fail-closed behavior and the distinction from route/framework failures.
+- The two previously reported aggregate-sensitive assertions were made
+  state-driven. Diagnosis delayed retry now polls the real claim transition
+  instead of sleeping for 60 ms, and the SDK Preflight status test awaits the
+  exporter callback's delivery promise before reading status. The two focused
+  suites passed concurrently (12/12 and 8/8), with no global timeout increase.
+- Verification: focused app unit tests passed 11/11; real Redis integration
+  passed 2/2; OpenAPI passed five validator tests, static validation of 18
+  operations/184 references, and runtime conformance. `pnpm run check:full` was
+  run twice consecutively and both runs passed formatting, ESLint, every build
+  and strict typecheck, 618 unit tests, OpenAPI/SigNoz/deployment contracts, and
+  148 real PostgreSQL/Redis/HTTP integration tests. No commit or push was made
+  per request.
+
+### Live direct-demo evidence on exact scratch image (2026-09-03)
+
+- Built `fuse-control-plane:live-demo` from the current tree (Node 24.19.0
+  scratch runtime) and ran migrations `0001` through `0008` against
+  `postgres:16-alpine` plus `redis:7.4.2-alpine` on network `fuse-live-demo`.
+  `/healthz` returned `{"status":"ok"}`, `/readyz` returned
+  `{"status":"ready"}`; control plane ran with development credentials and
+  `OTEL_SDK_DISABLED=true`.
+- `demo:real-detect loop`: trip epoch 1 by `system:detector:loop-signature`,
+  6 calls, 125 ms run time, next guarded call denied with 0 provider calls.
+- `demo:real-detect context-bloat`: trip epoch 1 by
+  `system:detector:context-bloat`, 20 calls, 502 ms, 0 provider calls.
+- `demo:real-detect cost-velocity`: trip epoch 1 by
+  `system:detector:cost-velocity`, 4 calls, 2925 ms, 0 provider calls.
+
+### Session close-out: Docker reset, identity, commit/push (2026-09-03)
+
+- Docker Desktop state reset between sessions: `docker info` showed
+  `Containers: 0`, `Images: 0`; `localhost:8080` (SigNoz) and
+  `localhost:8090` (live demo) both refused connections. Live SigNoz browser
+  verification therefore remains blocked; unblock action is re-running
+  `bash ./infra/signoz-up.sh` (or the forged-compose workaround under
+  `C:\Users\vedan\AppData\Local\Temp\opencode\fuse-signoz-pours\deployment`)
+  on a host with image cache, then provisioning rules/dashboard and capturing
+  UI screenshots. Direct-enforcement demo evidence above stands independently.
+- Push identity verified per AGENTS.md: `gh auth status` and
+  `gh api user --jq .login` both return exactly `Vedant817`; local
+  `user.name`/`user.email` are `Vedant817`/`vedantmahajan271@gmail.com`;
+  push remote is `https://github.com/Vedant817/Fuse.git` (personal account).
+- Final tree at close-out: 140 changed files, `+14653/-30871` (includes this
+  `task.md` entry). Last full gate: `pnpm run check:full` green twice (618
+  unit + 148 integration per run) with no source changes after except this
+  entry; commit/push recorded below once complete.

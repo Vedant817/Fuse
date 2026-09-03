@@ -1,10 +1,15 @@
 # ADR-006: SigNoz alert-rule provisioning (closing the §4.5 "Detect" gap)
 
-- Status: accepted
+- Status: accepted for provisioning details; trigger ordering superseded by ADR-014
 - Date: 2026-07-22
 - Deciders: Vedant817 (explicit choice, via delegated senior-engineer agent)
 
 ## Context
+
+> Historical note (2026-08-24): ADR-014 makes direct SDK detector reporting
+> the authoritative enforcement path. The SigNoz API shapes and pinned-version
+> provisioning details below remain current; statements that SigNoz is the
+> primary trip trigger describe the original hackathon architecture.
 
 A prior gap review found that `packages/detectors` (loop-signature, context-bloat,
 cost-velocity) existed as a well-tested pure-function library, but nothing in
@@ -155,6 +160,12 @@ rather than clicked, checked into `infra/`, and treated as declarative
 config applied against a running instance — not stored as SigNoz's own
 generated/exported artifacts (which are runtime state, analogous to
 `infra/signoz/pours/`, not hand-edited or committed).
+
+The provisioner updates existing channels and rules by name rather than
+skipping drift. It then fetches the persisted rule list and verifies every
+checked-in grouping, including `fuse.source_epoch` on detector rules. API
+response bodies are retained only in a mode-0700 temporary directory and are
+never printed because login/channel responses can contain credentials.
 
 ## Consequences
 

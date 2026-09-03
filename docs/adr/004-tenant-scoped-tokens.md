@@ -1,10 +1,15 @@
 # ADR-004: Tenant-scoped bearer tokens
 
-- Status: accepted; amended 2026-07-23 to cover grouped webhooks
+- Status: accepted for operator/webhook tenant binding; production agent scope superseded by ADR-014
 - Date: 2026-07-21
 - Deciders: Vedant817 (via delegated senior-engineer agent)
 
 ## Context
+
+> Current production rule (2026-08-24): agent credentials bind the exact
+> tenant/environment/agentId tuple. The partial-scope and wildcard agent formats
+> discussed below remain development/legacy history. Operator and webhook
+> tenant binding remains current.
 
 `docs/threat-model.md` (task.md §1.2), written against the system as
 actually implemented, surfaced a genuine gap: control-plane bearer tokens

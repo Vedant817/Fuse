@@ -1,110 +1,115 @@
-# Fuse limitations and non-guarantees
+# Fuse Limitations and Non-Guarantees
 
-Status: living document, first written 2026-07-23 (task.md §9.3). This is
-the single place a new operator or judge should read to know what Fuse does
-**not** promise — every item below is either a documented design tradeoff
-(cited to its ADR) or a real gap found during this project's own testing
-(cited to its evidence), not speculation.
+Read this before production evaluation. Fuse is pre-1.0 and has no published
+SLA, customer outcome study, or production-scale longitudinal evidence.
 
-## What Fuse does guarantee
+## What Is Enforced
 
-- **Zero provider calls after a committed trip.** This is the one
-  guarantee that holds independent of everything else on this page —
-  proven under both sequential and concurrent load
-  (`packages/sdk/src/guard.integration.test.ts`), including the
-  in-flight-exposure edge case (a call already past its permit check when
-  the trip commits may still complete — measured and documented, not
-  hidden).
-- **Honest reporting when telemetry can't be trusted.** Preflight reports
-  `blind`/`degraded` rather than silently assuming `protected` when
-  coverage/freshness/orphan-rate thresholds are crossed — this is the
-  project's core differentiator per `AGENTS.md`/task.md, and it is a
-  reporting guarantee, not an enforcement one (see below).
+After a breaker trip commits, a subsequent `FuseGuard` permit check for that
+exact scope is denied before its provider callback. This behavior is covered by
+sequential, concurrent, and real-PostgreSQL integration tests.
 
-## What Fuse does NOT guarantee
+That statement has important boundaries:
 
-- **A `blind` Preflight state does not itself stop enforcement.** The
-  breaker's own armed/tripped/disabled state is independent of Preflight's
-  protected/degraded/blind/disabled state by design — see
-  `docs/runbooks/incident-response.md`'s telemetry-outage entry. A scope
-  can be genuinely blind (no reliable signal) while its breaker sits
-  `armed`, providing no real detector-driven protection during that window.
-  Treat a `blind` report as an incident requiring investigation, not as
-  Fuse having "handled it."
-- **A fresh, forged webhook alert from a valid webhook token is not
-  detected.** SigNoz has no payload-signing option (verified against its
-  docs, not assumed) — the staleness/clock-skew guard
-  (`CONTROL_PLANE_WEBHOOK_MAX_ALERT_AGE_MS`) stops a _replayed_ old alert,
-  not a _new_ one an attacker with a valid webhook token chooses to send.
-  Impact is fail-safe only (a forged alert can only cause a trip, never a
-  resume/disable/enable) — `docs/threat-model.md` §3/§9 risk #2b.
-- **Tokens are flat roles, not per-tenant credentials, unless you opt in.**
-  A plain (unscoped) token is valid for every tenant on the deployment — the
-  `tenant:token` form (`docs/adr/004-tenant-scoped-tokens.md`) must be
-  explicitly configured per tenant to change this. A leaked wildcard token
-  affects every tenant sharing that deployment.
-- **No online key rotation or per-token expiry.** Rotating any token
-  requires an env-var change and a process restart
-  (`docs/runbooks/operations.md` §5); a leaked token stays valid until an
-  operator notices and rotates it.
-- **No repository-provided PostgreSQL backup or audit-log retention job.**
-  The Kubernetes base includes an expired-`idempotency_keys` cleanup CronJob,
-  but `breaker_audit_log` intentionally has no default deletion window and
-  the repository cannot define the operator's legal retention policy.
-  Production still requires a managed PostgreSQL backup/PITR policy and a
-  rehearsed restore; "restore from backup" assumes those external controls
-  were provisioned.
-- **No scripted schema rollback.** Migrations are forward-only
-  (`docs/runbooks/operations.md` §4) — reverting a bad schema change means
-  a manual reverse migration or a backup restore, not a one-command
-  rollback.
-- **Estimated cost, not reconciled billing.** `fuse.estimated_cost.usd.total`
-  (the dashboard's spend panel, `packages/otel/src/pricing.ts`) is computed
-  from a local pricing table against reported token counts — it is not
-  reconciled against your actual provider invoice, and will drift from
-  real billing if the pricing table goes stale or a provider changes its
-  rates.
-- **No true latency percentiles for `gen_ai` histograms on the dashboard.**
-  `docs/adr/008-signoz-dashboard-provisioning.md` documents that SigNoz
-  stores histogram sub-metrics (`.sum`/`.count`/`.bucket`) separately; the
-  shipped dashboard queries `.sum` (a total), not a computed p95/p99 from
-  `.bucket` — an honest simplification, not a hidden gap.
-- **The checked-in two-replica topology is not a multi-region guarantee.**
-  Detector requests carry their complete bounded window, and PostgreSQL
-  serializes registration and breaker transitions, so either replica can
-  handle a request. The repository has not run a sustained multi-zone soak,
-  regional failover, or disaster-recovery exercise. The earlier local load
-  test remains a capacity input, not a universal sizing promise.
-- **One logical scope needs one authoritative observation stream.** The SDK
-  carries at most 200 trailing observations per detector request. Two
-  independent agent processes reusing the same
-  `tenant/environment/agentId` do not merge their client-side windows;
-  allocate distinct `agentId` values or detect the aggregate in SigNoz.
-- **Scope onboarding is bounded but has no deletion workflow.** Every
-  operational path now rejects unknown scopes, and operator-only
-  `/v1/scopes/register` enforces a race-safe per-tenant cap (10,000 by
-  default). Registered scopes are durable and there is no deregistration
-  endpoint yet; capacity reclamation is an operator/database procedure.
-- **Diagnosis and Slack delivery are best-effort after the durable trip.**
-  A breaker trip commits before diagnosis starts, so Slack/MCP failure can
-  never weaken enforcement. There is no durable notification outbox:
-  terminating a process in the small interval after commit can lose that
-  incident's Slack notification. The audit row remains authoritative and
-  queryable for reconciliation.
-- **Container scanning is a release-environment gate, not a checked-in CI
-  job.** CI performs dependency audit, SBOM generation, container build,
-  hardening checks, and a live container smoke test. A registry scanner must
-  still approve the immutable image digest before promotion.
-- **The CI workflow exists but has not run on GitHub yet.** The local
-  equivalents pass, but `.github/workflows/ci.yml` cannot provide remote
-  evidence until the local commits are pushed to the verified personal
-  repository and GitHub executes it.
+- A provider call that bypasses `FuseGuard` is not protected.
+- A call already past permit when the trip commits may complete.
+- A process can choose fail-open for control-plane or store outages.
+- Preflight `blind` or `degraded` is a telemetry warning, not an automatic
+  trip.
+- A logically shared scope needs one authoritative SDK observation stream;
+  separate processes do not merge their client-side windows.
 
-## Where to look for more detail
+## Detection
 
-- `docs/threat-model.md` — the full trust-boundary/risk-register analysis
-  these limitations summarize.
-- `docs/adr/*.md` — the specific investigation and evidence behind each
-  design decision cited above.
-- `task.md` — the section-by-section status of what's built vs. explicitly
-  scoped out, including deadline-driven deferrals.
+- Detector defaults are engineering hypotheses, not validated optimal
+  thresholds. Useful repetitive or long-running work can produce false
+  positives; novel runaway shapes can produce false negatives.
+- No precision, recall, false-positive rate, or avoided-cost benchmark has yet
+  been measured on customer workloads.
+- The SDK carries at most 200 trailing observations. Behavior outside that
+  window is not available to direct evaluation.
+- Cost velocity uses a local model-pricing table and token counts. It is an
+  estimate, not invoice reconciliation.
+- Canonical step fingerprints reduce content exposure but can collide or merge
+  semantically different work. Progress labels and policy tuning remain the
+  integrator's responsibility.
+
+## Telemetry and SigNoz
+
+- `protected` requires success reported through the separate exact-scope
+  exporter-evidence capability and fresh structural evidence. It does not prove
+  SigNoz retention, query correctness, dashboard availability, or alert
+  delivery end to end.
+- The exporter bearer token is not cryptographic attestation. The supported
+  in-process runtime lets a fully compromised agent read that credential and
+  forge success. Isolate the exporter process and secret to exclude that actor.
+- SigNoz fallback is asynchronous. Evaluation and notification cadence can be
+  materially slower than direct enforcement and must be measured per
+  deployment.
+- An alert without a valid source breaker epoch is non-enforcing. A delayed
+  alert for an old epoch cannot re-trip a resumed scope.
+- SigNoz webhook payloads are bearer-authenticated but not HMAC-signed by
+  SigNoz. A holder of a valid webhook token can create a fresh trip attempt for
+  an authorized registered scope. The token cannot resume or disable.
+- The supplied dashboard does not provide true histogram p95/p99 calculations
+  for all panels.
+
+## Availability and Scale
+
+- Fail-closed protects cost but can turn a PostgreSQL, Redis, network, or
+  control-plane outage into an agent availability incident.
+- The checked-in two-replica topology has not completed multi-zone soak,
+  regional failover, disaster-recovery, or formal capacity certification.
+- Production requires shared Redis. Local in-memory rate limiting is not safe
+  across replicas.
+- The global token-keyed rate limit is shared across routes; a noisy caller can
+  consume permit capacity unless credentials and limits are sized correctly.
+- Registered scopes have a configurable per-tenant cap but no public deletion
+  workflow.
+
+## Delivery and Operations
+
+- Diagnosis delivery is durable and at-least-once, not exactly-once. Leases,
+  deterministic Slack message IDs, retries, and replay reduce duplicates but
+  cannot prove an external provider will never duplicate a side effect.
+- MCP, filesystem, or Slack failure can exhaust retries and dead-letter a job.
+  Enforcement remains committed, but an operator must inspect and replay.
+- Local incident snapshots in the hardened container use ephemeral `/tmp`.
+- Migrations are forward-only. There are no repository-provided down
+  migrations.
+- Migration checksums detect drift only after the one-time upgrade from the
+  legacy ID-only ledger. That backfill necessarily trusts the migration files
+  in the upgrade image because no earlier checksum exists to compare.
+- The repository does not provision production PostgreSQL backup/PITR, audit
+  retention, Redis HA, SigNoz HA, TLS certificates, or secret rotation.
+- Bearer tokens have no online revocation or expiry. Rotation requires a
+  configuration rollout.
+- `/healthz` proves only process liveness and deliberately ignores Redis and
+  PostgreSQL. `/readyz` proves a bounded rate-limit Redis `PING`, PostgreSQL,
+  and schema readiness, not SigNoz, Slack, MCP, or provider health.
+
+## Security and Privacy
+
+- Production agent and exporter-evidence credentials are exact-scope, separate,
+  and non-reusable. Operator and webhook credentials can be tenant-bound or
+  explicit wildcards. A wildcard increases blast radius.
+- Static bearer tokens must be protected by TLS and a secret manager.
+- Supplied OTel instrumentation excludes raw prompts, completions, and tool
+  arguments. Integrators can still attach sensitive attributes through other
+  instrumentation; Fuse cannot redact data it does not own.
+- Audit reasons are persisted free text. Do not put secrets, prompts, or
+  personal data in them.
+- Dependency audits and SBOMs are point-in-time evidence, not proof of no
+  vulnerabilities.
+
+## Commercial Evidence Still Required
+
+- Three or more real design partners with signed telemetry/privacy terms.
+- Baseline versus Fuse measurements for incidents, spend, and operator time.
+- Detector quality segmented by agent/workload type.
+- Production reliability, latency, recovery, and support evidence.
+- Willingness-to-pay and buyer validation.
+
+See the [pilot plan](../design-partner-pilot.md),
+[threat model](../threat-model.md), and
+[incident response runbook](./incident-response.md).

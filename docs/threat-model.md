@@ -1,315 +1,180 @@
-# Fuse threat model
+# Fuse Threat Model
 
-Status: living document, first written 2026-07-21 against the code as it
-exists at commit range up to `docs: record README/CONTRIBUTING/CODEOWNERS
-evidence in task.md`. This satisfies task.md §1.2. It documents the system
-**as built**, not an aspirational design — every mitigation cited below is
-backed by a specific file and test; every gap listed is something a real
-holder of the stated credential could exploit against the current code.
-Re-read and update this document whenever the control plane's auth model,
-webhook handling, or data-collection surface changes.
+Last reviewed: 2026-08-24. This model covers the current control plane, SDK,
+PostgreSQL/Redis state, SigNoz fallback, durable diagnosis, and Slack resume.
 
-## 1. Assets
+## Assets
 
-- **Breaker state and audit log** (Postgres, `packages/breaker-store`) — the
-  authoritative record of every tenant/environment/agent's armed/tripped/
-  disabled state and every transition's actor/reason/correlation ID.
-- **Preflight telemetry-health state** (same store) — a scope's
-  protected/degraded/blind/disabled verdict.
-- **Bearer tokens** (`CONTROL_PLANE_API_TOKENS` / `_AGENT_API_TOKENS` /
-  `_WEBHOOK_TOKENS`) — the only credential type in the system. There is no
-  session, cookie, or per-tenant credential; see §4 for why this matters.
-- **SigNoz alert payloads** — untrusted input arriving over the webhook
-  route; the only externally-triggered write path into breaker state besides
-  the operator API.
-- **Span/telemetry data** (OTel `gen_ai.*`/`fuse.*` attributes,
-  `SpanTelemetrySampleWire` reports) — deliberately structural/metadata only
-  (see §5); not itself an asset requiring redaction, by design.
+- Breaker state, epoch, policy version, and immutable transition audit.
+- Registered tenant/environment/agent scopes.
+- Preflight exporter evidence and protection state.
+- Diagnosis jobs, leases, errors, and replay audit.
+- Operator, exact-scope agent, exact-scope exporter-evidence, webhook, Slack,
+  database, Redis, and OTLP credentials.
+- Structural OTel data and estimated cost.
 
-## 2. Actors and trust boundaries
+Raw prompts, completions, and tool arguments are intentionally outside Fuse's
+supplied telemetry schema. Audit reasons remain caller-supplied persisted text.
 
-| Actor                                                                 | Holds                                                                                            | Trust boundary                                                                                              |
-| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Operator (human or automation with `CONTROL_PLANE_API_TOKENS`)        | Full control: trip/resume/disable/enable any scope, read/report Preflight, submit webhook alerts | Fully trusted within the deployment — no further restriction below "has an operator token"                  |
-| Agent SDK (`CONTROL_PLANE_AGENT_API_TOKENS`, embedded in `FuseGuard`) | Permit checks + Preflight report/read only; `403` on every `/v1/breaker/*` call                  | Trusted not to misuse the calls it _can_ make, not trusted with control actions                             |
-| SigNoz webhook channel (`CONTROL_PLANE_WEBHOOK_TOKENS`)               | Trip-only, via alert payload                                                                     | Trusted to deliver genuine SigNoz alerts; payload content (scope, reason) is otherwise untrusted (see §3)   |
-| Unauthenticated network caller                                        | Nothing                                                                                          | Every mutating and every Preflight/permit route requires a bearer token (`auth.ts`); only `/health` is open |
-| A dependency listed in `pnpm-workspace.yaml`'s `allowBuilds`          | Arbitrary code execution during `pnpm install`, scoped to the installing user                    | See §7                                                                                                      |
+## Actors and Capabilities
 
-**Load-bearing design fact, stated plainly:** tokens in this system are flat,
-global roles — "an operator token" or "an agent token" — not
-tenant/environment-scoped credentials. This is the single most consequential
-trust-boundary decision in the system and is examined in §4.
+| Actor                                      | Allowed capability                                                      | Boundary                                                     |
+| ------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Operator token                             | Register, inspect, trip, resume, disable, enable, list/replay diagnosis | Tenant-bound or explicit wildcard                            |
+| Agent token                                | Permit, detector observation, Preflight report/status                   | Exact scope required in production                           |
+| Exporter-evidence token                    | Preflight exporter evidence only                                        | Separate exact scope required in production                  |
+| Webhook token                              | SigNoz trip fallback                                                    | Tenant-bound or explicit wildcard; never resume              |
+| Slack user                                 | Open/submit resume modal                                                | Signed, fresh, allowlisted, optional team-bound, epoch-bound |
+| Unauthenticated caller                     | Health/readiness only                                                   | Rate-limited by IP                                           |
+| PostgreSQL/Redis/OTLP/MCP/Slack dependency | Service-specific state or side effects                                  | Network and credential boundary                              |
 
-## 3. Webhook authentication, replay, and forgery resistance
+Bearer checks use fixed-size SHA-256 digests and constant-time comparison. A
+known credential used on the wrong role or scope receives 403; an unknown
+credential receives 401.
 
-Implemented (`services/control-plane/src/routes/webhook.ts`,
-`services/control-plane/src/signoz-alert-mapper.ts`):
+## Trust Boundaries
 
-- Auth is the same bearer-token check as every other route (SigNoz has no
-  HMAC-signing option for webhooks — verified against its current docs,
-  recorded in `packages/contracts/src/alert-webhook.ts`). Configure SigNoz's
-  webhook channel with an empty username and the webhook token as the
-  Basic-Auth password; it is sent and checked as a bearer token.
-- Route-scoped 256 KB body limit and a 200-alert-per-delivery cap
-  (`AlertGroupSchema.alerts.max(200)`), so a single webhook payload cannot be
-  unboundedly large.
-- Idempotency: `alertCorrelationId = signoz:${fingerprint}:${startsAt}` is
-  used as both the idempotency key and the correlation ID, specifically so a
-  genuine Alertmanager redelivery (new HTTP request, same alert instance) is
-  recognized as a duplicate rather than tripping
-  `IdempotencyConflictError`. Verified in
-  `services/control-plane/src/webhook.integration.test.ts`.
-- Every trip the webhook causes uses **server-controlled**
-  `policyVersion`/`cooldownSeconds` (`config.webhookDefaultPolicyVersion`/
-  `webhookDefaultCooldownSeconds`) — never read from the untrusted alert
-  payload.
-- **Fixed: replay/timestamp-skew window.** `isStaleAlert`
-  (`services/control-plane/src/routes/webhook.ts`) rejects any alert
-  (per-alert, not the whole batch) whose `startsAt` is older than
-  `config.webhookMaxAlertAgeMs` (default 10 minutes) or claims to be
-  further in the future than `webhookMaxClockSkewAheadMs` (default 1
-  minute) — outcome `stale-alert`, never a trip. An unparseable `startsAt`
-  fails closed (treated as stale) rather than being assumed fresh. Proven
-  in `webhook.integration.test.ts`: a 20-minute-old alert, a 5-minute-future
-  alert, and an unparseable timestamp are all rejected without tripping
-  anything, while a 1-minute-old alert still trips normally. **What this
-  does and does not fix:** it defends against a captured HTTP request (or
-  a stale re-queued delivery) being replayed long after it stopped being
-  relevant. It does **not** defend against an attacker who already holds a
-  valid webhook token minting a brand-new, currently-fresh forged alert —
-  `fingerprint` and `startsAt` remain entirely attacker-chosen fields with
-  no payload signature to verify, since SigNoz offers no signing option
-  for its webhook channel. That residual capability (a valid token can
-  still force a trip for any **registered, token-authorized** scope it
-  names, as often as it likes, as long as each attempt uses a fresh
-  timestamp) is unchanged and tracked below.
-  **Recommended follow-up** for that residual gap: a per-webhook-token
-  trip-rate limit tighter than the global 120 req/min default (§6), since
-  the staleness window alone cannot bound how often a valid token is used.
-- **Fixed: webhook tenant binding and scope registration.** Webhook token
-  entries support the same `tenant:token` form as operator/agent roles.
-  `extractTenantFromWebhookRequest` requires every alert in a grouped
-  delivery to carry one identical tenant before a tenant-bound credential is
-  accepted; missing/mixed tenants fail with 403. A plain token remains an
-  explicit wildcard for a shared multi-tenant SigNoz channel. Independently,
-  the mapper's full scope must already exist in `registered_scopes`, so a
-  valid webhook credential cannot create arbitrary state or metric label
-  tuples. Integration tests prove wrong-tenant/mixed-tenant denial and
-  wildcard compatibility.
-- **No key-rotation mechanism.** Tokens are static environment variables;
-  rotating one requires a control-plane restart with a new `.env` value and,
-  during any overlap window, both old and new tokens are simultaneously
-  valid (whichever set the running process loaded at start). There is no
-  online/graceful rotation, no token expiry, and no revocation list.
-  **Recommended follow-up:** document (and eventually automate) a rotation
-  runbook: add new token → restart → confirm → remove old token → restart.
+### Agent to control plane
 
-## 4. Human-action authorization, audit, and the cross-tenant blast radius
+The agent chooses structural observations and can cause self-denial by firing a
+detector. Production credentials bind the exact scope, the scope must be
+operator-registered, request bodies are bounded, and policy is server-resolved.
+This prevents one production agent credential from tripping another scope.
 
-**Implemented and tested** (already `[x]` in task.md §1.2 before this
-document existed): every mutating control-plane endpoint
-(`/v1/breaker/trip|resume|disable|enable`) requires a bearer token, an
-`actor {type, id}`, a `reason`, and an `idempotencyKey`; every transition is
-recorded in `breaker_audit_log` with actor/reason/correlation/policy-version.
-Verified in `store.integration.test.ts` and `app.integration.test.ts`. At the
-SQL layer, every store query filters by `tenant`/`environment`/`agent_id`
-(`packages/breaker-store/src/store.ts`) — there is no missing-`WHERE`-clause
-cross-tenant data leakage.
+Residual risk: a compromised agent can suppress or falsify its own evidence,
+bypass `FuseGuard`, or deliberately trip itself. Fuse is not a sandbox inside
+the agent process.
 
-**Fixed (ADR-004, `docs/adr/004-tenant-scoped-tokens.md`):** the gap was one
-layer up from storage, at authorization — `scope` is read directly from the
-request body/query (`services/control-plane/src/routes/permit.ts`,
-`routes/breaker.ts`, `routes/preflight.ts`) and, previously, no token was
-associated with any particular tenant, so:
+### Exporter evidence to control plane
 
-- A single leaked **operator** token could trip/resume/disable/enable
-  **every** tenant's breaker on the deployment, not just one team's.
-- A single leaked **agent** token could read or report Preflight status for
-  **any** tenant's scope, not just the agent it was issued to.
+`POST /v1/preflight/report` is a strict structural-observation contract and
+rejects `exporterDelivery`. Only `POST /v1/preflight/exporter-evidence` accepts
+that field, using a credential class that cannot call permit, detector,
+webhook, or operator routes. Production rejects missing, partial, wildcard, or
+raw-token-reused exporter credentials. The request scope must exactly match the
+credential. Bodies and sample counts are bounded. The existing token-keyed
+global limiter includes exporter credentials and uses shared Redis across
+production replicas; limiter keys contain only a SHA-256-derived value, never
+the bearer token.
 
-Bearer tokens can now optionally be bound to a single tenant via a
-`tenant:token` config entry (instead of a plain token); `requireBearerAuth`
-(`services/control-plane/src/auth.ts`) checks the matched token's tenant
-against the request's actual target tenant
-(`extractTenantFromRequest` — `request.body.scope.tenant` for POST bodies,
-`request.query.tenant` for GET) and returns `403 unauthorized` on mismatch.
-Wired into `/v1/permit`, `/v1/preflight/*`, and `/v1/breaker/*`. Proven
-against a real Postgres-backed store in
-`services/control-plane/src/app.integration.test.ts` ("control-plane
-tenant-scoped tokens: closing the cross-tenant blast radius") — a tenant-A
-token gets 403 attempting to trip/resume tenant B's scope or read its
-Preflight status, and the attempted cross-tenant trip is confirmed to have
-never actually happened (tenant B's scope remains `unknown_scope`
-afterward).
+Residual trust assumption: bearer possession authenticates the exporter
+capability but does not attest which process or code generated the body. The
+supported Node OTel runtime is in the agent process and therefore possesses the
+exporter credential. A fully compromised agent process can read it and fabricate
+success. Process separation helps only when the exporter and credential are
+actually isolated from the agent OS identity/container; it does not protect
+against compromise of that exporter process, host, or secret manager. Fuse does
+not describe this evidence as cryptographic or server-verified delivery.
 
-**This fix is opt-in, not a default, and that tradeoff is deliberate and
-recorded, not silently glossed over:** a plain (unscoped) token — the only
-form that existed before this ADR — still normalizes to the wildcard
-tenant `'*'` and is valid for every tenant, exactly reproducing prior
-behavior. A deployment that never migrates its `.env` to `tenant:token`
-pairs is **still exactly as exposed as described above** — the capability
-to close the gap now exists and is tested, but using it requires an
-operator to actually configure tenant-scoped tokens. `.env.example`
-documents the format and recommends it once more than one tenant shares a
-deployment.
+### SigNoz to webhook
 
-The SigNoz webhook is now covered too: tenant-bound webhook credentials
-require a single-tenant batch, while a plain wildcard credential preserves
-the deliberate shared-channel topology. The residual fresh-forgery
-limitation in §3 remains because tenant authorization is not payload
-authenticity.
+Payloads are untrusted and bounded to 256 KB/200 alerts. Tenant-bound webhook
+tokens require one matching tenant across a grouped delivery. Scope labels are
+normalized and must reference a registered scope. Server policy controls
+cooldown and version.
 
-## 5. Prompt/tool payload collection, redaction, and retention
+Freshness, future-clock skew, idempotency, and source breaker epoch are checked.
+Alerts with no epoch cannot enforce; delayed alerts cannot target a newer
+episode.
 
-**Current stance: nothing is collected, so there is nothing to redact.**
-`withGenAiSpan` (`packages/otel/src/gen-ai-span.ts`) attaches only
-structural metadata to spans — operation name, provider, model name,
-tenant/environment/agentId, session/step/correlation IDs, token _counts_
-(not content), estimated cost, finish reasons, and outcome. No raw prompt
-text, completion text, or tool-call arguments are ever placed on a span,
-metric, or log anywhere in this codebase (confirmed by direct review of
-every `span.setAttributes`/`span.setAttribute` call site). Control-plane
-logging (`request.log`/`app.log`, 4 call sites total) never logs
-`request.body` verbatim; the one error log that includes request data logs
-only the already-validated `scope` object
-(`services/control-plane/src/routes/permit.ts`).
+Residual risk: SigNoz does not provide an HMAC signature for this webhook
+shape. A valid webhook-token holder can mint a fresh, epoch-matching trip
+attempt. Its impact is availability/self-denial, not resume or data access.
 
-The one piece of caller-supplied free text that **is** persisted is the
-`reason` string on a trip/resume/disable/enable call (and the mapped
-`reason` on a webhook-triggered trip), truncated to 2000 characters and
-stored in `breaker_audit_log` as intended audit evidence, not incidental
-logging. Since `reason` is operator/detector-authored free text, it is a
-narrow retention surface worth naming explicitly: if a future detector or
-integration ever populates `reason` with anything derived from prompt/tool
-content, that content would flow into the audit log's normal retention path.
-**Recommended follow-up, if/when that changes:** define a redaction step
-before any detector-generated `reason` string is persisted.
+### Slack to resume
 
-There is currently no prompt/tool payload collection at all in this system,
-so retention/deletion/demo-data policy for that data class is not yet
-applicable — this will need a real policy the day any component starts
-attaching prompt or tool content to telemetry (e.g. a future diagnosis
-feature that quotes the offending trace).
+Slack request signing authenticates the raw body. A bounded freshness window
+prevents replay. User allowlisting and optional team binding authorize the
+human context. The control plane selects an operator credential for the
+incident tenant, and the action includes the expected trip epoch.
 
-## 6. Denial of service and rate limiting
+Residual risk: compromise of the Slack app signing secret plus an authorized
+account and usable operator credential can resume. Keep credentials separate,
+monitor audit, and prefer tenant-bound operator tokens.
 
-`@fastify/rate-limit` is registered globally
-(`services/control-plane/src/app.ts`): **120 requests/minute by default**
-(`CONTROL_PLANE_RATE_LIMIT_MAX`/`_WINDOW_MS` are operator-configurable), keyed by the
-raw `Authorization` header value when present, else by IP. This applies
-uniformly to every route — `/v1/permit` (cheap, no DB write on the happy
-path), `/v1/preflight/report` (can carry up to 2000 span samples and always
-writes to Postgres), and `/v1/breaker/*` all share the same ceiling. A
-global 64 KB body limit applies everywhere except the webhook route's
-explicit 256 KB override.
+### Control plane to PostgreSQL and Redis
 
-**Gap:** a single valid (even agent-scoped, lowest-privilege) token can
-issue up to 120 `/v1/preflight/report` calls/minute, each up to 2000 spans,
-each causing a Postgres write — there is no endpoint-specific tighter limit
-reflecting that this is a heavier operation than a permit check.
-**Recommended follow-up:** either a lower per-route limit on
-`/v1/preflight/report`, or accept this as within tolerance for a
-single-tenant-per-deployment demo scale and revisit before any multi-tenant
-production deployment.
+PostgreSQL is authoritative. Breaker transitions use transactions,
+idempotency locks, and epoch comparison. The diagnosis job is attached to the
+trip audit transaction. Claims use row locks, leases, and ownership checks.
+Replay writes a separate immutable audit.
 
-The limit also applies to the permit hot path. Agents sharing one token share
-one bucket; an exhausted bucket returns 429, which the SDK correctly treats as
-control-plane unavailability and subjects to its configured outage mode. A
-real deployment must therefore size the configurable limit above measured
-aggregate permit throughput (or issue separate tenant/agent tokens) to avoid
-self-inflicted fail-closed denials.
+Redis holds shared rate-limit counters only. Production refuses missing or
+unreachable Redis at startup; runtime limiter errors fail requests closed.
 
-## 7. Supply chain
+Residual risk: database administrator compromise can alter all state and audit.
+Redis compromise can deny service or weaken rate limiting. Use managed TLS,
+least-privilege roles, network isolation, backups, and provider audit logs.
 
-`pnpm-workspace.yaml` explicitly allows four packages
-(`cpu-features`, `esbuild`, `protobufjs`, `ssh2`) to run their install
-lifecycle scripts, overriding pnpm's default script-blocking policy — all
-four are transitive dependencies needed for native bindings/build tooling
-used by `testcontainers`/OTel packages. This is a narrow but real increased
-attack surface: a compromise of any of the four would achieve local code
-execution during `pnpm install` (developer machine or CI), with the
-installing user's privileges.
+### Control plane to SigNoz MCP and Slack
 
-**Updated 2026-07-23** (task.md §9.1,
-`docs/adr/009-supply-chain-scan.md`): `pnpm-workspace.yaml` pins
-`undici`/`uuid` past testcontainer advisories and
-`@hono/node-server@2.0.10` past both known moderate advisories inherited
-through the MCP SDK. `pnpm audit --prod --audit-level low` now reports
-`No known vulnerabilities found`. `.github/workflows/ci.yml` repeats the
-production audit and creates a required-only CycloneDX 1.6 SBOM with
-`@cyclonedx/cdxgen`; the same workflow builds and smoke-tests the hardened
-container. Periodically re-justify the `allowBuilds` list and require an
-external registry image scan before release promotion.
+Diagnosis runs after enforcement. MCP responses are treated as evidence, not
+control instructions. Slack blocks and snapshots are deterministically built;
+no LLM-generated control action is executed. External failures retry through a
+durable queue and can dead-letter.
 
-## 8. Abuse-case test inventory
+Residual risk: at-least-once external delivery may duplicate notifications, and
+malicious or incorrect SigNoz data can mislead diagnosis. Operators must verify
+before resume.
 
-Threats already covered by an existing, passing test (not a standalone
-abuse-case list before this document, but real coverage):
+## Data Protection
 
-| Threat                                                           | Test evidence                                                                                              |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Forged/unknown bearer token                                      | `auth.test.ts`, `app.integration.test.ts` (401 cases)                                                      |
-| Valid-but-wrong-role token (e.g. agent token on `/v1/breaker/*`) | `auth.test.ts`, `app.integration.test.ts` (403 cases)                                                      |
-| Prefix/length-based token guessing                               | `auth.test.ts` constant-time comparison tests                                                              |
-| Malformed/schema-invalid request body                            | `app.integration.test.ts`, `preflight.integration.test.ts`, `webhook.integration.test.ts` (400 cases)      |
-| Duplicate/replayed webhook delivery (same alert instance)        | `webhook.integration.test.ts`                                                                              |
-| Concurrent duplicate idempotency-key requests (true race)        | `store.integration.test.ts` (advisory-lock serialization)                                                  |
-| Stale-epoch / out-of-order transition attempts                   | `store.integration.test.ts` (CAS contention cases)                                                         |
-| Store outage during permit vs. during a mutation                 | `guard.test.ts` (SDK-side), `app.integration.test.ts`/`preflight.integration.test.ts` (control-plane side) |
-| Control-plane unreachable from the SDK                           | `guard.test.ts` (timeout/network-error fail-closed/fail-open cases)                                        |
+Supplied spans include provider/model identifiers, scope, correlation IDs,
+token counts, outcomes, timing, and estimated cost. Exporter health reports
+only field-presence booleans and topology. Detector step shapes should use the
+keyed canonicalizer rather than raw text.
 
-Threats identified by this document, now with a test (updated from the
-original "no test yet" list — struck through, not deleted, so the history
-of what this document originally found is still visible):
+Controls:
 
-- ~~Cross-tenant control via a single leaked operator/agent token (§4)~~ —
-  now covered: `app.integration.test.ts`'s "control-plane tenant-scoped
-  tokens" suite proves both the fixed behavior (a scoped token cannot cross
-  tenants) and that a wildcard token still can (the documented, opt-in
-  tradeoff).
+- no request body logging;
+- bounded labels/reasons/identifiers;
+- no bearer secrets in rate-limit keys;
+- static OTel attribute allowlists;
+- incident snapshots on restricted storage;
+- explicit retention policy outside this repository.
 
-- ~~Webhook replay via a stale `(fingerprint, startsAt)` pair (§3)~~ — now
-  covered: `webhook.integration.test.ts` proves a 20-minute-old alert, a
-  5-minute-future alert, and an unparseable timestamp are all rejected
-  (`stale-alert`, no trip), while a fresh alert still trips normally.
+Audit reasons are the principal free-text persistence surface. Treat them as
+non-sensitive operational metadata.
 
-- ~~Unbounded caller-chosen scope cardinality~~ — now covered at the durable
-  boundary: every permit, Preflight, detector, breaker, and webhook route
-  rejects unregistered scopes. Operator-only registration serializes a
-  per-tenant count under a PostgreSQL advisory lock and enforces the
-  configurable cap even across concurrent replicas.
+## Abuse Cases and Mitigations
 
-Still with **no test** (tracked as follow-up work, not silently dropped):
+| Abuse case                          | Mitigation                                                       | Residual risk                                          |
+| ----------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------ |
+| Cross-agent trip/read               | Exact production agent token plus registered scope               | Operator/webhook wildcard credentials have wider scope |
+| Old alert re-trips after resume     | Source epoch CAS, freshness, idempotency                         | Fresh forged alert with valid token                    |
+| Old Slack card resumes new incident | Expected trip epoch                                              | Authorized current card can still resume incorrectly   |
+| Duplicate detector requests         | Deterministic incident identity and store serialization          | Caller may create distinct valid episodes              |
+| Scope/metric cardinality attack     | Operator registration and per-tenant cap                         | No public deregistration workflow                      |
+| Heavy report DoS                    | Body/sample caps, separate credentials, shared token-keyed limit | Limits are not weighted by endpoint cost               |
+| Database outage                     | Readiness, fail-closed default, 503 mutations                    | Agent availability loss                                |
+| Diagnosis worker crash              | Durable leases and reclaim                                       | Duplicate external side effect possible                |
+| Dead-letter replay abuse            | Operator role, exact scope, manual actor, idempotency and audit  | Compromised operator can replay                        |
+| Secret timing/persistence           | Constant-time checks, hashed limiter key, redacted logs          | Static tokens lack expiry                              |
 
-- Forgery via a _fresh_, attacker-chosen `(fingerprint, startsAt)` pair from
-  a holder of a genuinely valid webhook token (§3's residual gap — the
-  staleness window doesn't and can't prevent this; would need a rate-limit
-  test once that follow-up is built).
-- Endpoint-specific rate-limit exhaustion on `/v1/preflight/report` (§6) —
-  now measured, not just theorized: `docs/adr/011-permit-load-test.md`'s
-  load test confirms the default 120/60s limit is shared per-token across
-  every route including this one; no dedicated test forces the specific
-  "heavy `/v1/preflight/report` payload under this shared budget" scenario.
+## Security Operations
 
-## 9. Summary risk register
+- Terminate TLS before the control plane; never expose local HTTP publicly.
+- Store credentials in a secret manager and rotate with overlap/restart.
+- Never inject exporter-evidence credentials into an ordinary agent process if
+  the threat model requires protection from full compromise of that process;
+  run the exporter under a separate identity and secret boundary.
+- Alert on auth failures, unexpected trips/resumes, stale epochs, readiness,
+  Redis errors, Preflight blindness, and dead-letter growth.
+- Require image digest, provenance/SBOM verification, dependency and container
+  scanning, and restore rehearsal before production promotion.
+- Review wildcard credentials and `pnpm-workspace.yaml` build-script allowlists
+  regularly.
 
-| #   | Risk                                                                                 | Severity (given current scale)                                                   | Status                                                                                              |
-| --- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| 1   | No token-to-tenant binding — leaked operator/agent token affects every tenant        | High for any multi-tenant deployment; low for the current single-tenant demo     | Fixed (ADR-004), opt-in — a wildcard-token deployment remains exposed by choice                     |
-| 2   | Webhook had no replay-window; a stale captured alert could be replayed indefinitely  | Medium (availability/nuisance only — a trip is fail-safe, not data-exposing)     | Fixed — `webhookMaxAlertAgeMs`/`webhookMaxClockSkewAheadMs` (§3)                                    |
-| 2b  | Residual: a _fresh_ forged alert from a valid webhook token is still not prevented   | Medium (same fail-safe-only impact; SigNoz has no payload signing)               | Open — recommended fix is a per-webhook-token trip-rate limit                                       |
-| 3   | Flat rate limit across cheap and heavy endpoints                                     | Low                                                                              | Open, documented, not yet fixed                                                                     |
-| 4   | No online key rotation                                                               | Low (env-var restart-based rotation works, just isn't graceful)                  | Open, documented                                                                                    |
-| 5   | `allowBuilds` supply-chain surface                                                   | Low-medium, narrow scope                                                         | Audit/SBOM/container smoke are in checked-in CI; release still requires registry image scanning     |
-| 6   | Audit-log `reason` field is a future redaction surface if content ever flows into it | None today (nothing populates it with sensitive content yet)                     | Monitor, no action needed now                                                                       |
-| 7   | Caller-controlled detector scope cardinality                                         | Medium (memory/metric growth) before the fix; low after                          | Fixed 2026-07-23 — registered-scope allowlist and race-safe per-tenant cap                          |
-| 8   | Unbounded attacker-controlled `detector` label reaching audit-log/log content        | Medium before the fix (unbounded TEXT growth + log injection surface); low after | Fixed 2026-07-23 — truncated to 200 chars at the mapper + schema (ADR-013)                          |
-| 9   | Unbounded permanent Postgres/OTel cardinality via arbitrary scope tuples             | Medium before the fix; low after                                                 | Fixed 2026-07-23 — unknown scopes return 404 and registration has a configurable per-tenant ceiling |
+## Open Risks
 
-None of these gaps affect the breaker's core guarantee (zero provider calls
-after a committed trip) — that guarantee is enforced independently of the
-auth model and is proven under both sequential and concurrent load in
-`packages/sdk/src/guard.integration.test.ts`. They affect _who can trigger_
-enforcement actions and _how finely scoped_ that trigger is, not whether
-enforcement itself works once triggered.
+1. Static bearer credentials have no issuer, expiry, or online revocation.
+2. SigNoz webhook delivery lacks payload signing.
+3. Global rate limiting is not weighted by endpoint cost.
+4. No sustained multi-zone or disaster-recovery evidence exists.
+5. Integrator-added OTel attributes can reintroduce sensitive content.
+6. Detection quality is not validated on customer workloads.
+
+These risks do not change a committed breaker's transition semantics, but they
+affect who can control it, whether detection occurs, and system availability.
+See [limitations](./runbooks/limitations.md) and
+[incident response](./runbooks/incident-response.md).

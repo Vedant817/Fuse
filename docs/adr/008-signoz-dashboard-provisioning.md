@@ -118,9 +118,9 @@ bucket-level histogram math, deliberately deferred (see Consequences).
 
 ### 4. Provisioning approach: idempotent update-by-title, not create-if-missing
 
-Unlike `infra/signoz-alerts-up.sh` (create-if-missing, since alert
-thresholds rarely change), `infra/signoz-dashboard-up.sh` looks up a
-dashboard by title and **always applies** the current
+Like the current `infra/signoz-alerts-up.sh` (update-by-name with round-trip
+verification), `infra/signoz-dashboard-up.sh` looks up a dashboard by title and
+**always applies** the current
 `fuse-agent-cost-health.json` contents to it via `PUT` — panels are
 expected to be iterated on, and there is no meaningful "don't touch it,
 it might have manual edits" concern for a dashboard whose whole point is

@@ -13,17 +13,18 @@ Before changing any code, read, in order:
    conventions, and the definition of done. It is binding, not advisory.
 2. [`Fuse_Hackathon_Brief.md`](./Fuse_Hackathon_Brief.md) — what Fuse is for
    and the demo path it must protect.
-3. [`task.md`](./task.md) — the current, evidence-backed state of the build.
-   Check here before assuming something is or isn't done.
+3. [`task.md`](./task.md) - the internal historical evidence archive. Use it to
+   locate prior commands and decisions, then verify current behavior against
+   code, tests, ADRs, and public docs.
 
 If an instruction in an issue, PR description, or conversation conflicts with
 these files, `AGENTS.md`'s source-of-truth hierarchy governs.
 
 ## Workflow
 
-1. Read the relevant `task.md` section and the current code before writing
-   anything. State the acceptance criteria and likely failure modes for the
-   slice you're about to build.
+1. Read relevant ADRs, current code, and any historical `task.md` evidence
+   before writing anything. State the acceptance criteria and likely failure
+   modes for the slice you're about to build.
 2. Implement the smallest cohesive, production-worthy vertical slice — not a
    disconnected demo, and not more than the task calls for.
 3. Add or update tests alongside the change, including negative paths and
@@ -40,11 +41,10 @@ these files, `AGENTS.md`'s source-of-truth hierarchy governs.
    before committing.
 5. Do a gap review of the change: correctness, concurrency/races, security,
    privacy, observability, operability, and misleading UX. Fix anything P0/P1
-   before moving on; record any legitimately deferred P2 in `task.md` with a
-   reason, not silently.
-6. Update `task.md` (and any affected docs, `.env.example`, or ADRs) with what
-   was actually verified — a checkbox only gets checked with a command or test
-   behind it.
+   before moving on; record any legitimately deferred work with a reason.
+6. Append concise command/evidence notes to `task.md` when useful, and update
+   affected public docs, `.env.example`, and ADRs. The archive is not a
+   substitute for passing current tests.
 7. Commit as a single, atomic Conventional Commit (`feat(scope): ...`,
    `fix(scope): ...`, `docs: ...`) covering exactly this slice. Never bundle
    unrelated changes.

@@ -1,186 +1,152 @@
-# Fuse incident-response runbook
+# Fuse Incident Response
 
-Status: living document, first written 2026-07-23 (task.md §9.3). Every
-command below uses the real request schemas
-(`packages/contracts/src/breaker-api.ts`) and route paths
-(`services/control-plane/src/routes/breaker.ts`) — verified by reading them
-directly, not guessed. Every behavior claim cites the test that proves it.
-Cross-references `docs/threat-model.md` for the underlying trust-boundary
-reasoning rather than repeating it.
+Start every incident by recording UTC time, scope, breaker epoch, correlation
+ID, policy version, Preflight state/reason, and the operator identity. Never put
+prompts, secrets, or personal data in the audit reason.
 
-## How to read a breaker/Preflight state
+## Initial Triage
 
 ```bash
 curl -H "Authorization: Bearer $OPERATOR_TOKEN" \
   "http://localhost:8090/v1/breaker/status?tenant=T&environment=E&agentId=A"
+curl -H "Authorization: Bearer $AGENT_OR_OPERATOR_TOKEN" \
+  "http://localhost:8090/v1/preflight/status?tenant=T&environment=E&agentId=A"
+curl -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  "http://localhost:8090/v1/diagnosis/jobs?tenant=T&environment=E&agentId=A"
 ```
 
-Breaker `state` is one of `armed` / `tripped` / `disabled` (never
-`unknown` for a real persisted record — `unknown` is a permit-response-only
-value meaning "the store was unreachable, we couldn't tell").
-`/v1/preflight/status` (same auth tier) separately reports
-`protected` / `degraded` / `blind` / `disabled` — Preflight's own read on
-whether this scope's _telemetry_ is trustworthy enough to make the breaker's
-decisions meaningful, independent of the breaker's own state.
+Breaker state (`armed`, `tripped`, `disabled`) and Preflight state
+(`protected`, `degraded`, `blind`, `disabled`) are separate axes.
 
-## Incident: false-positive trip (breaker tripped, but the agent wasn't actually misbehaving)
+## Runaway Agent or Valid Trip
 
-1. Confirm it's a false positive, not a missed real issue: pull the
-   incident's Slack card (if `SLACK_BOT_TOKEN` was configured) or the local
-   HTML snapshot at `FUSE_INCIDENT_SNAPSHOT_DIR` — `runDiagnosisAndNotify`
-   writes one for every trip regardless of Slack configuration
-   (`diagnosis-worker.test.ts`'s "always writes a local HTML snapshot"). It
-   contains the detector's evidence bundle (up to 5 real spans, if
-   `FUSE_SIGNOZ_MCP_URL` was configured) and the deterministic hypothesis
-   text — read it before resuming, since a resume with no real diagnosis is
-   exactly the failure mode Preflight/diagnosis exists to prevent.
-2. Resume via the operator API (never via the alert webhook token, which
-   cannot resume — `docs/threat-model.md` §2):
-   ```bash
-   curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" \
-     -H "Content-Type: application/json" \
-     http://localhost:8090/v1/breaker/resume -d '{
-       "scope": {"tenant":"T","environment":"E","agentId":"A"},
-       "reason": "confirmed false positive: <why>",
-       "actor": {"type":"human","id":"<you>"},
-       "correlationId": "<incident-id>",
-       "idempotencyKey": "<unique-per-attempt>"
-     }'
-   ```
-   `reason` is required and stored verbatim in `breaker_audit_log` — it is
-   the permanent record of why a human overrode enforcement, not optional
-   metadata.
-3. Alternatively, use Slack's own resume button if the incident card was
-   posted (opens a modal requiring a reason before submission —
-   `slack-actions.ts`'s `buildResumeReasonModalView`/
-   `executeAuthorizedResume`, tested end-to-end in
-   `slack-interactive.test.ts`).
-4. If false positives from this detector are recurring, tune its threshold
-   in the versioned policy config (`packages/contracts/src/policy.ts`'s
-   `DetectorsConfigSchema`) rather than repeatedly resuming — a
-   consistently wrong threshold is a policy bug, not an incident.
+1. Confirm the provider path is guarded and no bypass exists.
+2. Stop or isolate additional agent replicas using the same logical scope.
+3. Inspect breaker audit, detector result, policy version, and SigNoz evidence.
+4. Check for already-permitted in-flight calls; Fuse does not cancel them.
+5. Fix or bound the agent behavior before resume.
+6. Resume with a manual actor, specific reason, unique idempotency key, and the
+   expected trip epoch.
+7. Confirm the new epoch is armed and run one controlled canary call.
 
-## Incident: missed trip (a real cost/loop problem that should have tripped, didn't)
+## Suspected False Positive
 
-1. Check Preflight state first — a `blind`/`degraded` scope is Fuse's own
-   honest signal that its telemetry coverage was too thin to trust a
-   detector's silence (task.md's core claim: "clearly report when telemetry
-   makes protection unreliable," not silently assume protection held).
-   `fuse.preflight.state` on the SigNoz dashboard
-   (`infra/signoz/dashboards/fuse-agent-cost-health.json`) shows this over
-   time.
-2. If Preflight reported `protected` and a detector still should have fired
-   but didn't, check whether the relevant detector config
-   (`packages/contracts/src/policy.ts`) has since been loosened, and
-   whether `fuse.detector.score`/`fuse.detector.fired` on the dashboard show
-   the score approaching but never crossing threshold — that's a tuning
-   gap, not a code defect.
-3. A missed trip is never silently "fine" — the breaker's whole purpose is
-   preventing the next expensive call, so treat every missed-trip
-   post-mortem as a policy-threshold or telemetry-coverage review, per
-   `AGENTS.md`'s definition of done.
+Do not resume from the alert title alone. Review the bounded step shape,
+detector score/threshold, trace evidence, and business intent. If safe, resume:
 
-## Incident: breaker stuck (won't resume, or immediately re-trips)
+```bash
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/v1/breaker/resume \
+  -d '{
+    "scope":{"tenant":"T","environment":"E","agentId":"A"},
+    "reason":"confirmed false positive: bounded polling was expected",
+    "actor":{"type":"manual","id":"operator:on-call"},
+    "correlationId":"incident-correlation-id",
+    "idempotencyKey":"resume-unique-id",
+    "expectedEpoch":1
+  }'
+```
 
-1. `cooldownUntil` on the status response: a resume attempted before
-   cooldown expires is rejected — this is by design (prevents a rapid
-   trip/resume/trip thrash), not a bug. Wait for cooldown or use `disable`
-   (below) if the situation genuinely needs enforcement off immediately.
-2. If it re-trips right after resuming, the underlying condition (loop,
-   cost velocity) is likely still active — check the detector's live score
-   on the dashboard before resuming again. Resuming into an still-active
-   problem just burns another cooldown cycle.
-3. To take enforcement out of the loop entirely (e.g. investigating a
-   detector bug, not the agent's behavior) use `/v1/breaker/disable` — a
-   disabled scope reports `breaker-disabled` on the next webhook alert
-   instead of tripping (`webhook.integration.test.ts`'s "a disabled scope
-   reports breaker-disabled... and stays disabled") and must be explicitly
-   `/v1/breaker/enable`d again, same auth tier, same required `reason`.
+Recurring false positives require a reviewed policy change and canary, not a
+habitual resume procedure.
 
-## Incident: telemetry pipeline down (Preflight reports `blind`, or stops reporting at all)
+## Missed Trip
 
-This is the scenario task.md's core claim is specifically about — Fuse
-reporting honestly that it can no longer vouch for protection, rather than
-silently continuing to look "armed" while blind.
+1. Verify every provider dispatch used `FuseGuard`.
+2. Inspect Preflight. `blind` or `degraded` means detector silence was not
+   trustworthy.
+3. Check step-report failures. The reporter defaults fail-closed and latches
+   subsequent guarded calls when a detector observation cannot be durably
+   evaluated, but an integration can still bypass or misconfigure it.
+4. Compare the bounded observation window with the effective policy.
+5. Confirm the scope was registered and the exact-scope credential matched.
+6. Check direct route latency/errors separately from SigNoz fallback timing.
+7. Preserve evidence and add a regression fixture before changing thresholds.
 
-1. Check the agent side first: is the SDK's Preflight reporter actually
-   running (`packages/sdk/src/preflight-reporter.ts`)? A process crash or a
-   misconfigured `FUSE_CONTROL_PLANE_URL` stops reports entirely, which
-   Preflight's own heartbeat-grace logic (`preflightHeartbeatGraceMs`) will
-   eventually surface as `blind` — check how long ago `lastGoodAt` was on
-   `/v1/preflight/status`.
-2. If reports are arriving but coverage/orphan-rate/token-missing-rate
-   thresholds are being crossed (`reasonCode` on the status response tells
-   you which), that's a genuine instrumentation regression upstream (OTel
-   SDK misconfigured, spans missing required `gen_ai.*` attributes) — fix
-   the instrumentation, don't just widen the threshold to make the symptom
-   go away.
-3. **Fuse does not fail the breaker closed just because Preflight reports
-   blind** — Preflight and the breaker are deliberately independent signals
-   (breaker enforcement continues on whatever its own state already is; a
-   `blind` Preflight state is a trust/visibility signal about whether that
-   enforcement can be relied on, not itself an enforcement action). This is
-   an intentional design boundary, not an oversight — but it means a
-   `blind` scope's breaker could still be silently `armed` while providing
-   no real protection, which is exactly why `blind` must be treated as an
-   incident in its own right, not a footnote.
+## Telemetry Blind or Exporter Failure
 
-## Incident: Postgres (state store) outage
+Reason codes `exporter-delivery-unconfirmed`, `exporter-delivery-failed`, and
+`exporter-delivery-stale` indicate the real OTLP export path is not currently
+proven. Check collector reachability, credentials, TLS, exporter queues, and
+clock health. Missing-field or orphan reasons point to instrumentation shape.
 
-1. `/readyz` flips to 503 `{"status":"not-ready","reason":"store_unavailable"}`
-   (`health.ts`) — a load balancer should stop routing here; `/healthz`
-   stays 200 (liveness — the process itself is fine).
-2. Permit checks follow `CONTROL_PLANE_STORE_OUTAGE_MODE` (default
-   `fail-closed` — denies, doesn't crash;
-   `guard.test.ts`/`app.integration.test.ts` prove this path). Mutating
-   calls (trip/resume/disable/enable) always fail with 503 regardless of
-   outage mode — a control action that can't be persisted must not report
-   success (`config.ts`'s doc comment, by design, not configurable).
-3. Restart Postgres / restore connectivity; `pool.on('error', ...)`'s
-   safety net (`@fuse/breaker-store`'s `createPool`) prevents one bad idle
-   connection from crashing the whole control-plane process while you do.
-4. No data is lost from a store outage itself (nothing was written during
-   the outage) — but every permit check that fail-closed during the window
-   denied a real LLM call an agent may have needed; that's the accepted
-   cost of the safer default, not a defect to "fix" after the fact.
+Preflight does not trip the breaker. Decide explicitly whether to pause the
+agent operationally, relying on the deployment's approved outage policy.
 
-## Incident: leaked webhook/agent/operator token
+## PostgreSQL or Schema Failure
 
-See `docs/runbooks/operations.md` §5 for the rotation mechanics (no online
-revocation — env var change + restart). Severity differs sharply by role
-(`docs/threat-model.md` §2/§4):
+- `/healthz` may remain 200.
+- `/readyz` returns 503 with `store_unavailable` or `schema_not_ready`.
+- Mutations return 503 rather than claiming success.
+- Permits follow the configured store outage mode.
 
-- **Leaked webhook token**: can only cause trips (fail-safe direction), and
-  only for scopes an attacker can name in a forged alert payload — cannot
-  resume/disable/enable anything. Rotate it, but this is a nuisance/
-  availability risk, not a data-exposure one.
-- **Leaked agent token**: can check permits (reads current state, can
-  trigger a lazy-init of a new scope) but gets 403 on every `/v1/breaker/*`
-  route — cannot force-trip, resume, disable, or enable anything
-  (`auth.test.ts`).
-- **Leaked operator token**: full control — force-trip/resume/disable/
-  enable any scope the token is valid for (every tenant, if it's an
-  unscoped/wildcard token — `docs/adr/004-tenant-scoped-tokens.md`). Rotate
-  immediately; audit `breaker_audit_log` for any transitions you didn't
-  expect, since every mutation records its actor/reason/correlationId.
+Stop rollout and compare the eight migration ledger IDs and SHA-256 checksums
+with the immutable image. Do not rewrite historical SQL or update a checksum to
+silence a mismatch; investigate artifact or database tampering. If migration
+compatibility is uncertain, use a restored copy of the pre-change backup and
+repeat the enforcement canary.
 
-## Incident: Slack or SigNoz MCP unreachable during a real trip
+## Redis Failure or 429 Saturation
 
-Both are designed to degrade, not to block the trip itself or crash the
-process — verified by tests, not just intended:
+Production startup requires a connected shared Redis. Runtime limiter errors
+fail normal API requests closed with 503 `store_unavailable` and preserve the
+request correlation ID. `/healthz` remains 200; `/readyz` returns 503 with
+`rate_limit_store_unavailable` after a bounded `PING`. Restore Redis and confirm
+the same process returns ready before allowing traffic; a restart is not normally
+required. Check Redis connectivity, TLS/auth, memory, command latency, and key
+volume. If requests return 429, confirm whether one credential is shared across
+too many agents before raising limits.
 
-- `runDiagnosisAndNotify` never throws even if evidence fetch rejects
-  unexpectedly (`diagnosis-worker.test.ts`) and always writes the local
-  HTML snapshot regardless of Slack's availability.
-- A Slack post that fails (network error, non-2xx, API-level error) logs
-  and moves on (`slack-client.test.ts`, `diagnosis-worker.test.ts`'s "logs
-  but does not throw when the Slack post is not delivered").
-- The breaker's own trip already committed before diagnosis runs at all —
-  diagnosis/Slack are fire-and-forget _after_ the enforcement decision
-  (`webhook.ts`'s `void runDiagnosisAndNotify(...)`), so an outage here
-  never delays or blocks the actual protection.
+## Diagnosis Backlog or Dead Letter
 
-Action: check `FUSE_INCIDENT_SNAPSHOT_DIR` for the local HTML snapshot
-(always written) instead of waiting on Slack; fix the Slack/MCP
-connectivity issue at your own pace since it does not affect enforcement
-correctness in the meantime.
+Enforcement has already committed. Inspect queue metrics and list jobs by
+tenant/status. Identify MCP, snapshot filesystem, or Slack failure. After the
+dependency is healthy, replay dead-letter jobs through the operator API. Never
+edit queue rows manually without preserving an external incident record.
+
+At-least-once delivery can duplicate an external side effect. Compare the
+audit-event-derived Slack message identity before manually reposting.
+
+## Stale or Forged SigNoz Alert
+
+- `unbound-alert`: update the alert rule to carry `fuse.source_epoch`; no state
+  change occurred.
+- `stale-alert`: investigate scheduling, queueing, or clock skew.
+- `stale-epoch`: the breaker episode already advanced; do not force the old
+  alert onto current state.
+- Unexpected fresh trip with valid epoch: rotate the webhook token, review
+  channel access, inspect the alert in SigNoz, and audit affected scopes.
+
+Webhook credentials can trip but cannot resume, disable, or enable.
+
+## Slack Resume Rejected
+
+Check, in order:
+
+1. Slack request timestamp freshness and HMAC signing secret.
+2. `SLACK_AUTHORIZED_USER_IDS`.
+3. `SLACK_TEAM_ID`, when configured.
+4. An operator credential matching the incident tenant.
+5. The incident card's expected epoch versus current breaker epoch.
+6. Cooldown and breaker transition rules.
+
+Do not bypass these checks by weakening the webhook route. Use the operator API
+with the same expected epoch and an audited reason when Slack is unavailable.
+
+## Credential Exposure
+
+- Agent token: rotate the exact scope credential and inspect permit/detector/
+  Preflight traffic. It cannot call breaker control routes.
+- Webhook token: rotate and inspect unexpected trips. It is trip-only.
+- Operator token: treat as high severity; rotate immediately and inspect all
+  breaker and diagnosis replay audit events for its tenant or wildcard scope.
+
+Rotation requires a controlled restart as documented in
+[operations.md](./operations.md).
+
+## Closure
+
+Before closing, record root cause, affected scopes and epochs, guarded versus
+unguarded exposure, estimated provider cost as an estimate, recovery evidence,
+policy/code follow-up, and whether the incident changes any public guarantee.

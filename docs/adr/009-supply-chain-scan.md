@@ -111,10 +111,12 @@ The original `@cyclonedx/cyclonedx-npm --ignore-npm-errors` approach shells
 out to `npm ls` and emits thousands of false pnpm-tree errors. CI now uses
 `@cyclonedx/cdxgen@12.8.1 --type js --required-only --fail-on-error
 --no-install-deps --spec-version 1.6`, which understands the pnpm workspace
-and fails instead of suppressing extractor errors. The generated artifact
-is reparsed and required to have CycloneDX format/version plus a non-empty
-component list. The locally verified run produced 43 required components
-and 54 dependency graph entries.
+and fails instead of suppressing extractor errors. The generated artifact is
+reparsed and required to have CycloneDX format/version plus the expected
+Fastify, Redis, PostgreSQL, OTel SDK, Zod, and distributed-rate-limit runtime
+components. A schema-valid but incomplete component list fails the workflow.
+The image SBOM additionally requires the deployed Fuse control-plane,
+breaker-store, and contracts packages.
 
 ## Consequences
 
@@ -124,10 +126,14 @@ and 54 dependency graph entries.
   be revisited if
   `@testcontainers/postgresql` ever bumps its own `undici`/`uuid` floor past
   these pins (they would become redundant, not wrong).
-- `.github/workflows/ci.yml` regenerates and retains the SBOM on every
-  change; `docs/sbom.cdx.json` remains a point-in-time human-review snapshot.
+- `.github/workflows/ci.yml` regenerates and retains an SBOM on every change;
+  `.github/workflows/release.yml` separately generates and validates release
+  workspace and final-image SBOMs. The old `docs/sbom.cdx.json` point-in-time
+  snapshot was removed because it drifted from the lockfile while still looking
+  authoritative. SBOM evidence is now generated for and retained with the run
+  it describes.
 - CI now builds the repository's immutable control-plane image and runs it
-  non-root/read-only with capabilities dropped. A registry image scanner is
-  still a required promotion gate in `docs/runbooks/deployment.md`; it is
-  intentionally external because the checked-in workflow does not publish a
-  digest.
+  non-root/read-only with capabilities dropped. Release scans both exact local
+  architecture candidates with the SHA-pinned Anchore scan action and explicitly
+  pinned Grype version before registry authentication. High or critical findings
+  fail the run before any consumer-facing alias exists.

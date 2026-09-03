@@ -1,149 +1,210 @@
-# Fuse architecture (task.md §11.2)
+# Fuse Architecture
 
-Every component and edge below is real, wired code — not an aspirational
-diagram. Cross-references point at the actual source, matching the
-discipline the rest of this repo's docs use.
+This document describes the current uncommitted implementation. The original
+hackathon brief and ADR-006 capture an earlier SigNoz-first design; ADR-014
+supersedes that trigger ordering.
 
-## System diagram
-
-```mermaid
-flowchart TB
-    subgraph Agent["Agent process"]
-        SDK["packages/sdk\nFuseGuard middleware"]
-    end
-
-    subgraph ControlPlane["services/control-plane (Fastify)"]
-        Permit["/v1/permit"]
-        Breaker["/v1/breaker/*\ntrip · resume · disable · enable · status"]
-        PreflightAPI["/v1/preflight/*\nreport · status"]
-        DetectAPI["/v1/detectors/observe"]
-        WebhookAPI["/v1/webhooks/signoz"]
-        SlackAPI["/v1/slack/interactive"]
-        Runner["DetectorRunner\n(in-memory trailing window)"]
-        Worker["diagnosis-worker\n(fire-and-forget after a trip)"]
-    end
-
-    subgraph Store["Postgres"]
-        BreakerState[("breaker_state\nbreaker_audit_log")]
-        PreflightState[("preflight_state")]
-        Idem[("idempotency_keys")]
-    end
-
-    subgraph SigNoz["Self-hosted SigNoz"]
-        Collector["OTel Collector"]
-        CH[("ClickHouse\ntraces · metrics · logs")]
-        Alerts["Alert rules\nloop-signature · context-bloat · cost-velocity"]
-        Dashboard["Agent Cost Health\ndashboard"]
-        MCP["signoz-mcp server"]
-    end
-
-    Slack["Slack\n(incident channel)"]
-
-    SDK -- "permit check before every model call" --> Permit
-    SDK -- "step + span telemetry" --> DetectAPI
-    SDK -- "Preflight evidence" --> PreflightAPI
-    SDK -. "gen_ai spans/metrics (OTel)" .-> Collector
-
-    Permit --> BreakerState
-    Breaker --> BreakerState
-    Breaker --> Idem
-    PreflightAPI --> PreflightState
-
-    DetectAPI --> Runner
-    Runner -- "fuse.detector.score / .fired gauges" --> Collector
-    Collector --> CH
-    Alerts -- "query CH on a fixed cadence" --> CH
-    Alerts -- "webhook: alert fires" --> WebhookAPI
-    WebhookAPI -- "trip (scope from alert labels)" --> BreakerState
-    WebhookAPI -. "fire-and-forget" .-> Worker
-
-    Worker -- "fetch evidence spans" --> MCP
-    MCP --> CH
-    Worker -- "post incident card" --> Slack
-    Slack -- "resume button click" --> SlackAPI
-    SlackAPI -- "authorized resume" --> Breaker
-
-    CH --> Dashboard
-```
-
-## The closed loop, in one paragraph
-
-An agent's `FuseGuard` reports structural step/span telemetry (never raw
-prompt/tool content) to the control plane on every call. The control plane
-both persists this locally (`DetectorRunner`'s trailing window,
-`PreflightState`) and forwards it to SigNoz as OTel spans/metrics. SigNoz's
-own alert rules query the exact `fuse.detector.score`/`fuse.detector.fired`
-gauges the control plane emits, on a fixed evaluation cadence — when one
-crosses threshold, SigNoz calls back into the control plane's own webhook,
-which is the **only** thing that ever trips a breaker from outside an
-operator's own action. The trip immediately blocks the next `/v1/permit`
-call (the core guarantee), and independently kicks off diagnosis: the
-control plane asks SigNoz's own MCP server for the real evidence spans
-behind the trip, builds a deterministic (non-LLM) hypothesis, and posts it
-to Slack. An operator resumes from Slack or the API; either path is a real,
-audited call back into the same breaker the alert tripped. SigNoz is used
-as the **complete** observability substrate for this loop — traces/metrics
-in (via OTel), alerts evaluating them, a dashboard visualizing the same
-metrics, and MCP reading traces back out for diagnosis — not just a
-side-channel dashboard bolted onto a system that works some other way.
-
-## Why an in-process control plane, not "SigNoz does everything"
-
-SigNoz's own webhook channel is exactly how the alert-to-trip link above
-works — but SigNoz has no notion of a durable, epoch-based compare-and-swap
-breaker record, no per-tenant authorization model, and (critically) cannot
-sit synchronously in an agent's own call path to answer "am I allowed to
-make this call right now?" in single-digit milliseconds
-(`docs/adr/011-permit-load-test.md`'s p50 was 6ms). The control plane exists
-specifically as that durable, race-safe enforcement layer SigNoz's alerting
-triggers into — not a replacement for SigNoz's own telemetry/alerting
-engine, which this design deliberately keeps doing everything it already
-does well. See
-`docs/adr/002-system-boundaries-and-state-store.md` for the original
-reasoning and `docs/adr/006-signoz-alert-rule-provisioning.md` for the
-real, measured alert-to-trip latency (231s/331s in two live runs) this
-architecture accepts as a tradeoff.
-
-## Data flow sequence: one full incident
+## System View
 
 ```mermaid
-sequenceDiagram
-    participant Agent
-    participant CP as Control plane
-    participant SN as SigNoz
-    participant DW as diagnosis-worker
-    participant Slack
+flowchart LR
+  subgraph Agent[Agent process]
+    Guard[FuseGuard]
+    Window[Bounded step window]
+    Exporter[OTLP exporter wrapper]
+  end
 
-    Agent->>CP: POST /v1/detectors/observe (step telemetry)
-    CP->>CP: DetectorRunner evaluates loop/context-bloat/cost-velocity
-    CP-->>SN: fuse.detector.score / .fired (OTel export)
-    loop every evaluation cycle
-        SN->>SN: alert rule queries the gauge
-    end
-    SN->>CP: POST /v1/webhooks/signoz (alert firing)
-    CP->>CP: trip breaker for the alert's scope (epoch-CAS)
-    Agent->>CP: POST /v1/permit (next call)
-    CP-->>Agent: 200 allowed:false — blocked before dispatch
-    CP--)DW: fire-and-forget runDiagnosisAndNotify
-    DW->>SN: fetch evidence spans (MCP)
-    DW->>Slack: post incident card (or write local HTML snapshot)
-    Slack->>CP: POST /v1/slack/interactive (resume button)
-    CP->>CP: verify HMAC signature, open reason modal
-    Slack->>CP: view_submission (reason provided)
-    CP->>CP: resume breaker (authorized, audited)
-    Agent->>CP: POST /v1/permit (next call)
-    CP-->>Agent: 200 allowed:true — access restored
+  subgraph CP[Control plane]
+    Permit[POST /v1/permit]
+    Observe[POST /v1/detectors/observe]
+    Preflight[POST /v1/preflight/report]
+    Webhook[POST /v1/webhooks/signoz]
+    Worker[Diagnosis dispatcher]
+    SlackRoute[POST /v1/slack/interactive]
+  end
+
+  subgraph PG[PostgreSQL]
+    State[(breaker_state)]
+    Audit[(breaker_audit_log)]
+    PF[(preflight_state)]
+    Jobs[(diagnosis_jobs)]
+    Replay[(diagnosis_job_replay_audit)]
+  end
+
+  subgraph SN[SigNoz]
+    OTLP[OTel Collector]
+    Data[(traces and metrics)]
+    Rules[Alert rules]
+    Dashboard[Dashboard]
+    MCP[SigNoz MCP]
+  end
+
+  Slack[Slack]
+
+  Guard -->|before provider dispatch| Permit
+  Window -->|complete bounded window| Observe
+  Observe -->|evaluate and trip in one request| State
+  State --> Audit
+  Audit -->|same transaction| Jobs
+  Permit --> State
+  Exporter -->|real export result and samples| Preflight
+  Preflight --> PF
+  Exporter -.-> OTLP
+  Observe -.-> OTLP
+  OTLP --> Data
+  Data --> Rules
+  Data --> Dashboard
+  Rules -->|epoch-bound fallback| Webhook
+  Webhook --> State
+  Jobs --> Worker
+  Worker --> MCP
+  MCP --> Data
+  Worker --> Slack
+  Slack -->|signed, authorized, epoch-bound resume| SlackRoute
+  SlackRoute --> State
 ```
 
-## Component ownership (matches `README.md`'s repository-layout table)
+## Authoritative Enforcement Path
 
-| Layer            | Package/service                                                   | Owns                                                                        |
-| ---------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Contracts        | `packages/contracts`                                              | Every versioned wire schema (zod)                                           |
-| Enforcement      | `packages/breaker-core`, `packages/breaker-store`                 | The pure state machine and its Postgres-backed, epoch-CAS persistence       |
-| Telemetry health | `packages/preflight`                                              | protected/degraded/blind/disabled evaluation, with hysteresis               |
-| Detection        | `packages/detectors`, `services/control-plane`'s `DetectorRunner` | Pure detector math, and the live trailing-window evaluator                  |
-| SDK              | `packages/sdk`                                                    | `FuseGuard`, provider adapters, Preflight/step reporters                    |
-| API              | `services/control-plane`                                          | Every HTTP route (`docs/openapi.yaml`), auth, rate limiting                 |
-| Diagnosis        | `packages/diagnosis`                                              | SigNoz MCP client, deterministic hypothesis engine, Slack rendering/posting |
-| Observability    | `packages/otel`, `infra/signoz/`                                  | OTel bootstrap + instrumentation, alert rules, dashboard                    |
+The SDK owns one bounded trailing observation window per logical agent scope.
+After a completed step, it sends the full window to
+`POST /v1/detectors/observe`. This makes evaluation replica-independent: any
+control-plane instance can evaluate the request without local history.
+
+The route reads the current breaker epoch, resolves the immutable policy,
+evaluates all detectors, and commits the first firing trip with that epoch as a
+compare-and-swap condition. A firing observation is not acknowledged as a
+successful direct trip until PostgreSQL has committed the breaker transition,
+audit event, and diagnosis job. Concurrent duplicate observations converge on
+the same incident identity.
+
+Before every protected provider call, `FuseGuard` asks `POST /v1/permit`. If
+the scope is tripped, the provider callback is never invoked. This boundary
+does not cancel calls already past permit and cannot protect calls that bypass
+the guard.
+
+## SigNoz Path
+
+The direct detector result is also exported as OTel metrics. SigNoz stores and
+visualizes those signals and evaluates provisioned alert rules asynchronously.
+Each detector metric includes `fuse.source_epoch`; the alert rules preserve it
+as a label. The webhook uses that epoch as `expectedEpoch`.
+
+This makes SigNoz a safe fallback for the same breaker episode:
+
+- if the direct commit succeeded, a later alert is a no-op or stale;
+- if direct commit failed before state changed, a matching alert may trip the
+  still-current epoch;
+- after a resume advances the epoch, a delayed old alert cannot re-trip the
+  new episode;
+- alerts without a valid source epoch are observed as `unbound-alert` and do
+  not mutate breaker state.
+
+SigNoz also provides trace/metric retention, the operator dashboard, and the
+MCP query surface used for incident evidence. Fuse does not require SigNoz in
+the synchronous permit path.
+
+## Preflight Trust Path
+
+`ExporterHealthSpanExporter` wraps the real OTLP trace exporter. Only after the
+delegate export callback runs does it report:
+
+- exporter success or failure;
+- a process-instance identifier and monotonic sequence;
+- observation time;
+- bounded structural samples containing field presence and parent/root shape.
+
+`FuseOtelRuntime` routes that result to the matching guard. Structural
+observations use the ordinary exact-scope agent credential and
+`POST /v1/preflight/report`; exporter results use a separate exact-scope
+exporter-evidence credential and `POST /v1/preflight/exporter-evidence`.
+PostgreSQL orders evidence and rejects older reports. A `protected` result
+therefore requires a successful result reported by the exporter wrapper plus
+fresh, sufficient structural telemetry. Span creation or an ordinary agent
+credential cannot submit exporter delivery.
+
+This is capability separation, not remote attestation. The control plane can
+verify only that the request holds the exporter credential and matches its exact
+scope; it cannot prove which code produced the claim. The supported Node runtime
+is in-process, so a fully compromised agent able to read that credential can
+forge success. Deploy the exporter and credential in a separately protected
+process when that trust assumption is unacceptable.
+
+Preflight is an honesty signal, not a breaker transition. Its states are:
+
+| State       | Meaning                                                         |
+| ----------- | --------------------------------------------------------------- |
+| `protected` | The exporter role reported recent successful delivery evidence  |
+| `degraded`  | Telemetry is arriving but quality is incomplete                 |
+| `blind`     | Delivery failed, is stale, or evidence cannot support detection |
+| `disabled`  | An operator explicitly disabled Preflight monitoring            |
+
+## Durable Diagnosis
+
+A successful trip can create one `diagnosis_jobs` row in the same transaction
+as its breaker audit event. Workers claim due jobs with PostgreSQL row locks and
+leases. Active attempts renew ownership; expired leases can be reclaimed.
+Failures use bounded exponential backoff with jitter and eventually become
+`dead-letter`.
+
+Operators can list jobs with stable keyset pagination and replay only a
+dead-letter job. Replay requires the exact scope, manual actor, reason, and
+idempotency key, and writes an immutable replay-audit row. Delivery is
+at-least-once; Slack receives a deterministic `client_msg_id` to reduce
+duplicate cards across retries.
+
+Diagnosis remains off the enforcement path. MCP or Slack failure cannot undo a
+committed trip. A local snapshot is attempted before Slack, but filesystem,
+MCP, and Slack failures can still exhaust the job and require replay.
+
+## Resume Boundary
+
+Operator API resume requires an operator bearer token, reason, actor,
+idempotency key, and optional expected epoch. Slack additionally requires:
+
+- a valid HMAC signature over the raw request body;
+- a fresh Slack request timestamp;
+- an allowlisted Slack user;
+- the configured workspace, when one is set;
+- an operator credential selected for the incident tenant;
+- the exact trip epoch embedded in the incident action.
+
+The epoch condition prevents an old incident card from resuming a newer trip.
+
+## Shared State and Availability
+
+PostgreSQL is authoritative for registration, breaker state, audit,
+idempotency, Preflight, diagnosis delivery, and replay audit. Production rate
+limiting uses shared Redis; production startup refuses replica-local limiting.
+`/healthz` is dependency-free liveness and bypasses limiter storage. `/readyz`
+performs a bounded rate-limit Redis `PING`, then checks PostgreSQL, all required
+tables/columns, and the IDs plus SHA-256 content checksums of migrations `0001`
+through `0008`. The migration runner verifies the same manifest under its
+session advisory lock before applying pending files.
+
+Permit outage policy can be fail-closed or fail-open. Mutating routes never
+claim success when PostgreSQL is unavailable. The SDK has an independent
+control-plane outage policy because the server cannot dictate behavior while
+unreachable.
+
+## Data and Privacy
+
+Fuse emits structural identifiers, token counts, estimated cost, detector
+measurements, and control decisions. The supplied instrumentation does not
+emit raw prompts, completions, or tool arguments. Operator-provided audit
+reasons are persisted and must not contain secrets or customer content.
+Per-source Preflight structural evidence is active for twice the configured
+evidence-staleness threshold and retained for four times that threshold. The
+periodic sweeper deletes older rows in replica-safe, capped batches using
+PostgreSQL receipt time.
+
+## Deployment Shape
+
+The checked-in Kubernetes base uses two control-plane replicas, managed
+PostgreSQL, shared Redis, TLS ingress, immutable detector policy, and digest-
+pinned images. SigNoz and Slack are external asynchronous dependencies. The
+OCI Compose topology is a personal-project deployment, not an HA reference.
+
+See [deployment](./runbooks/deployment.md),
+[operations](./runbooks/operations.md), and
+[limitations](./runbooks/limitations.md).

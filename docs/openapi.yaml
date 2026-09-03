@@ -6,12 +6,13 @@ info:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
   description: >-
-    Hand-authored against the actual route/schema code (task.md §10.1's
-    "Contract: ... OpenAPI" item) — every path, method, and status code below
-    is verified against services/control-plane/src/routes/*.ts and
-    packages/contracts/src/*.ts directly, not guessed. This is the first
-    OpenAPI spec for this project; no code generation or request validation
-    is wired to it yet (see docs/runbooks/limitations.md).
+    Control-plane contract for scope registration, pre-call permits, direct
+    detector enforcement, Preflight telemetry health, breaker operations,
+    epoch-bound SigNoz fallback, diagnosis operations, and Slack callbacks.
+    Runtime validation is implemented with Zod; this document is not used for
+    server-side code generation. Every route except the unauthenticated health
+    and readiness probes is subject to the global rate limit. The Slack callback
+    uses Slack HMAC authentication rather than bearer authentication.
 servers:
   - url: https://{host}
     description: TLS-terminated production endpoint
@@ -29,10 +30,21 @@ components:
       type: http
       scheme: bearer
       description: >-
-        Bearer tokens have operator/agent/webhook roles based on their
-        env-var list. A `tenant:token` entry is bound to one tenant; a plain
-        token is an explicit wildcard. A role-correct token used against
-        another tenant or a token used against the wrong role gets 403.
+        Bearer tokens have operator/agent/exporter-evidence/webhook roles based
+        on their env-var list. Production agent and exporter-evidence
+        credentials bind an exact tenant, environment, and agentId and cannot
+        reuse the same raw token. Operator and webhook entries may use
+        `tenant:token` or an explicit plain wildcard. A role-correct token
+        used against another scope, or a token used against the wrong role,
+        gets 403.
+    slackSignature:
+      type: apiKey
+      in: header
+      name: X-Slack-Signature
+      description: >-
+        Slack HMAC SHA-256 signature over the exact request body. The required
+        X-Slack-Request-Timestamp header is also checked against the replay
+        window before any action is accepted.
 
   schemas:
     Scope:
@@ -49,6 +61,76 @@ components:
       properties:
         type: { type: string, enum: [system, manual, policy] }
         id: { type: string, minLength: 1 }
+
+    DiagnosisJobStatus:
+      type: string
+      enum: [pending, running, succeeded, dead-letter]
+
+    DiagnosisJob:
+      type: object
+      required:
+        [
+          auditEventId,
+          scope,
+          detector,
+          measurement,
+          reason,
+          correlationId,
+          startsAt,
+          tripEpoch,
+          notifySlack,
+          status,
+          attempts,
+          availableAt,
+          leasedBy,
+          leasedUntil,
+          lastError,
+          createdAt,
+          updatedAt,
+          completedAt,
+        ]
+      properties:
+        auditEventId: { type: string, format: uuid }
+        scope: { $ref: '#/components/schemas/Scope' }
+        detector: { type: string, maxLength: 200 }
+        measurement:
+          type: object
+          nullable: true
+          required: [detectorVersion, score, threshold, windowEnd]
+          properties:
+            detectorVersion: { type: string, maxLength: 200 }
+            score: { type: number }
+            threshold: { type: number }
+            windowEnd: { type: string, format: date-time }
+        reason: { type: string, maxLength: 2000 }
+        correlationId: { type: string, maxLength: 200 }
+        startsAt: { type: string, format: date-time }
+        tripEpoch: { type: integer, minimum: 0 }
+        notifySlack: { type: boolean }
+        status: { $ref: '#/components/schemas/DiagnosisJobStatus' }
+        attempts: { type: integer, minimum: 0, maximum: 100 }
+        availableAt: { type: string, format: date-time }
+        leasedBy: { type: string, nullable: true }
+        leasedUntil: { type: string, format: date-time, nullable: true }
+        lastError: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+
+    DiagnosisReplayRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, actor, reason, idempotencyKey]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        actor:
+          allOf:
+            - { $ref: '#/components/schemas/Actor' }
+            - type: object
+              properties:
+                type: { type: string, enum: [manual] }
+        reason: { type: string, minLength: 1, maxLength: 2000 }
+        idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
 
     FuseError:
       type: object
@@ -71,6 +153,13 @@ components:
             - store_unavailable
             - internal_error
         message: { type: string }
+        correlationId: { type: string }
+
+    SlackCallbackError:
+      type: object
+      required: [error, correlationId]
+      properties:
+        error: { type: string, enum: [invalid_request, unauthenticated, forbidden] }
         correlationId: { type: string }
 
     BreakerState:
@@ -161,7 +250,7 @@ components:
 
     PermitResponse:
       type: object
-      required: [allowed, state, reason, epoch, degraded, correlationId, record]
+      required: [allowed, state, reason, epoch, degraded, correlationId]
       properties:
         allowed: { type: boolean }
         state: { $ref: '#/components/schemas/PermitState' }
@@ -171,7 +260,6 @@ components:
           type: boolean
           description: 'true only when a store outage forced a fail-open/fail-closed default, not a real read'
         correlationId: { type: string }
-        record: { $ref: '#/components/schemas/BreakerRecord' }
 
     TripRequest:
       type: object
@@ -196,28 +284,57 @@ components:
         expectedEpoch:
           type: integer
           minimum: 0
-          nullable: true
-          description: 'optional optimistic-lock guard; alert-driven trips normally omit it'
+          maximum: 9007199254740991
+          description: >-
+            Optional optimistic-lock guard for operator force-trips. Direct
+            detector and SigNoz fallback trips bind their source epoch inside
+            the server implementation.
 
-    ResumeOrDisableOrEnableRequest:
+    ControlRequest:
       type: object
-      required: [scope, reason, actor, correlationId, idempotencyKey]
+      required: [scope, reason, actor, correlationId, idempotencyKey, expectedEpoch]
       properties:
         scope: { $ref: '#/components/schemas/Scope' }
         reason: { type: string, minLength: 1, maxLength: 2000 }
         actor: { $ref: '#/components/schemas/Actor' }
         correlationId: { type: string, minLength: 1, maxLength: 200 }
         idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
-        expectedEpoch: { type: integer, minimum: 0, nullable: true }
+        expectedEpoch:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: >-
+            Required optimistic-lock guard. Read the current breaker record and
+            submit its epoch; stale actions fail with 409 stale_epoch. There is
+            no force or unbound bypass.
+
+    ResumeRequest:
+      allOf:
+        - { $ref: '#/components/schemas/ControlRequest' }
+
+    DisableRequest:
+      allOf:
+        - { $ref: '#/components/schemas/ControlRequest' }
+
+    EnableRequest:
+      allOf:
+        - { $ref: '#/components/schemas/ControlRequest' }
 
     TransitionResponse:
       type: object
-      required: [record, auditEvent]
+      required: [record, auditEvent, noop]
       properties:
         record: { $ref: '#/components/schemas/BreakerRecord' }
         auditEvent:
           type: object
           description: 'the persisted breaker_audit_log row for this transition'
+        noop: { type: boolean }
+
+    BreakerStatusResponse:
+      type: object
+      required: [record]
+      properties:
+        record: { $ref: '#/components/schemas/BreakerRecord' }
 
     DetectorResult:
       type: object
@@ -246,15 +363,60 @@ components:
         evidence: { type: array, items: { type: string } }
         dedupeKey: { type: string }
 
-    StepObservation:
+    AvailablePricedStepObservation:
       type: object
-      required: [timestampMs, canonicalShape, inputTokens, outputTokens, estimatedCostUsd]
+      required:
+        [
+          executionId,
+          timestampMs,
+          canonicalShape,
+          inputTokens,
+          outputTokens,
+          pricingStatus,
+          estimatedCostUsd,
+        ]
       properties:
+        executionId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._:-]+$'
         timestampMs: { type: integer, minimum: 0 }
         canonicalShape: { type: string, minLength: 1 }
         inputTokens: { type: integer, minimum: 0 }
         outputTokens: { type: integer, minimum: 0 }
+        pricingStatus: { type: string, enum: [available] }
         estimatedCostUsd: { type: number, minimum: 0 }
+
+    UnavailablePricedStepObservation:
+      type: object
+      required:
+        [
+          executionId,
+          timestampMs,
+          canonicalShape,
+          inputTokens,
+          outputTokens,
+          pricingStatus,
+          estimatedCostUsd,
+        ]
+      properties:
+        executionId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._:-]+$'
+        timestampMs: { type: integer, minimum: 0 }
+        canonicalShape: { type: string, minLength: 1 }
+        inputTokens: { type: integer, minimum: 0 }
+        outputTokens: { type: integer, minimum: 0 }
+        pricingStatus: { type: string, enum: [unavailable] }
+        estimatedCostUsd: { type: number, nullable: true, enum: [null] }
+
+    StepObservation:
+      oneOf:
+        - { $ref: '#/components/schemas/AvailablePricedStepObservation' }
+        - { $ref: '#/components/schemas/UnavailablePricedStepObservation' }
 
     ObserveStepsRequest:
       type: object
@@ -312,6 +474,7 @@ components:
 
     PreflightReportRequest:
       type: object
+      additionalProperties: false
       required: [scope, spans]
       properties:
         scope: { $ref: '#/components/schemas/Scope' }
@@ -323,8 +486,41 @@ components:
           type: object
           properties:
             lastSeenAtMs: { type: integer, minimum: 0 }
+        revalidate:
+          type: boolean
+          description: >-
+            Re-evaluate persisted evidence against the current clock. When
+            true, spans must be empty and no other signal or disabled-state
+            field may be supplied.
         disabled: { type: boolean }
         disabledReason: { type: string, maxLength: 2000 }
+
+    ExporterDeliverySignal:
+      type: object
+      additionalProperties: false
+      required: [status, observedAtMs, sourceInstanceId, sequence]
+      properties:
+        status: { type: string, enum: [success, failure] }
+        observedAtMs: { type: integer, minimum: 0 }
+        sourceInstanceId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._:-]+$'
+        sequence: { type: integer, minimum: 1 }
+
+    PreflightExporterEvidenceRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, spans, exporterDelivery]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        spans:
+          type: array
+          maxItems: 2000
+          items: { $ref: '#/components/schemas/SpanTelemetrySample' }
+        exporterDelivery:
+          $ref: '#/components/schemas/ExporterDeliverySignal'
 
     PreflightResult:
       type: object
@@ -358,6 +554,12 @@ components:
           nullable: true
         pendingSince: { type: string, format: date-time, nullable: true }
 
+    PreflightResponse:
+      type: object
+      required: [result]
+      properties:
+        result: { $ref: '#/components/schemas/PreflightResult' }
+
     SignozAlertmanagerWebhookPayload:
       type: object
       required: [status, alerts]
@@ -381,7 +583,14 @@ components:
             required: [status, labels, startsAt, fingerprint]
             properties:
               status: { type: string, enum: [firing, resolved] }
-              labels: { type: object, additionalProperties: { type: string } }
+              labels:
+                type: object
+                additionalProperties: { type: string }
+                description: >-
+                  Firing fallback alerts need scope labels, fuse.detector, and
+                  a canonical fuse.source_epoch (dotted or underscored aliases
+                  are normalized). Missing/invalid source epochs are accepted
+                  only as non-enforcing unbound-alert outcomes.
               annotations: { type: object, additionalProperties: { type: string } }
               startsAt: { type: string }
               endsAt: { type: string }
@@ -402,11 +611,19 @@ components:
       content:
         application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
     TooManyRequests:
-      description: Rate limit exceeded (CONTROL_PLANE_RATE_LIMIT_MAX/_WINDOW_MS)
+      description: Global rate limit exceeded (CONTROL_PLANE_RATE_LIMIT_MAX/_WINDOW_MS)
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+    InternalError:
+      description: Unexpected server error; the response never includes a stack or secret
       content:
         application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
     StoreUnavailable:
-      description: The Postgres state store is unreachable; mutating routes always fail here (503), never report a fabricated success
+      description: >-
+        Required request storage is unavailable. This includes the shared Redis
+        global rate-limit store before route handling and route-specific
+        PostgreSQL storage. The request fails closed with 503 and is not reported
+        as a fabricated success.
       content:
         application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
 
@@ -422,31 +639,50 @@ paths:
           content:
             application/json:
               schema:
-                { type: object, properties: { status: { type: string, enum: [ok] } } }
-        '429': { $ref: '#/components/responses/TooManyRequests' }
+                {
+                  type: object,
+                  required: [status],
+                  properties: { status: { type: string, enum: [ok] } },
+                }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /readyz:
     get:
       operationId: getReadyz
-      summary: Readiness probe — checks the Postgres store
+      summary: Readiness probe - checks Redis, PostgreSQL, and the complete required schema
       security: []
       responses:
         '200':
-          description: Store reachable
+          description: Rate-limit Redis and PostgreSQL reachable; migrations 0001 through 0008 present
           content:
             application/json:
               schema:
-                { type: object, properties: { status: { type: string, enum: [ready] } } }
+                {
+                  type: object,
+                  required: [status],
+                  properties: { status: { type: string, enum: [ready] } },
+                }
         '503':
-          description: Store unreachable — a load balancer should stop routing here
+          description: Redis/PostgreSQL unreachable or schema stale - stop routing here
           content:
             application/json:
               schema:
                 type: object
+                required: [status, reason]
                 properties:
                   status: { type: string, enum: [not-ready] }
-                  reason: { type: string, enum: [store_unavailable] }
-        '429': { $ref: '#/components/responses/TooManyRequests' }
+                  reason:
+                    {
+                      type: string,
+                      enum:
+                        [
+                          rate_limit_store_unavailable,
+                          store_unavailable,
+                          schema_not_ready,
+                        ],
+                    }
+                  dependency: { type: string, enum: [redis] }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /v1/scopes/register:
     post:
@@ -475,6 +711,8 @@ paths:
           description: Per-tenant registered-scope capacity reached
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/policies/effective:
@@ -503,12 +741,14 @@ paths:
           description: Scope has not been registered by an operator
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/permit:
     post:
       operationId: postPermit
-      summary: Check whether a guarded LLM call may proceed (the hot path — see docs/adr/011-permit-load-test.md)
+      summary: Check whether a guarded LLM call may proceed
       requestBody:
         required: true
         content:
@@ -525,11 +765,9 @@ paths:
           description: Scope has not been registered by an operator
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
-        '503':
-          description: Breaker store unavailable
-          content:
-            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /v1/breaker/trip:
     post:
@@ -556,6 +794,8 @@ paths:
           description: idempotency_conflict / stale_epoch / invalid_transition
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/breaker/resume:
@@ -565,8 +805,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
-            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+          application/json: { schema: { $ref: '#/components/schemas/ResumeRequest' } }
       responses:
         '200':
           description: Transition applied
@@ -580,6 +819,8 @@ paths:
           description: cooldown_active / idempotency_conflict / stale_epoch / invalid_transition
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/breaker/disable:
@@ -589,8 +830,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
-            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+          application/json: { schema: { $ref: '#/components/schemas/DisableRequest' } }
       responses:
         '200':
           description: Transition applied
@@ -600,6 +840,12 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: idempotency_conflict / stale_epoch / invalid_transition
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/breaker/enable:
@@ -609,8 +855,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
-            { schema: { $ref: '#/components/schemas/ResumeOrDisableOrEnableRequest' } }
+          application/json: { schema: { $ref: '#/components/schemas/EnableRequest' } }
       responses:
         '200':
           description: Transition applied
@@ -620,6 +865,12 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: idempotency_conflict / stale_epoch / invalid_transition
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/breaker/status:
@@ -634,21 +885,26 @@ paths:
         '200':
           description: Current record
           content:
-            application/json: { schema: { $ref: '#/components/schemas/BreakerRecord' } }
+            application/json:
+              { schema: { $ref: '#/components/schemas/BreakerStatusResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: unknown_scope — never seen before
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/preflight/report:
     post:
       operationId: postPreflightReport
       summary: >-
-        Report structural telemetry-health evidence for a scope (agent-tier
-        token; operator-tier required only when the body sets
-        disabled/disabledReason)
+        Report structural telemetry-health observations for a scope. This
+        strict contract rejects exporterDelivery (agent-tier token;
+        operator-tier required only for disabled/disabledReason).
       requestBody:
         required: true
         content:
@@ -658,10 +914,46 @@ paths:
         '200':
           description: Committed Preflight state after evaluating this report
           content:
-            application/json: { schema: { $ref: '#/components/schemas/PreflightResult' } }
+            application/json:
+              { schema: { $ref: '#/components/schemas/PreflightResponse' } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/preflight/exporter-evidence:
+    post:
+      operationId: postPreflightExporterEvidence
+      summary: >-
+        Report one bounded OTLP exporter result (separate exact-scope
+        exporter-evidence credential only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            { schema: { $ref: '#/components/schemas/PreflightExporterEvidenceRequest' } }
+      responses:
+        '200':
+          description: Committed Preflight state after evaluating exporter evidence
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/PreflightResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Scope has not been registered by an operator
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/preflight/status:
     get:
@@ -675,13 +967,18 @@ paths:
         '200':
           description: Current Preflight result
           content:
-            application/json: { schema: { $ref: '#/components/schemas/PreflightResult' } }
+            application/json:
+              { schema: { $ref: '#/components/schemas/PreflightResponse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: unknown_scope
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/detectors/observe:
     post:
@@ -709,18 +1006,98 @@ paths:
           description: Detector trip contention could not be resolved; retry
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
-        '503':
-          description: Scope registry/store unavailable or no active detector policy
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/diagnosis/jobs:
+    get:
+      operationId: listDiagnosisJobs
+      summary: List diagnosis delivery jobs (operator-only and tenant-bound)
+      parameters:
+        - {
+            in: query,
+            name: tenant,
+            required: true,
+            schema: { type: string, maxLength: 128 },
+          }
+        - { in: query, name: environment, schema: { type: string, maxLength: 64 } }
+        - { in: query, name: agentId, schema: { type: string, maxLength: 128 } }
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/DiagnosisJobStatus' }
+        - {
+            in: query,
+            name: limit,
+            schema: { type: integer, minimum: 1, maximum: 100, default: 50 },
+          }
+        - { in: query, name: cursor, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: Stable keyset-paginated diagnosis jobs for the authorized tenant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs, nextCursor]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: '#/components/schemas/DiagnosisJob' }
+                  nextCursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/diagnosis/jobs/{auditEventId}/replay:
+    post:
+      operationId: replayDiagnosisJob
+      summary: Requeue one dead-letter diagnosis job with audited operator attribution
+      parameters:
+        - in: path
+          name: auditEventId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiagnosisReplayRequest' }
+      responses:
+        '200':
+          description: Job requeued, or the same idempotent replay result returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job, replayed]
+                properties:
+                  job: { $ref: '#/components/schemas/DiagnosisJob' }
+                  replayed: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No job exists for the supplied tenant/environment/agent scope
           content:
             application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '409':
+          description: Job is live/succeeded, or the idempotency key conflicts
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/webhooks/signoz:
     post:
       operationId: postWebhooksSignoz
       summary: >-
-        SigNoz's Alertmanager-compatible webhook channel (webhook-tier
-        token; scope named by the alert's own labels, not by the token —
-        see docs/threat-model.md §3)
+        SigNoz Alertmanager-compatible epoch-bound fallback (webhook-tier
+        token; scope and source breaker epoch come from alert labels)
       requestBody:
         required: true
         content:
@@ -737,14 +1114,19 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [correlationId, results]
                 properties:
-                  outcomes:
+                  correlationId: { type: string }
+                  results:
                     type: array
                     items:
                       { type: object, description: 'per-alert outcome, see webhook.ts' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/slack/interactive:
     post:
@@ -754,7 +1136,8 @@ paths:
         — authenticated by Slack's own HMAC request signature, NOT a bearer
         token (see docs/adr/007-signoz-mcp-diagnosis.md and
         slack-actions.ts)
-      security: []
+      security:
+        - slackSignature: []
       requestBody:
         required: true
         content:
@@ -775,4 +1158,18 @@ paths:
             Missing/invalid X-Slack-Signature, or a stale
             X-Slack-Request-Timestamp — fail-closed on either
           content:
-            application/json: { schema: { $ref: '#/components/schemas/FuseError' } }
+            application/json:
+              { schema: { $ref: '#/components/schemas/SlackCallbackError' } }
+        '403':
+          description: Signed request from a user or workspace not authorized to resume
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/SlackCallbackError' } }
+        '400':
+          description: Missing or malformed Slack form payload
+          content:
+            application/json:
+              { schema: { $ref: '#/components/schemas/SlackCallbackError' } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }

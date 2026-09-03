@@ -22,12 +22,33 @@ All notable changes to Fuse are documented here. The project follows
 - Direct SDK detector enforcement: the SDK carries a bounded complete window,
   the control plane commits a trip before acknowledging a firing observation,
   and the next guarded provider call is denied.
-- A tag/manual release workflow that verifies the full suite and publishes
+- Exporter-confirmed Preflight evidence with ordered source-instance sequences;
+  span creation alone can no longer produce a `protected` result.
+- Epoch-bound SigNoz detector metrics and webhook fallback. Delayed alerts from
+  an earlier breaker episode are rejected after resume.
+- Durable PostgreSQL diagnosis delivery with leasing, renewal, bounded retry and
+  jitter, dead-letter status, operator listing, and audited idempotent replay.
+- Slack resume authorization by request freshness/signature, user allowlist,
+  optional workspace, tenant-appropriate operator token, and trip epoch.
+- Publishable `@fuse/contracts`, `@fuse/otel`, and `@fuse/sdk` tarballs plus an
+  isolated external-consumer packaging test.
+- A manual release workflow that verifies the full suite and publishes
   immutable `linux/amd64` and `linux/arm64` images to GHCR, plus an OCI
   Always Free personal-deployment Compose definition and runbook.
+- Manual-only, protected-environment release promotion from `main`: both
+  architectures are smoke-tested and vulnerability-scanned, assembled under
+  run-specific staging tags, covered by validated workspace/image SBOMs and
+  digest-bound attestations, then promoted to version, commit, and stable
+  `latest` aliases as the final operation. Exact-digest reruns are idempotent;
+  conflicting immutable aliases fail closed.
 
 ### Fixed
 
+- Removed the unsupported unscoped detector-observation compatibility payload;
+  public observations now require `executionId` and explicit `pricingStatus`.
+- Expanded the isolated tarball consumer gate to prove default `runStep`
+  detection/enforcement, real localhost OTLP export, exporter evidence, public
+  declarations, and supported SDK subpath exports without disabling reporting.
 - Prevented low-token normal conversations from triggering context-growth
   detection solely because a tiny starting value increased by a large ratio.
 - Prevented duplicate Slack incident cards when two replicas receive the same
@@ -50,18 +71,17 @@ All notable changes to Fuse are documented here. The project follows
   exits `0` with real applied migrations, not a silent no-op.
 - Updated Fastify's transitive `find-my-way` router from 9.6.0 to 9.7.0 to
   remediate GHSA-c96f-x56v-gq3h (HTTP/2 denial of service).
-- Corrected `demo:real-detect` so it clears the newer synchronous detector
-  trip and only reports success after a separately attributed SigNoz webhook
-  trip; added Windows-safe LF shell checkouts and WSL Docker credential-helper
-  isolation for the SigNoz launcher.
+- Corrected `demo:real-detect` to attribute the low-latency stop to the direct
+  detector trip, prove zero provider dispatches on the next guarded call, and
+  describe SigNoz as asynchronous corroboration/fallback.
 
 ### Operational notes
 
 - Production requires externally managed PostgreSQL backups/PITR, real
   hostname/TLS and secret-manager values, an immutable registry digest plus
   image scan, and monitored alert destinations.
-- Breaker state and audit transitions are durable; diagnosis/Slack delivery is
-  best-effort and does not yet use a durable outbox.
+- Breaker, audit, and diagnosis-job acceptance are transactional. Diagnosis
+  delivery is at-least-once and may require operator replay from dead-letter.
 - Schema migrations are forward-only. See
   `docs/runbooks/deployment.md` and `docs/runbooks/limitations.md` before
   promotion.
