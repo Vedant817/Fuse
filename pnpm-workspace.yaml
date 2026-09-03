@@ -8,8 +8,9 @@ allowBuilds:
   ssh2: true
 overrides:
   '@hono/node-server': '2.0.10'
-  'fast-uri@>=3.0.0 <3.1.5': '3.1.5'
-  'fast-uri@>=4.0.0 <4.1.2': '4.1.2'
+  'fast-uri@>=3.0.0 <3.1.6': '3.1.6'
+  'fast-uri@>=4.0.0 <4.1.3': '4.1.3'
+  'qs@<6.16.0': '6.16.0'
   find-my-way@<=9.6.0: '>=9.6.1'
   hono@<4.12.34: '4.12.34'
   ip-address@<=10.3.0: '10.3.1'

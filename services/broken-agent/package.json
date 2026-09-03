@@ -35,7 +35,7 @@
     "@opentelemetry/sdk-trace-node": "^2.9.0",
     "@testcontainers/postgresql": "^10.16.0",
     "@types/pg": "^8.11.10",
-    "fastify": "^5.2.1",
+    "fastify": "^5.12.1",
     "pg": "^8.13.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
