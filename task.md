@@ -3887,3 +3887,12 @@ the earlier checkmarks:
   genuine mid-test idle errors still fail the suite. Verified locally:
   breaker-store 55/55, control-plane 73/73, sdk 11/11, broken-agent 5/5 with
   no unhandled-error sections, plus format/lint/typecheck green.
+- Follow-up CI run `33732703795` confirmed audit, quality/integration, and
+  packaging green, but newly reached the container job (previously skipped)
+  which failed on a stale assertion expecting image user `node`. The scratch
+  runtime correctly uses numeric `1000:1000` with no username; release smoke
+  already asserted that. Fixed `ci.yml` to assert `1000:1000`.
+- Final CI run `33734922951` on `0950352` is fully green: Dependency audit
+  and SBOM, Quality and integration, Build and smoke-test container, and
+  Pack and test external SDK consumer all succeed. Pushed as `0950352`
+  `fix(ci): assert scratch numeric user in container smoke`.
