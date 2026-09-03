@@ -19,7 +19,8 @@
             "groupBy": [
               { "name": "fuse.tenant" },
               { "name": "fuse.environment" },
-              { "name": "fuse.agent_id" }
+              { "name": "fuse.agent_id" },
+              { "name": "fuse.source_epoch" }
             ],
             "aggregations": [
               {
@@ -40,7 +41,7 @@
   },
   "labels": { "severity": "critical", "fuse_detector": "cost-velocity" },
   "annotations": {
-    "summary": "Fuse: cost-velocity detector fired for {{$labels.fuse_agent_id}}",
+    "summary": "Fuse: cost-velocity detector fired for {{$labels.fuse_agent_id}} at breaker epoch {{$labels.fuse_source_epoch}}",
     "description": "Estimated spend in the trailing window crossed the configured threshold — see docs/adr/006-signoz-alert-rule-provisioning.md and packages/detectors/src/cost-velocity.ts."
   },
   "disabled": false,

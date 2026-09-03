@@ -5,7 +5,7 @@ resources:
   - namespace.yaml
   - service-account.yaml
   - config-map.yaml
-  - detector-policy-config-map.yaml
+  - migration-job.yaml
   - deployment.yaml
   - pod-disruption-budget.yaml
   - idempotency-cleanup-cronjob.yaml
@@ -17,6 +17,26 @@ labels:
     pairs:
       app.kubernetes.io/part-of: fuse
       app.kubernetes.io/managed-by: kustomize
+configMapGenerator:
+  - name: fuse-detector-policy
+    files:
+      - production.json=production-detector-policy.json
+patches:
+  # Plain kubectl apply has no migration-before-Deployment ordering. Keep the
+  # Job visible in the rendered release without starting it concurrently;
+  # operators run migration-job.yaml directly and wait before applying this base.
+  - target:
+      group: batch
+      version: v1
+      kind: Job
+      name: fuse-control-plane-migrate
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: fuse-control-plane-migrate-template
+      - op: add
+        path: /spec/suspend
+        value: true
 images:
   - name: ghcr.io/vedant817/fuse-control-plane
-    newTag: 0.1.0
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

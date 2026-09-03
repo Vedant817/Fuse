@@ -1,5 +1,5 @@
 {
-  "alert": "fuse-loop-signature",
+  "alert": "fuse-preflight-health",
   "alertType": "METRIC_BASED_ALERT",
   "ruleType": "threshold_rule",
   "evalWindow": "1m",
@@ -15,16 +15,14 @@
             "name": "A",
             "signal": "metrics",
             "stepInterval": "60s",
-            "filter": { "expression": "fuse.detector = 'loop-signature'" },
             "groupBy": [
               { "name": "fuse.tenant" },
               { "name": "fuse.environment" },
-              { "name": "fuse.agent_id" },
-              { "name": "fuse.source_epoch" }
+              { "name": "fuse.agent_id" }
             ],
             "aggregations": [
               {
-                "metricName": "fuse.detector.fired",
+                "metricName": "fuse.preflight.self_alert.active",
                 "temporality": "unspecified",
                 "timeAggregation": "latest",
                 "spaceAggregation": "max"
@@ -39,11 +37,11 @@
     "target": 1,
     "matchType": "at_least_once"
   },
-  "labels": { "severity": "critical", "fuse_detector": "loop-signature" },
+  "labels": { "severity": "critical", "fuse_signal": "preflight-health" },
   "annotations": {
-    "summary": "Fuse: loop-signature detector fired for {{$labels.fuse_agent_id}} at breaker epoch {{$labels.fuse_source_epoch}}",
-    "description": "A repeating step-shape cycle was detected past the configured minRepetitions threshold — see docs/adr/006-signoz-alert-rule-provisioning.md and packages/detectors/src/loop-signature.ts."
+    "summary": "Fuse protection degraded for {{$labels.fuse_agent_id}}",
+    "description": "Preflight no longer has current, acknowledged OTLP delivery for this scope. Inspect fuse.preflight.self_alert.transitions for the reason code, restore the agent exporter, and wait for the configured recovery dwell. This alert is advisory and does not synchronously gate detector enforcement."
   },
   "disabled": false,
-  "preferredChannels": ["fuse-control-plane"]
+  "preferredChannels": ["fuse-preflight-health"]
 }

@@ -2,7 +2,7 @@
 
 # The tag is human-readable; the manifest-list digest makes the base immutable
 # while retaining multi-architecture resolution.
-ARG NODE_IMAGE=node:24.14.0-alpine3.23@sha256:7fddd9ddeae8196abf4a3ef2de34e11f7b1a722119f91f28ddf1e99dcafdf114
+ARG NODE_IMAGE=node:24.19.0-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
 
 FROM ${NODE_IMAGE} AS tooling
 
@@ -41,13 +41,26 @@ COPY LICENSE ./
 
 RUN pnpm --filter @fuse/control-plane... run build
 RUN --mount=type=cache,id=fuse-pnpm-store,target=/pnpm/store \
-  pnpm --filter @fuse/control-plane deploy --prod --legacy /opt/fuse-control-plane
+  pnpm --filter @fuse/control-plane deploy --prod --legacy /opt/fuse-control-plane \
+  && rm -rf /opt/fuse-control-plane/src /opt/fuse-control-plane/coverage \
+  && find -L /opt/fuse-control-plane/node_modules/@fuse -mindepth 2 -maxdepth 2 \
+    -type d \( -name src -o -name coverage \) -exec rm -rf '{}' +
 
-FROM ${NODE_IMAGE} AS runtime
+FROM ${NODE_IMAGE} AS runtime-files
+
+RUN mkdir -p /runtime/usr/local/bin /runtime/usr/lib /runtime/lib /runtime/etc/ssl/certs \
+  && cp /usr/local/bin/node /runtime/usr/local/bin/node \
+  && cp -L /usr/lib/libstdc++.so.6 /usr/lib/libgcc_s.so.1 /runtime/usr/lib/ \
+  && cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /runtime/lib/ \
+  && cp /etc/ssl/certs/ca-certificates.crt /runtime/etc/ssl/certs/ca-certificates.crt
+
+FROM scratch AS runtime
 
 ARG BUILD_DATE
 ARG VCS_REF
-ARG VERSION=0.1.0
+# Local/source builds are not releases. The release workflow supplies the
+# intentional changelog-cut version as a build argument.
+ARG VERSION=dev
 
 LABEL org.opencontainers.image.title="Fuse control plane" \
   org.opencontainers.image.description="OTel-native cost circuit breaker control plane for AI agents" \
@@ -58,22 +71,17 @@ LABEL org.opencontainers.image.title="Fuse control plane" \
   org.opencontainers.image.licenses="Apache-2.0"
 
 ENV NODE_ENV=production \
+  PATH=/usr/local/bin \
   CONTROL_PLANE_HOST=0.0.0.0 \
   CONTROL_PLANE_PORT=8090
 
 WORKDIR /app
 
-COPY --from=build --chown=node:node /opt/fuse-control-plane/ ./
-COPY --from=build --chown=node:node /workspace/LICENSE ./LICENSE
+COPY --from=runtime-files /runtime/ /
+COPY --from=build --chown=1000:1000 /opt/fuse-control-plane/ ./
+COPY --from=build --chown=1000:1000 /workspace/LICENSE ./LICENSE
 
-# `pnpm deploy --prod` provides only production dependencies. Remove workspace
-# TypeScript sources retained by legacy workspace deployment; compiled output
-# and breaker-store SQL migrations remain.
-RUN rm -rf /app/src /app/coverage \
-  && find -L /app/node_modules/@fuse -mindepth 2 -maxdepth 2 \
-    -type d \( -name src -o -name coverage \) -exec rm -rf '{}' +
-
-USER node
+USER 1000:1000
 
 EXPOSE 8090
 

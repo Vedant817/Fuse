@@ -1,10 +1,39 @@
 name: fuse-personal-production
 
 services:
+  redis:
+    image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
+    command:
+      - redis-server
+      - --save
+      - ''
+      - --appendonly
+      - 'no'
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - noeviction
+    read_only: true
+    tmpfs:
+      - /data:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 96m
+    cpus: 0.25
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
   migrate:
     image: ${FUSE_CONTROL_PLANE_IMAGE:?set FUSE_CONTROL_PLANE_IMAGE to an immutable GHCR digest}
     env_file:
-      - ${FUSE_ENV_FILE:-/etc/fuse/control-plane.env}
+      - ${FUSE_MIGRATION_ENV_FILE:-/etc/fuse/migration.env}
     command:
       - node
       - node_modules/@fuse/breaker-store/dist/migrate.js
@@ -24,6 +53,15 @@ services:
       CONTROL_PLANE_PORT: '8090'
       CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: production
       CONTROL_PLANE_DETECTOR_POLICY_FILE: /app/policies/production.json
+      CONTROL_PLANE_RATE_LIMIT_REDIS_URL: redis://redis:6379/0
+      # Required secret value supplied by the host/secret manager, not this
+      # manifest. Exact form: tenant:environment:agentId:token.
+      CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: ${CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS:?set an exact-scope exporter evidence credential}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../kubernetes/production-detector-policy.json:/app/policies/production.json:ro
     ports:
       - 127.0.0.1:8090:8090
     extra_hosts:

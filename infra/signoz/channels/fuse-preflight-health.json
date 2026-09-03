@@ -1,0 +1,13 @@
+{
+  "name": "fuse-preflight-health",
+  "type": "slack",
+  "slack_configs": [
+    {
+      "send_resolved": true,
+      "api_url": "__PREFLIGHT_SLACK_WEBHOOK_URL__",
+      "channel": "#fuse-incidents",
+      "title": "[{{ .Status | toUpper }}] Fuse telemetry protection health",
+      "text": "{{ range .Alerts }}*Scope:* {{ .Labels.fuse_tenant }}/{{ .Labels.fuse_environment }}/{{ .Labels.fuse_agent_id }}\n*Summary:* {{ .Annotations.summary }}\n*Description:* {{ .Annotations.description }}\n{{ end }}"
+    }
+  ]
+}

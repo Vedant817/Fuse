@@ -7,3 +7,4 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: fuse-control-plane
+      app.kubernetes.io/component: control-plane

@@ -1,0 +1,964 @@
+[
+  {
+    "alert": "fuse-operational-permit-p95-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "s",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.permit.duration",
+                  "timeAggregation": "p95",
+                  "spaceAggregation": "max"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 0.05,
+            "targetUnit": "s",
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "warning",
+      "fuse_signal": "permit-p95",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Permit p95 exceeds provisional 50 ms objective",
+      "description": "Opens after every evaluated point in 5m exceeds 50 ms; resolves when the rolling condition clears. Idle traffic is not no-data. See docs/runbooks/operations.md#provisional-operational-slos."
+    }
+  },
+  {
+    "alert": "fuse-operational-permit-error-rate-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "percent",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.outcome IN ['degraded', 'server_error']"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.permit.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "B",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.permit.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_formula",
+            "spec": { "name": "F1", "expression": "(A / B) * 100" }
+          }
+        ]
+      },
+      "selectedQueryName": "F1",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0.1,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "permit-error-rate",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Permit error rate exceeds provisional 0.1% objective",
+      "description": "Degraded unknown-state decisions and server errors consume this budget. Opens on a 5m breach and resolves when the rolling rate clears; idle is not no-data."
+    }
+  },
+  {
+    "alert": "fuse-operational-permit-deny-p95-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "s",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.outcome = 'denied'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.permit.duration",
+                  "timeAggregation": "p95",
+                  "spaceAggregation": "max"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 0.05,
+            "targetUnit": "s",
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "permit-deny-p95",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Permit denial p95 exceeds provisional 50 ms objective",
+      "description": "Opens when deny-path p95 remains above 50 ms for 5m and resolves when it clears. No denied traffic is healthy idle, not no-data."
+    }
+  },
+  {
+    "alert": "fuse-operational-detector-observation-p95-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "s",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.detector_observation.duration",
+                  "timeAggregation": "p95",
+                  "spaceAggregation": "max"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 0.1,
+            "targetUnit": "s",
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "warning",
+      "fuse_signal": "detector-observation-p95",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Detector observation p95 exceeds provisional 100 ms objective",
+      "description": "Opens after a sustained 5m latency breach and resolves when the rolling condition clears. Idle observation streams do not create no-data alerts."
+    }
+  },
+  {
+    "alert": "fuse-operational-detector-observation-errors-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "percent",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.outcome IN ['auth_failure', 'client_error', 'server_error']"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.detector_observation.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "B",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.detector_observation.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_formula",
+            "spec": { "name": "F1", "expression": "(A / B) * 100" }
+          }
+        ]
+      },
+      "selectedQueryName": "F1",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 1,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "detector-observation-error-rate",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Detector observation error rate exceeds provisional 1% objective",
+      "description": "Opens on a 5m server-error ratio breach and resolves after the rolling window clears; idle is not no-data."
+    }
+  },
+  {
+    "alert": "fuse-operational-webhook-auth-failures-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.outcome = 'auth_failure'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.webhook.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "warning",
+      "fuse_signal": "webhook-auth-failures",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "SigNoz webhook authentication failure observed",
+      "description": "Opens on any 401/403 in 5m and resolves after a clean rolling window. No webhook traffic is valid idle, not no-data. Investigate token drift or forgery attempts."
+    }
+  },
+  {
+    "alert": "fuse-operational-webhook-processing-errors-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "percent",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.outcome IN ['client_error', 'server_error']"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.webhook.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "B",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "disabled": true,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.control_plane.webhook.requests",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          },
+          {
+            "type": "builder_formula",
+            "spec": { "name": "F1", "expression": "(A / B) * 100" }
+          }
+        ]
+      },
+      "selectedQueryName": "F1",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 1,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "webhook-processing-error-rate",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Webhook processing error rate exceeds provisional 1% objective",
+      "description": "Opens on a 5m non-auth processing-failure ratio breach and resolves when the rolling condition clears; auth failures are tracked separately."
+    }
+  },
+  {
+    "alert": "fuse-operational-diagnosis-backlog-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.diagnosis.status = 'pending'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.diagnosis.queue.jobs",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": true,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 100,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "10m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": {
+        "enabled": true,
+        "interval": "30m",
+        "alertStates": ["firing", "nodata"]
+      }
+    },
+    "labels": {
+      "severity": "warning",
+      "fuse_signal": "diagnosis-backlog",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Diagnosis pending backlog exceeds provisional 100-job objective",
+      "description": "Opens when pending depth stays above 100 for 10m or after five consecutive no-data evaluations. Resolves after queue depth returns within target and samples resume."
+    }
+  },
+  {
+    "alert": "fuse-operational-diagnosis-dead-letters-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.diagnosis.status = 'dead-letter'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.diagnosis.queue.jobs",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": true,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": {
+        "enabled": true,
+        "interval": "30m",
+        "alertStates": ["firing", "nodata"]
+      }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "diagnosis-dead-letters",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Diagnosis dead-letter job exists",
+      "description": "Opens when any dead-letter is observed or after five consecutive no-data evaluations. Resolves only after queue samples resume with zero dead letters."
+    }
+  },
+  {
+    "alert": "fuse-operational-diagnosis-lease-renewal-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.diagnosis.lease_renewal.failures",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "diagnosis-lease-renewal-failures",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Diagnosis lease renewal failed",
+      "description": "Opens on any renewal rejection/error in 5m and resolves after a clean window. Inspect PostgreSQL connectivity and competing workers before replaying jobs."
+    }
+  },
+  {
+    "alert": "fuse-operational-redis-readiness-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.rate_limit.redis.ready",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "min"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": true,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "below",
+            "matchType": "at_least_once",
+            "target": 1,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": {
+        "enabled": true,
+        "interval": "30m",
+        "alertStates": ["firing", "nodata"]
+      }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "redis-readiness",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Rate-limit Redis is unavailable or readiness telemetry stopped",
+      "description": "Opens on ready=0 or after five consecutive no-data evaluations. Resolves only after ready=1 is observed. Normal API traffic remains fail-closed while Redis is unavailable."
+    }
+  },
+  {
+    "alert": "fuse-operational-preflight-stale-no-data-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional' AND fuse.preflight.health_class IN ['stale', 'no_data']"
+              },
+              "groupBy": [
+                {
+                  "name": "fuse.preflight.health_class",
+                  "fieldContext": "attribute",
+                  "fieldDataType": "string"
+                }
+              ],
+              "aggregations": [
+                {
+                  "metricName": "fuse.preflight.evaluations",
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": false,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": ["fuse.preflight.health_class"],
+      "usePolicy": false,
+      "renotify": { "enabled": false, "interval": "30m", "alertStates": [] }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "preflight-stale-no-data",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Preflight committed stale or no-data protection evidence",
+      "description": "Opens when any committed evaluation is stale/no_data and resolves after the rolling window has no such evaluation. Scope identity stays on the separate bounded-registration Preflight incident metric."
+    }
+  },
+  {
+    "alert": "fuse-operational-preflight-sweeper-v1",
+    "alertType": "METRIC_BASED_ALERT",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "filter": {
+                "expression": "fuse.slo.version = 'v1-provisional'"
+              },
+              "aggregations": [
+                {
+                  "metricName": "fuse.preflight.sweep.healthy",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "min"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "alertOnAbsent": true,
+      "absentFor": 5,
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "below",
+            "matchType": "at_least_once",
+            "target": 1,
+            "channels": ["fuse-operations"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": { "evalWindow": "5m", "frequency": "1m" }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "usePolicy": false,
+      "renotify": {
+        "enabled": true,
+        "interval": "30m",
+        "alertStates": ["firing", "nodata"]
+      }
+    },
+    "labels": {
+      "severity": "critical",
+      "fuse_signal": "preflight-sweeper",
+      "fuse_slo_version": "v1-provisional"
+    },
+    "annotations": {
+      "summary": "Preflight stale-evidence sweeper failed or stopped reporting",
+      "description": "Opens on any failed sweep or after five consecutive no-data evaluations. Resolves after successful sweep samples resume and the failure window clears."
+    }
+  }
+]

@@ -18,6 +18,7 @@ spec:
             app.kubernetes.io/name: fuse-idempotency-cleanup
             app.kubernetes.io/component: maintenance
         spec:
+          serviceAccountName: fuse-control-plane-maintenance
           restartPolicy: Never
           automountServiceAccountToken: false
           enableServiceLinks: false
@@ -45,7 +46,7 @@ spec:
                 - name: PGDATABASE
                   valueFrom:
                     secretKeyRef:
-                      name: fuse-control-plane-secrets
+                      name: fuse-control-plane-maintenance-secrets
                       key: DATABASE_URL
               resources:
                 requests:

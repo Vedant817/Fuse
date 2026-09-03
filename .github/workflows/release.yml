@@ -1,9 +1,6 @@
 name: Release image
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -12,27 +9,50 @@ on:
         type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  # All releases share commit tags, so serialize the entire publisher rather
+  # than only matching versions. Alias preflight and final promotion therefore
+  # cannot race another run of this workflow.
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE_NAME: ghcr.io/vedant817/fuse-control-plane
-  NODE_VERSION: 24.14.0
+  NODE_VERSION: 24.19.0
   PNPM_VERSION: 11.6.0
-  RELEASE_VERSION: ${{ inputs.version != '' && inputs.version || github.ref_name }}
+  RELEASE_VERSION_INPUT: ${{ inputs.version }}
 
 jobs:
   verify:
     name: Verify release source
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      publish-latest: ${{ steps.release.outputs.publish-latest }}
+      version: ${{ steps.release.outputs.version }}
+    permissions:
+      contents: read
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Require manual main dispatch from a commit on origin/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_EVENT_NAME}" = workflow_dispatch
+          test "${GITHUB_REF}" = refs/heads/main
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+
+      - name: Validate release version and changelog label
+        id: release
+        run: node tools/release/validate-release.mjs "${RELEASE_VERSION_INPUT}"
 
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
@@ -49,18 +69,81 @@ jobs:
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate release workflow invariants
+        run: pnpm run test:release-workflow
+
       - name: Run complete local-equivalent gate
         run: pnpm run check:full
+
+      - name: Validate publishable tarballs in an offline external consumer
+        run: pnpm run test:package-consumer
 
       - name: Reject production dependency advisories
         run: pnpm audit --prod --audit-level low
 
+      - name: Generate source CycloneDX SBOM
+        run: >-
+          npx --yes @cyclonedx/cdxgen@12.8.1
+          --type js
+          --required-only
+          --fail-on-error
+          --no-install-deps
+          --spec-version 1.6
+          --output release-source-sbom.cdx.json
+          .
+
+      - name: Validate workspace SBOM runtime coverage
+        run: >-
+          node tools/release/validate-sbom.mjs cyclonedx release-source-sbom.cdx.json
+          fastify ioredis pg @opentelemetry/sdk-node zod @fastify/rate-limit
+
+      - name: Preserve source SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-source-sbom-${{ steps.release.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-source-sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
   publish:
-    name: Publish multi-architecture image
+    name: Build, smoke-test, and publish exact images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs:
       - verify
+    environment: release
+    env:
+      PUBLISH_LATEST: ${{ needs.verify.outputs.publish-latest }}
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      STAGING_PREFIX: staging-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: fuse
+          POSTGRES_USER: fuse
+          POSTGRES_PASSWORD: release-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fuse -d fuse"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -71,38 +154,369 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Authenticate to GHCR
+      - name: Build exact amd64 candidate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: fuse-control-plane:release-amd64
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ env.RELEASE_VERSION }}
+
+      - name: Build exact arm64 candidate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: fuse-control-plane:release-arm64
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ env.RELEASE_VERSION }}
+
+      - name: Smoke-test both exact candidates before registry authentication
+        shell: bash
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          set -euo pipefail
+          smoke_image() (
+            local image="$1"
+            local suffix="$2"
+            local database="fuse_release_${suffix}"
+            local container="fuse-release-${suffix}"
+            local operator_token="release-operator-${suffix}-0123456789abcdef0123456789abcdef"
+            local agent_tokens=""
+            local exporter_tokens=""
+            local migration_output
+            trap 'docker start "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true; docker unpause "${REDIS_CONTAINER}" >/dev/null 2>&1 || true; docker rm --force "${container}" >/dev/null 2>&1 || true' EXIT
+
+            for slug in loop context cost; do
+              agent_token="release-agent-${slug}-${suffix}-0123456789abcdef0123456789abcdef"
+              exporter_token="release-exporter-${slug}-${suffix}-0123456789abcdef0123456789abcdef"
+              agent_entry="release-tenant:production:release-${slug}-${suffix}:${agent_token}"
+              exporter_entry="release-tenant:production:release-${slug}-${suffix}:${exporter_token}"
+              agent_tokens="${agent_tokens:+${agent_tokens},}${agent_entry}"
+              exporter_tokens="${exporter_tokens:+${exporter_tokens},}${exporter_entry}"
+            done
+
+            docker exec "${POSTGRES_CONTAINER}" createdb -U fuse "${database}"
+            migration_output="$(docker run --rm --platform "linux/${suffix}" --network host \
+              --env "DATABASE_URL=postgres://fuse:release-only-password@127.0.0.1:5432/${database}" \
+              "$image" \
+              node node_modules/@fuse/breaker-store/dist/migrate.js)"
+            printf '%s\n' "${migration_output}"
+            for migration in \
+              0001_init.sql \
+              0002_preflight.sql \
+              0003_scope_registry.sql \
+              0004_preflight_evidence_order.sql \
+              0005_diagnosis_jobs.sql \
+              0006_preflight_exporter_order.sql \
+              0007_diagnosis_job_replays.sql \
+              0008_preflight_source_evidence.sql; do
+              grep -Fq "${migration}" <<<"${migration_output}"
+            done
+
+            docker run --detach --name "${container}" --platform "linux/${suffix}" --network host \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --env "DATABASE_URL=postgres://fuse:release-only-password@127.0.0.1:5432/${database}" \
+              --env "CONTROL_PLANE_API_TOKENS=release-tenant:${operator_token}" \
+              --env "CONTROL_PLANE_AGENT_API_TOKENS=${agent_tokens}" \
+              --env "CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS=${exporter_tokens}" \
+              --env CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production \
+              --env CONTROL_PLANE_RATE_LIMIT_REDIS_URL=redis://127.0.0.1:6379/0 \
+              --env CONTROL_PLANE_DETECTOR_POLICY_FILE=/etc/fuse/policies/production.json \
+              --env OTEL_SDK_DISABLED=true \
+              --volume "${GITHUB_WORKSPACE}/infra/production/kubernetes/production-detector-policy.json:/etc/fuse/policies/production.json:ro" \
+              "$image"
+            if ! curl --fail --show-error --silent --retry 30 --retry-all-errors \
+              http://127.0.0.1:8090/healthz || \
+              ! curl --fail --show-error --silent --retry 30 --retry-all-errors \
+              http://127.0.0.1:8090/readyz; then
+              docker logs "${container}" || true
+              return 1
+            fi
+
+            FUSE_SMOKE_URL=http://127.0.0.1:8090 \
+              FUSE_SMOKE_SUFFIX="${suffix}" \
+              FUSE_SMOKE_OPERATOR_TOKEN="${operator_token}" \
+              node tools/release/smoke-exact-image.mjs
+
+            test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '1000:1000'
+            test -n "$(docker image inspect "$image" --format '{{json .Config.Healthcheck}}')"
+            test "$(docker run --rm --platform "linux/${suffix}" "$image" node --version)" = v24.19.0
+            if docker run --rm --platform "linux/${suffix}" --entrypoint /bin/sh \
+              "$image" -c true >/dev/null 2>&1; then
+              echo "scratch runtime unexpectedly contains /bin/sh" >&2
+              return 1
+            fi
+
+            docker pause "${REDIS_CONTAINER}" >/dev/null
+            curl --fail --show-error --silent --max-time 5 http://127.0.0.1:8090/healthz >/dev/null
+            redis_ready_body="$(mktemp)"
+            redis_ready_status="$(curl --show-error --silent --max-time 10 \
+              --output "${redis_ready_body}" --write-out '%{http_code}' \
+              http://127.0.0.1:8090/readyz)"
+            test "${redis_ready_status}" = 503
+            node -e "const v=require(process.argv[1]);if(v.reason!=='rate_limit_store_unavailable'||v.dependency!=='redis')process.exit(1)" "${redis_ready_body}"
+            redis_api_status="$(curl --show-error --silent --max-time 10 \
+              --output /dev/null --write-out '%{http_code}' \
+              --header "Authorization: Bearer release-agent-loop-${suffix}-0123456789abcdef0123456789abcdef" \
+              --header 'Content-Type: application/json' \
+              --data "{\"scope\":{\"tenant\":\"release-tenant\",\"environment\":\"production\",\"agentId\":\"release-loop-${suffix}\"},\"correlationId\":\"release-redis-outage-${suffix}\"}" \
+              http://127.0.0.1:8090/v1/permit)"
+            test "${redis_api_status}" -ge 400
+            docker unpause "${REDIS_CONTAINER}" >/dev/null
+            curl --fail --show-error --silent --retry 30 --retry-all-errors \
+              http://127.0.0.1:8090/readyz >/dev/null
+
+            # Stopping is bounded; pausing can strand an established TCP query
+            # because the frozen server cannot deliver its statement timeout.
+            docker stop --timeout 1 "${POSTGRES_CONTAINER}" >/dev/null
+            curl --fail --show-error --silent --max-time 5 http://127.0.0.1:8090/healthz >/dev/null
+            postgres_ready_body="$(mktemp)"
+            postgres_ready_status="$(curl --show-error --silent --max-time 15 \
+              --output "${postgres_ready_body}" --write-out '%{http_code}' \
+              http://127.0.0.1:8090/readyz)"
+            test "${postgres_ready_status}" = 503
+            node -e "const v=require(process.argv[1]);if(v.reason!=='store_unavailable')process.exit(1)" "${postgres_ready_body}"
+            postgres_api_status="$(curl --show-error --silent --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              --header "Authorization: Bearer release-agent-loop-${suffix}-0123456789abcdef0123456789abcdef" \
+              --header 'Content-Type: application/json' \
+              --data "{\"scope\":{\"tenant\":\"release-tenant\",\"environment\":\"production\",\"agentId\":\"release-loop-${suffix}\"},\"correlationId\":\"release-postgres-outage-${suffix}\"}" \
+              http://127.0.0.1:8090/v1/permit)"
+            test "${postgres_api_status}" -ge 400
+            docker start "${POSTGRES_CONTAINER}" >/dev/null
+            curl --fail --show-error --silent --retry 30 --retry-all-errors \
+              http://127.0.0.1:8090/readyz >/dev/null
+
+            recovered_permit="$(curl --fail --show-error --silent \
+              --header "Authorization: Bearer release-agent-loop-${suffix}-0123456789abcdef0123456789abcdef" \
+              --header 'Content-Type: application/json' \
+              --data "{\"scope\":{\"tenant\":\"release-tenant\",\"environment\":\"production\",\"agentId\":\"release-loop-${suffix}\"},\"correlationId\":\"release-recovered-${suffix}\"}" \
+              http://127.0.0.1:8090/v1/permit)"
+            node -e "const v=JSON.parse(process.argv[1]);if(v.allowed!==false||v.degraded!==false||v.state!=='tripped')process.exit(1)" "${recovered_permit}"
+          )
+          smoke_image fuse-control-plane:release-amd64 amd64
+          smoke_image fuse-control-plane:release-arm64 arm64
+
+      - name: Scan exact amd64 candidate for high and critical vulnerabilities
+        id: scan-amd64
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: fuse-control-plane:release-amd64
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: release-scan-amd64.json
+          grype-version: v0.110.0
+
+      - name: Scan exact arm64 candidate for high and critical vulnerabilities
+        id: scan-arm64
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: fuse-control-plane:release-arm64
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: release-scan-arm64.json
+          grype-version: v0.110.0
+
+      - name: Preserve candidate vulnerability scan evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-scans-${{ env.RELEASE_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-scan-amd64.json
+            release-scan-arm64.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Gate publication on both candidate vulnerability scans
+        shell: bash
+        env:
+          AMD64_SCAN_OUTCOME: ${{ steps.scan-amd64.outcome }}
+          ARM64_SCAN_OUTCOME: ${{ steps.scan-arm64.outcome }}
+        run: |
+          set -euo pipefail
+          test "${AMD64_SCAN_OUTCOME}" = success
+          test "${ARM64_SCAN_OUTCOME}" = success
+
+      # Registry credentials are intentionally unavailable until every image
+      # that will be referenced by the release manifest has passed smoke and scan.
+      - name: Authenticate to GHCR after smoke tests
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        id: metadata
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ env.RELEASE_VERSION }}
-            type=sha,prefix=sha-
-
-      - name: Build and publish immutable image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            BUILD_DATE=${{ fromJSON(steps.metadata.outputs.json).labels['org.opencontainers.image.created'] }}
-            VCS_REF=${{ github.sha }}
-            VERSION=${{ env.RELEASE_VERSION }}
-          provenance: mode=max
-          sbom: true
-
-      - name: Record published digest
+      - name: Push exact candidates under run-specific staging tags
+        shell: bash
         run: |
-          printf 'Image: %s\n' "${IMAGE_NAME}:${RELEASE_VERSION}"
-          docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_VERSION}"
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker tag \
+              "fuse-control-plane:release-${arch}" \
+              "${IMAGE_NAME}:${STAGING_PREFIX}-${arch}"
+            docker push "${IMAGE_NAME}:${STAGING_PREFIX}-${arch}"
+          done
+
+      - name: Assemble and validate run-specific staging manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${STAGING_PREFIX}" \
+            "${IMAGE_NAME}:${STAGING_PREFIX}-amd64" \
+            "${IMAGE_NAME}:${STAGING_PREFIX}-arm64"
+
+          manifest_json="$(docker buildx imagetools inspect \
+            "${IMAGE_NAME}:${STAGING_PREFIX}" --format '{{json .Manifest}}')"
+          manifest_digest="$(jq -r '.digest' <<<"${manifest_json}")"
+          platforms="$(jq -r '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort | join(",")' <<<"${manifest_json}")"
+          test "${platforms}" = 'amd64,arm64'
+          test "$(jq -r '.manifests | length' <<<"${manifest_json}")" = 2
+          [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s@%s\n' "${IMAGE_NAME}" "${manifest_digest}" | tee release-image.txt
+          echo "digest=${manifest_digest}" >>"${GITHUB_OUTPUT}"
+
+      - name: Generate final image SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          format: spdx-json
+          output-file: release-image.spdx.json
+          syft-version: v1.42.3
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Validate final image SBOM
+        run: >-
+          node tools/release/validate-sbom.mjs spdx release-image.spdx.json
+          @fuse/control-plane @fuse/breaker-store @fuse/contracts
+          fastify ioredis pg @opentelemetry/sdk-node zod @fastify/rate-limit
+
+      - name: Attest final manifest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest final manifest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          sbom-path: release-image.spdx.json
+          push-to-registry: true
+
+      - name: Preserve final image release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-image-evidence-${{ env.RELEASE_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-image.txt
+            release-image.spdx.json
+            release-scan-amd64.json
+            release-scan-arm64.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Preflight immutable public aliases for resumable promotion
+        id: aliases
+        shell: bash
+        run: |
+          set -euo pipefail
+          inspect_optional_alias() {
+            local alias="$1"
+            local error_file
+            error_file="$(mktemp)"
+            if digest="$(docker buildx imagetools inspect \
+              "${IMAGE_NAME}:${alias}" --format '{{json .Manifest}}' 2>"${error_file}" | jq -r '.digest')"; then
+              [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              printf '%s' "${digest}"
+            elif grep -Eqi 'manifest unknown|name unknown|not found' "${error_file}"; then
+              printf ''
+            else
+              echo "Could not determine GHCR alias state: ${IMAGE_NAME}:${alias}" >&2
+              cat "${error_file}" >&2
+              exit 1
+            fi
+            rm -f "${error_file}"
+          }
+          version_digest="$(inspect_optional_alias "${RELEASE_VERSION}")"
+          commit_digest="$(inspect_optional_alias "sha-${GITHUB_SHA}")"
+          node tools/release/validate-promotion.mjs \
+            "${{ steps.manifest.outputs.digest }}" \
+            "${version_digest}" \
+            "${commit_digest}"
+          echo "version-digest=${version_digest}" >>"${GITHUB_OUTPUT}"
+          echo "commit-digest=${commit_digest}" >>"${GITHUB_OUTPUT}"
+
+      # This is the only step that creates or changes consumer-facing aliases.
+      # A partial failure is safe to rerun because immutable aliases must either
+      # be absent or already point at the exact staged digest.
+      - name: Promote version, commit, and latest aliases as the final mutation
+        shell: bash
+        env:
+          COMMIT_DIGEST: ${{ steps.aliases.outputs.commit-digest }}
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
+          VERSION_DIGEST: ${{ steps.aliases.outputs.version-digest }}
+        run: |
+          set -euo pipefail
+          promote_alias() {
+            local alias="$1"
+            local existing_digest="$2"
+            if [ "${existing_digest}" = "${MANIFEST_DIGEST}" ]; then
+              echo "Alias already promoted: ${IMAGE_NAME}:${alias}"
+              return
+            fi
+            docker buildx imagetools create \
+              --tag "${IMAGE_NAME}:${alias}" \
+              "${IMAGE_NAME}@${MANIFEST_DIGEST}"
+          }
+          promote_alias "${RELEASE_VERSION}" "${VERSION_DIGEST}"
+          promote_alias "sha-${GITHUB_SHA}" "${COMMIT_DIGEST}"
+          if [ "${PUBLISH_LATEST}" = true ]; then
+            promote_alias latest ""
+          fi
+
+      - name: Verify promoted aliases and record published digest
+        run: |
+          set -euo pipefail
+          expected="${{ steps.manifest.outputs.digest }}"
+          for alias in "${RELEASE_VERSION}" "sha-${GITHUB_SHA}"; do
+            actual="$(docker buildx imagetools inspect \
+              "${IMAGE_NAME}:${alias}" --format '{{json .Manifest}}' | jq -r '.digest')"
+            test "${actual}" = "${expected}"
+          done
+          if [ "${PUBLISH_LATEST}" = true ]; then
+            latest="$(docker buildx imagetools inspect \
+              "${IMAGE_NAME}:latest" --format '{{json .Manifest}}' | jq -r '.digest')"
+            test "${latest}" = "${expected}"
+          fi
+          printf 'Image: %s@%s\n' "${IMAGE_NAME}" "${expected}"

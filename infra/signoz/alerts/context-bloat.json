@@ -19,7 +19,8 @@
             "groupBy": [
               { "name": "fuse.tenant" },
               { "name": "fuse.environment" },
-              { "name": "fuse.agent_id" }
+              { "name": "fuse.agent_id" },
+              { "name": "fuse.source_epoch" }
             ],
             "aggregations": [
               {
@@ -40,7 +41,7 @@
   },
   "labels": { "severity": "critical", "fuse_detector": "context-bloat" },
   "annotations": {
-    "summary": "Fuse: context-bloat detector fired for {{$labels.fuse_agent_id}}",
+    "summary": "Fuse: context-bloat detector fired for {{$labels.fuse_agent_id}} at breaker epoch {{$labels.fuse_source_epoch}}",
     "description": "Input-token growth crossed the absolute ceiling, consecutive-growth-run, or ratio safeguard — see docs/adr/006-signoz-alert-rule-provisioning.md and packages/detectors/src/context-bloat.ts."
   },
   "disabled": false,

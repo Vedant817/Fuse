@@ -1,0 +1,13 @@
+{
+  "name": "fuse-operations",
+  "type": "slack",
+  "slack_configs": [
+    {
+      "send_resolved": true,
+      "api_url": "__PREFLIGHT_SLACK_WEBHOOK_URL__",
+      "channel": "#fuse-operations",
+      "title": "[{{ .Status | toUpper }}] Fuse operational SLO",
+      "text": "{{ range .Alerts }}*SLO:* {{ .Labels.fuse_signal }} ({{ .Labels.fuse_slo_version }})\n*Summary:* {{ .Annotations.summary }}\n*Description:* {{ .Annotations.description }}\n{{ end }}"
+    }
+  ]
+}
