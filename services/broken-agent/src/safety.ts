@@ -60,7 +60,8 @@ export function clampCeilings(configured: SafetyCeilingsConfig): Ceilings {
   };
 }
 
-/** A demo-only, clearly-labeled synthetic price — NOT actual provider spend.
- * This threshold is a deterministic safety proxy; provider billing remains
- * authoritative. The versioned estimate table lives in @fuse/otel. */
+/** A demo-only, clearly-labeled fallback price for models absent from the
+ * versioned @fuse/otel estimate table — NOT actual provider spend. This
+ * threshold is a deterministic safety proxy; provider billing remains
+ * authoritative. */
 export const DEMO_PRICE_PER_TOKEN_USD = 0.000002;

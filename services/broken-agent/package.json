@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('tsconfig.tsbuildinfo',{force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
     "demo": "tsx src/demo.ts",
     "demo:real-detect": "tsx src/demo-real-detect.ts",
@@ -28,6 +28,7 @@
     "@fuse/breaker-store": "workspace:*",
     "@fuse/contracts": "workspace:*",
     "@fuse/control-plane": "workspace:*",
+    "@fuse/detectors": "workspace:*",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.9.0",
     "@opentelemetry/sdk-trace-base": "^2.9.0",

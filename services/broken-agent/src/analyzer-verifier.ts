@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { withGenAiSpan } from '@fuse/otel';
+import { randomUUID } from 'node:crypto';
+import { estimateCostUsd, withGenAiSpan } from '@fuse/otel';
 import { BreakerTrippedError } from '@fuse/sdk';
 import { defaultMockModel } from './mock-model.js';
 import { clampCeilings, DEMO_PRICE_PER_TOKEN_USD } from './safety.js';
@@ -11,6 +11,9 @@ function sleep(ms: number): Promise<void> {
 
 const DEFAULT_PROVIDER_NAME = 'fuse-mock';
 const DEFAULT_REQUEST_MODEL = 'mock-model-v1';
+const COST_VELOCITY_PROVIDER_NAME = 'fuse-synthetic';
+const COST_VELOCITY_REQUEST_MODEL = 'mock-cost-velocity-v1';
+const COST_VELOCITY_EVIDENCE_DELAY_MS = 700;
 
 /**
  * Runs a generic Analyzer↔Verifier reflection loop (Analyzer drafts,
@@ -33,8 +36,19 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
   const correlationPrefix =
     config.correlationIdPrefix ?? `broken-agent-${config.scenario}`;
   const sessionId = randomUUID();
-  const providerName = config.providerName ?? DEFAULT_PROVIDER_NAME;
-  const requestModel = config.requestModel ?? DEFAULT_REQUEST_MODEL;
+  const providerName =
+    config.providerName ??
+    (config.scenario === 'cost-velocity'
+      ? COST_VELOCITY_PROVIDER_NAME
+      : DEFAULT_PROVIDER_NAME);
+  const requestModel =
+    config.requestModel ??
+    (config.scenario === 'cost-velocity'
+      ? COST_VELOCITY_REQUEST_MODEL
+      : DEFAULT_REQUEST_MODEL);
+  const iterationDelayMs =
+    config.iterationDelayMs ??
+    (config.scenario === 'cost-velocity' ? COST_VELOCITY_EVIDENCE_DELAY_MS : 0);
   const scope = config.guard.scope;
 
   return withGenAiSpan(
@@ -59,6 +73,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
       let totalTokens = 0;
       let totalInputTokens = 0;
       let totalOutputTokens = 0;
+      let totalEstimatedSpendUsd = 0;
       // Reaching the end of the loop below means the maxCalls ceiling was
       // exhausted without an earlier stop condition firing — that is
       // itself a safety-ceiling stop, so it is the correct default, not a
@@ -74,7 +89,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
           stopReason = 'safety-ceiling';
           break;
         }
-        if (totalTokens * DEMO_PRICE_PER_TOKEN_USD >= ceilings.maxSpendUsd) {
+        if (totalEstimatedSpendUsd >= ceilings.maxSpendUsd) {
           stopReason = 'safety-ceiling';
           break;
         }
@@ -82,57 +97,31 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
         const role = i % 2 === 0 ? 'analyzer' : 'verifier';
         let callResult;
         try {
-          callResult = await config.guard.guard(
-            () =>
-              withGenAiSpan(
-                {
-                  operationName: 'chat',
-                  providerName,
-                  requestModel,
-                  tenant: scope.tenant,
-                  environment: scope.environment,
-                  agentId: scope.agentId,
-                  sessionId,
-                  scenario: config.scenario,
-                  stepIndex: i,
-                  correlationId: `${correlationPrefix}-${i}`,
-                  conversationId: sessionId,
-                  onTelemetryObserved: (obs) => config.guard.recordSpanTelemetry(obs),
-                  onStepObserved: (step) => config.guard.recordStepObservation(step),
-                },
-                async () => {
-                  const r = await model.call({
-                    role,
-                    round: i,
-                    historyLength,
-                    scenario: config.scenario,
-                    seed: config.seed,
-                  });
-                  // Canonicalized per task.md §4.2's "excluding volatile IDs,
-                  // timestamps, and token counts": a hash of the actual
-                  // output content, not the content itself (avoids an
-                  // unbounded-cardinality/oversized attribute value), plus
-                  // the role — a real fix in the loop scenario produces
-                  // byte-identical content every round by design, so this
-                  // hash is identical round over round exactly when the
-                  // draft genuinely never changes.
-                  const shapeHash = createHash('sha256')
-                    .update(r.content)
-                    .digest('hex')
-                    .slice(0, 16);
-                  return {
-                    result: r,
-                    outcome: {
-                      inputTokens: r.inputTokens,
-                      outputTokens: r.outputTokens,
-                      outcome: 'success',
-                      canonicalShape: `${role}:${shapeHash}`,
-                    },
-                  };
-                },
-              ),
-            `${correlationPrefix}-${i}`,
-          );
+          callResult = await config.guard.runStep({
+            executionId: sessionId,
+            providerName,
+            requestModel,
+            kind: role,
+            stepIndex: i,
+            correlationId: `${correlationPrefix}-${i}`,
+            scenario: config.scenario,
+            dispatch: () =>
+              model.call({
+                role,
+                round: i,
+                historyLength,
+                scenario: config.scenario,
+                seed: config.seed,
+              }),
+            observe: (result) => ({
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+              text: result.content,
+              ...(result.stepStructure === undefined
+                ? {}
+                : { structure: result.stepStructure }),
+            }),
+          });
         } catch (err) {
           if (err instanceof BreakerTrippedError) {
             stopReason = 'breaker-tripped';
@@ -144,6 +133,15 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
         totalInputTokens += callResult.inputTokens;
         totalOutputTokens += callResult.outputTokens;
         totalTokens += callResult.inputTokens + callResult.outputTokens;
+        const callCost = estimateCostUsd(
+          providerName,
+          requestModel,
+          callResult.inputTokens,
+          callResult.outputTokens,
+        );
+        totalEstimatedSpendUsd += callCost.priced
+          ? callCost.costUsd
+          : (callResult.inputTokens + callResult.outputTokens) * DEMO_PRICE_PER_TOKEN_USD;
         historyLength += callResult.content.length;
         const round: RoundResult = {
           index: i,
@@ -169,7 +167,7 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
           stopReason = 'safety-ceiling';
           break;
         }
-        if (totalTokens * DEMO_PRICE_PER_TOKEN_USD >= ceilings.maxSpendUsd) {
+        if (totalEstimatedSpendUsd >= ceilings.maxSpendUsd) {
           stopReason = 'safety-ceiling';
           break;
         }
@@ -178,8 +176,8 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
           break;
         }
 
-        if (config.iterationDelayMs) {
-          await sleep(config.iterationDelayMs);
+        if (iterationDelayMs) {
+          await sleep(iterationDelayMs);
         }
       }
 
@@ -189,9 +187,10 @@ export async function runAnalyzerVerifier(config: RunConfig): Promise<RunResult>
         rounds,
         totalCalls: rounds.length,
         totalTokens,
-        estimatedSpendUsd: totalTokens * DEMO_PRICE_PER_TOKEN_USD,
+        estimatedSpendUsd: totalEstimatedSpendUsd,
         elapsedMs: Date.now() - start,
       };
+      await config.guard.endExecution(sessionId);
       return {
         result,
         outcome: {

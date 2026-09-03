@@ -8,9 +8,9 @@ import type { FuseGuard } from '@fuse/sdk';
  *                    thousands of iterations/hour" pathology.
  * `context-bloat`  — each round appends a large, never-compacted block to
  *                    the running history, so input tokens grow every step.
- * `cost-velocity`  — same shape as `normal` but paced with (near-)zero
- *                    delay between rounds, producing an abnormal calls/
- *                    time-window rate.
+ * `cost-velocity`  — bounded synthetic high-cost calls spanning enough
+ *                    logical time for the real detector's incomplete-window
+ *                    safeguard; all prices remain explicitly estimated.
  */
 export type Scenario = 'normal' | 'loop' | 'context-bloat' | 'cost-velocity';
 
@@ -50,6 +50,9 @@ export interface ModelCallResult {
   content: string;
   inputTokens: number;
   outputTokens: number;
+  /** Non-sensitive semantic phase labels. These let canonicalization preserve
+   * genuine progress without exporting model text. */
+  stepStructure?: readonly string[];
 }
 
 export interface Model {

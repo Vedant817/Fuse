@@ -8,8 +8,8 @@
  * Run with: pnpm --filter @fuse/broken-agent run demo
  */
 import { randomUUID } from 'node:crypto';
-import { bootstrapOtel } from '@fuse/otel';
 import { FuseGuard, BreakerTrippedError } from '@fuse/sdk';
+import { bootstrapFuseOtel } from '@fuse/sdk/otel';
 import { createGroqProvider, createNvidiaBuildProvider } from '@fuse/sdk/providers';
 import type { Scope } from '@fuse/contracts';
 import { runAnalyzerVerifier, defaultMockModel } from './index.js';
@@ -40,19 +40,24 @@ const SIGNOZ_URL = (process.env['SIGNOZ_URL'] ?? 'http://localhost:8080').replac
 const PERMIT_TIMEOUT_MS = parsePermitTimeoutMs(process.env['FUSE_PERMIT_TIMEOUT_MS']);
 const SDK_OUTAGE_MODE = parseOutageMode(process.env['FUSE_SDK_OUTAGE_MODE']);
 
-function firstToken(envVar: string): string | undefined {
+function firstToken(envVar: string, scopeFields: number): string | undefined {
   const raw = process.env[envVar];
   if (!raw) return undefined;
   const first = raw.split(',')[0]!.trim();
   if (first.length === 0) return undefined;
-  // Accept the `tenant:token` form (docs/adr/004-tenant-scoped-tokens.md)
-  // and use just the token part for this demo's plain HTTP calls.
-  const separator = first.indexOf(':');
-  return separator > 0 ? first.slice(separator + 1) : first;
+  let separator = -1;
+  for (let index = 0; index < scopeFields; index++) {
+    separator = first.indexOf(':', separator + 1);
+    if (separator < 0) return first;
+  }
+  return first.slice(separator + 1);
 }
 
-const OPERATOR_TOKEN = firstToken('CONTROL_PLANE_API_TOKENS');
-const AGENT_TOKEN = firstToken('CONTROL_PLANE_AGENT_API_TOKENS') ?? OPERATOR_TOKEN;
+const OPERATOR_TOKEN = firstToken('CONTROL_PLANE_API_TOKENS', 1);
+const AGENT_TOKEN = firstToken('CONTROL_PLANE_AGENT_API_TOKENS', 3) ?? OPERATOR_TOKEN;
+const EXPORTER_EVIDENCE_TOKEN =
+  process.env['FUSE_PREFLIGHT_EXPORTER_TOKEN'] ??
+  firstToken('CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS', 3);
 
 if (!OPERATOR_TOKEN) {
   fmt.fatal('CONTROL_PLANE_API_TOKENS is not set in this shell', [
@@ -110,7 +115,7 @@ function loggingModel(inner: Model): Model {
   };
 }
 
-async function tripViaRealApi(scope: Scope, reason: string): Promise<void> {
+async function tripViaRealApi(scope: Scope, reason: string): Promise<number> {
   const res = await fetch(`${CONTROL_PLANE_URL}/v1/breaker/trip`, {
     method: 'POST',
     headers: {
@@ -128,13 +133,18 @@ async function tripViaRealApi(scope: Scope, reason: string): Promise<void> {
     }),
   });
   if (!res.ok) fmt.fatal(`Trip API call failed: HTTP ${res.status}`);
-  const body = (await res.json()) as { record: { state: string } };
+  const body = (await res.json()) as { record: { state: string; epoch: number } };
   fmt.ok(
     `Breaker tripped for real via the operational API — state: ${body.record.state}`,
   );
+  return body.record.epoch;
 }
 
-async function resumeViaRealApi(scope: Scope, reason: string): Promise<void> {
+async function resumeViaRealApi(
+  scope: Scope,
+  reason: string,
+  expectedEpoch: number,
+): Promise<void> {
   const res = await fetch(`${CONTROL_PLANE_URL}/v1/breaker/resume`, {
     method: 'POST',
     headers: {
@@ -147,6 +157,7 @@ async function resumeViaRealApi(scope: Scope, reason: string): Promise<void> {
       actor: { type: 'manual', id: 'user:demo-operator' },
       correlationId: `demo-resume-${randomUUID()}`,
       idempotencyKey: `demo-resume-${randomUUID()}`,
+      expectedEpoch,
     }),
   });
   if (!res.ok) fmt.fatal(`Resume API call failed: HTTP ${res.status}`);
@@ -165,11 +176,24 @@ async function main(): Promise<void> {
     );
   }
 
-  const otel = bootstrapOtel({
+  const otel = bootstrapFuseOtel({
     serviceName: 'fuse-demo',
     serviceVersion: '0.1.0',
     deploymentEnvironment: 'local-demo',
   });
+  let telemetryUnavailableReported = false;
+  const flushTelemetry = async () => {
+    try {
+      await otel.forceFlush();
+    } catch {
+      if (!telemetryUnavailableReported) {
+        fmt.info(
+          'OTLP export is unavailable; Preflight will remain honestly unprotected for these scopes.',
+        );
+        telemetryUnavailableReported = true;
+      }
+    }
+  };
 
   const summary: string[] = [];
 
@@ -178,13 +202,18 @@ async function main(): Promise<void> {
     fmt.act('Normal run — the verifier approves quickly');
     const scope1 = scopeFor(`agent-normal-${randomUUID().slice(0, 8)}`);
     await registerScopeViaRealApi(scope1);
-    const guard1 = new FuseGuard({
-      scope: scope1,
-      controlPlaneUrl: CONTROL_PLANE_URL,
-      apiToken: AGENT_TOKEN!,
-      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
-      outageMode: SDK_OUTAGE_MODE,
-    });
+    const guard1 = otel.registerGuard(
+      new FuseGuard({
+        scope: scope1,
+        controlPlaneUrl: CONTROL_PLANE_URL,
+        apiToken: AGENT_TOKEN!,
+        ...(EXPORTER_EVIDENCE_TOKEN
+          ? { exporterEvidenceToken: EXPORTER_EVIDENCE_TOKEN }
+          : {}),
+        ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+        outageMode: SDK_OUTAGE_MODE,
+      }),
+    );
     const result1 = await runAnalyzerVerifier({
       scenario: 'normal',
       seed: 1,
@@ -195,22 +224,26 @@ async function main(): Promise<void> {
     fmt.kv('Total calls', result1.totalCalls);
     fmt.kv('Total tokens', result1.totalTokens);
     fmt.kv('Estimated spend', `$${result1.estimatedSpendUsd.toFixed(6)}`);
-    await guard1.flushPreflightTelemetry();
-    guard1.stopPreflightReporting();
+    await flushTelemetry();
     summary.push('Normal run terminated via verifier approval — no false trip.');
 
     // --- Act 2: a pathological scenario is bounded by the fixture's own ceiling ---
     fmt.act("Loop scenario — never approves, stopped by the fixture's own hard ceiling");
     const scope2 = scopeFor(`agent-loop-${randomUUID().slice(0, 8)}`);
     await registerScopeViaRealApi(scope2);
-    const guard2 = new FuseGuard({
-      scope: scope2,
-      controlPlaneUrl: CONTROL_PLANE_URL,
-      apiToken: AGENT_TOKEN!,
-      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
-      outageMode: SDK_OUTAGE_MODE,
-      reportStepObservations: false,
-    });
+    const guard2 = otel.registerGuard(
+      new FuseGuard({
+        scope: scope2,
+        controlPlaneUrl: CONTROL_PLANE_URL,
+        apiToken: AGENT_TOKEN!,
+        ...(EXPORTER_EVIDENCE_TOKEN
+          ? { exporterEvidenceToken: EXPORTER_EVIDENCE_TOKEN }
+          : {}),
+        ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+        outageMode: SDK_OUTAGE_MODE,
+        reportStepObservations: false,
+      }),
+    );
     const result2 = await runAnalyzerVerifier({
       scenario: 'loop',
       seed: 1,
@@ -225,8 +258,7 @@ async function main(): Promise<void> {
         'Stopped by the in-process safety ceiling — before any external detector had to act',
       );
     }
-    await guard2.flushPreflightTelemetry();
-    guard2.stopPreflightReporting();
+    await flushTelemetry();
     summary.push(
       "A repeating (loop) scenario was capped by the fixture's own hard ceiling.",
     );
@@ -235,16 +267,22 @@ async function main(): Promise<void> {
     fmt.act('THE CORE CLAIM — an external trip stops the very next call, mid-run');
     const scope3 = scopeFor(`agent-trip-${randomUUID().slice(0, 8)}`);
     await registerScopeViaRealApi(scope3);
-    const guard3 = new FuseGuard({
-      scope: scope3,
-      controlPlaneUrl: CONTROL_PLANE_URL,
-      apiToken: AGENT_TOKEN!,
-      ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
-      outageMode: SDK_OUTAGE_MODE,
-      reportStepObservations: false,
-    });
+    const guard3 = otel.registerGuard(
+      new FuseGuard({
+        scope: scope3,
+        controlPlaneUrl: CONTROL_PLANE_URL,
+        apiToken: AGENT_TOKEN!,
+        ...(EXPORTER_EVIDENCE_TOKEN
+          ? { exporterEvidenceToken: EXPORTER_EVIDENCE_TOKEN }
+          : {}),
+        ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+        outageMode: SDK_OUTAGE_MODE,
+        reportStepObservations: false,
+      }),
+    );
 
     let dispatchCount = 0;
+    let tripEpoch: number | undefined;
     const trippingModel: Model = {
       async call(args) {
         dispatchCount += 1;
@@ -254,7 +292,7 @@ async function main(): Promise<void> {
           fmt.warn(
             'Simulating a detector firing — calling the REAL /v1/breaker/trip endpoint now...',
           );
-          await tripViaRealApi(scope3, 'demo: loop-signature detector fired');
+          tripEpoch = await tripViaRealApi(scope3, 'demo: loop-signature detector fired');
         }
         return r;
       },
@@ -311,7 +349,10 @@ async function main(): Promise<void> {
 
     // --- Act 4: resume ---
     fmt.act('Resume — an operator restores access');
-    await resumeViaRealApi(scope3, 'demo: operator verified and resumed');
+    if (tripEpoch === undefined) {
+      fmt.fatal('Cannot resume: the demo trip did not return a breaker epoch');
+    }
+    await resumeViaRealApi(scope3, 'demo: operator verified and resumed', tripEpoch);
     const postResume = await guard3.guard(() =>
       defaultMockModel.call({
         role: 'analyzer',
@@ -328,8 +369,7 @@ async function main(): Promise<void> {
 
     // --- Act 5: Preflight ---
     fmt.act('Preflight — telemetry-health status for the scope used above');
-    await guard3.flushPreflightTelemetry();
-    guard3.stopPreflightReporting();
+    await flushTelemetry();
     const statusRes = await fetch(
       `${CONTROL_PLANE_URL}/v1/preflight/status?tenant=${scope3.tenant}&environment=${scope3.environment}&agentId=${scope3.agentId}`,
       { headers: { authorization: `Bearer ${OPERATOR_TOKEN}` } },
@@ -363,13 +403,18 @@ async function main(): Promise<void> {
         (groqKey ? 'llama-3.1-8b-instant' : 'meta/llama-3.1-8b-instruct');
       const scope4 = scopeFor(`agent-real-llm-${randomUUID().slice(0, 8)}`);
       await registerScopeViaRealApi(scope4);
-      const guard4 = new FuseGuard({
-        scope: scope4,
-        controlPlaneUrl: CONTROL_PLANE_URL,
-        apiToken: AGENT_TOKEN!,
-        ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
-        outageMode: SDK_OUTAGE_MODE,
-      });
+      const guard4 = otel.registerGuard(
+        new FuseGuard({
+          scope: scope4,
+          controlPlaneUrl: CONTROL_PLANE_URL,
+          apiToken: AGENT_TOKEN!,
+          ...(EXPORTER_EVIDENCE_TOKEN
+            ? { exporterEvidenceToken: EXPORTER_EVIDENCE_TOKEN }
+            : {}),
+          ...permitTimeoutOption(PERMIT_TIMEOUT_MS),
+          outageMode: SDK_OUTAGE_MODE,
+        }),
+      );
       const real = await runGuardedInstrumentedChat({
         guard: guard4,
         providerName: providerAttribute,
@@ -385,8 +430,7 @@ async function main(): Promise<void> {
         `Real response from ${providerName} (${model}): "${real.choices[0]?.message.content}"`,
       );
       fmt.kv('Tokens used', real.usage.total_tokens);
-      await guard4.flushPreflightTelemetry();
-      guard4.stopPreflightReporting();
+      await flushTelemetry();
       summary.push(
         `A real ${providerName} call was made and guarded like any other provider call.`,
       );

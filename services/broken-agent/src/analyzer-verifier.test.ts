@@ -12,20 +12,23 @@ function allowingGuard(): FuseGuard {
   // mockImplementation (not mockResolvedValue) so every call gets a fresh
   // Response instance — reusing one Response across calls means its body
   // stream is already consumed after the first .json() read.
-  const fetchImpl = vi.fn().mockImplementation(
-    () =>
-      new Response(
-        JSON.stringify({
+  const fetchImpl = vi.fn().mockImplementation((input: string | URL | Request) => {
+    const url = String(input);
+    const body = url.endsWith('/v1/detectors/observe')
+      ? { results: [], enforcement: [] }
+      : {
           allowed: true,
           state: 'armed',
           reason: 'armed',
           epoch: 0,
           degraded: false,
           correlationId: 'c1',
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-  );
+        };
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
   return new FuseGuard({
     scope: { tenant: 't1', environment: 'test', agentId: 'broken-agent' },
     controlPlaneUrl: 'http://cp.internal',
@@ -46,7 +49,7 @@ describe('runAnalyzerVerifier', () => {
     expect(result.rounds.at(-1)?.approved).toBe(true);
   });
 
-  it('loop scenario never approves and runs until the safety ceiling, with a canonicalizable repeated shape', async () => {
+  it('loop scenario never approves and runs until the safety ceiling despite small wording changes', async () => {
     const result = await runAnalyzerVerifier({
       scenario: 'loop',
       seed: 1,
@@ -61,7 +64,7 @@ describe('runAnalyzerVerifier', () => {
     const analyzerContents = result.rounds
       .filter((r) => r.role === 'analyzer')
       .map((r) => r.content);
-    expect(new Set(analyzerContents).size).toBe(1); // byte-identical every round: the loop signature
+    expect(new Set(analyzerContents).size).toBeGreaterThan(1);
   });
 
   it('loop scenario reports a small, bounded, repeating set of canonicalShapes to the detector reporter', async () => {
@@ -79,15 +82,12 @@ describe('runAnalyzerVerifier', () => {
     });
 
     expect(observed).toHaveLength(result.totalCalls);
-    // Byte-identical analyzer content + one of two verifier phrases means
-    // at most 3 distinct shapes ever appear, never a fresh one per round —
-    // exactly the "canonicalizable repeat" a loop-signature detector needs.
-    expect(new Set(observed).size).toBeLessThanOrEqual(3);
-    // Every shape actually recurs (this is what makes it a *repeat*, not
-    // just a small alphabet of one-off values).
+    // Volatile IDs/timestamps/numbers and two modest paraphrases reduce to
+    // one analyzer + one verifier shape, recovering the real ping-pong cycle.
+    expect(new Set(observed).size).toBe(2);
     const counts = new Map<string, number>();
     for (const shape of observed) counts.set(shape, (counts.get(shape) ?? 0) + 1);
-    expect(Math.max(...counts.values())).toBeGreaterThan(1);
+    expect(new Set(counts.values())).toEqual(new Set([result.totalCalls / 2]));
   });
 
   it('context-bloat scenario produces strictly growing input tokens round over round', async () => {
@@ -104,21 +104,25 @@ describe('runAnalyzerVerifier', () => {
     }
   });
 
-  it('cost-velocity scenario (near-zero delay) completes far faster than the same call count with a real delay', async () => {
-    const fast = await runAnalyzerVerifier({
-      scenario: 'cost-velocity',
-      seed: 1,
-      guard: allowingGuard(),
-      iterationDelayMs: 0,
-    });
-    const paced = await runAnalyzerVerifier({
-      scenario: 'normal',
-      seed: 1,
-      guard: allowingGuard(),
-      iterationDelayMs: 50,
-    });
-    // Same shape (both approve around the same round), wildly different pacing.
-    expect(fast.elapsedMs).toBeLessThan(paced.elapsedMs);
+  it('cost-velocity scenario emits priced evidence over the default detector minimum elapsed time without a real wait', async () => {
+    vi.useFakeTimers({ now: new Date('2026-08-24T00:00:00.000Z') });
+    try {
+      const pending = runAnalyzerVerifier({
+        scenario: 'cost-velocity',
+        seed: 1,
+        guard: allowingGuard(),
+      });
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await pending;
+      expect(result.stopReason).toBe('safety-ceiling');
+      expect(result.totalCalls).toBe(5);
+      expect(result.elapsedMs).toBe(2_800);
+      expect(result.rounds.every((round) => round.inputTokens === 50_000)).toBe(true);
+      expect(result.rounds.every((round) => round.outputTokens === 10_000)).toBe(true);
+      expect(result.estimatedSpendUsd).toBeCloseTo(0.875, 10);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clamps a configured ceiling far above the absolute maximum back down to it', async () => {

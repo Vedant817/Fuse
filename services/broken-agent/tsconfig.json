@@ -5,5 +5,9 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "references": [{ "path": "../../packages/sdk" }, { "path": "../../packages/otel" }]
+  "references": [
+    { "path": "../../packages/sdk" },
+    { "path": "../../packages/otel" },
+    { "path": "../../packages/detectors" }
+  ]
 }
