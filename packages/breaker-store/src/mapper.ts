@@ -1,12 +1,16 @@
-import type {
-  Actor,
-  BreakerAuditEvent,
-  BreakerRecord,
-  BreakerState,
-  PreflightReasonCode,
-  PreflightResult,
-  PreflightState,
-  Scope,
+import {
+  ExporterDeliverySignalSchema,
+  SpanTelemetrySampleSchema,
+  type Actor,
+  type BreakerAuditEvent,
+  type BreakerRecord,
+  type BreakerState,
+  type ExporterDeliverySignal,
+  type PreflightReasonCode,
+  type PreflightResult,
+  type PreflightState,
+  type Scope,
+  type SpanTelemetrySampleWire,
 } from '@fuse/contracts';
 
 export interface BreakerStateRow {
@@ -90,6 +94,32 @@ export interface PreflightStateRow {
   freshness_ms: string | null; // BIGINT comes back as string from node-postgres
   pending_recovery_state: PreflightState | null;
   pending_since: Date | null;
+  exporter_source_instance_id: string | null;
+  exporter_sequence: string | null;
+  exporter_observed_at_ms: string | null;
+  exporter_status: ExporterDeliverySignal['status'] | null;
+  exporter_spans: unknown;
+}
+
+export interface PersistedExporterEvidence {
+  signal: ExporterDeliverySignal;
+  spans: SpanTelemetrySampleWire[];
+}
+
+export function rowToPersistedExporterEvidence(
+  row: PreflightStateRow,
+): PersistedExporterEvidence | null {
+  if (row.exporter_source_instance_id === null) return null;
+  const signal = ExporterDeliverySignalSchema.parse({
+    sourceInstanceId: row.exporter_source_instance_id,
+    sequence: Number(row.exporter_sequence),
+    observedAtMs: Number(row.exporter_observed_at_ms),
+    status: row.exporter_status,
+  });
+  return {
+    signal,
+    spans: SpanTelemetrySampleSchema.array().max(2_000).parse(row.exporter_spans),
+  };
 }
 
 export function rowToPreflightResult(row: PreflightStateRow): PreflightResult {

@@ -71,7 +71,14 @@ describe('0003_scope_registry migration', () => {
         runMigrations(legacyPool),
         runMigrations(legacyPool),
       ]);
-      expect(concurrentRuns).toContainEqual(['0003_scope_registry.sql']);
+      expect(concurrentRuns).toContainEqual([
+        '0003_scope_registry.sql',
+        '0004_preflight_evidence_order.sql',
+        '0005_diagnosis_jobs.sql',
+        '0006_preflight_exporter_order.sql',
+        '0007_diagnosis_job_replays.sql',
+        '0008_preflight_source_evidence.sql',
+      ]);
       expect(concurrentRuns).toContainEqual([]);
 
       const scopes = await legacyPool.query<{

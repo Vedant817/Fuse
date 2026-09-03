@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   rowToPreflightResult,
+  rowToPersistedExporterEvidence,
   type PreflightStateRow,
   rowToAuditEvent,
   rowToRecord,
@@ -102,6 +103,11 @@ describe('rowToPreflightResult', () => {
       freshness_ms: '1500',
       pending_recovery_state: 'protected',
       pending_since: new Date('2026-07-21T00:00:05.000Z'),
+      exporter_source_instance_id: 'instance-1',
+      exporter_sequence: '4',
+      exporter_observed_at_ms: '1784592000000',
+      exporter_status: 'success',
+      exporter_spans: [],
     };
     const result = rowToPreflightResult(row);
     expect(result).toEqual({
@@ -134,11 +140,59 @@ describe('rowToPreflightResult', () => {
       freshness_ms: null,
       pending_recovery_state: null,
       pending_since: null,
+      exporter_source_instance_id: null,
+      exporter_sequence: null,
+      exporter_observed_at_ms: null,
+      exporter_status: null,
+      exporter_spans: [],
     };
     const result = rowToPreflightResult(row);
     expect(result.lastGoodAt).toBeNull();
     expect(result.freshnessMs).toBeNull();
     expect(result.pendingRecoveryState).toBeNull();
     expect(result.pendingSince).toBeNull();
+  });
+
+  it('maps the exact persisted exporter signal and bounded span samples', () => {
+    const row: PreflightStateRow = {
+      tenant: 't1',
+      environment: 'prod',
+      agent_id: 'agent-1',
+      state: 'protected',
+      reason_code: 'healthy',
+      reason: 'healthy',
+      evaluated_at: new Date('2026-07-21T00:00:00.000Z'),
+      last_good_at: new Date('2026-07-21T00:00:00.000Z'),
+      required_field_coverage_percent: 100,
+      orphan_rate_percent: 0,
+      freshness_ms: '0',
+      pending_recovery_state: null,
+      pending_since: null,
+      exporter_source_instance_id: 'instance-1',
+      exporter_sequence: '7',
+      exporter_observed_at_ms: '1784592000000',
+      exporter_status: 'failure',
+      exporter_spans: [
+        {
+          timestampMs: 1784592000000,
+          hasRequestModel: true,
+          hasInputTokens: true,
+          hasOutputTokens: true,
+          hasScopedIdentity: true,
+          hasValidTimestamps: true,
+          isRootSpan: true,
+          hasParent: false,
+        },
+      ],
+    };
+    expect(rowToPersistedExporterEvidence(row)).toEqual({
+      signal: {
+        sourceInstanceId: 'instance-1',
+        sequence: 7,
+        observedAtMs: 1784592000000,
+        status: 'failure',
+      },
+      spans: row.exporter_spans,
+    });
   });
 });

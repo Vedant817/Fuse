@@ -189,6 +189,7 @@ describe('BreakerStore (Postgres integration)', () => {
       actor: POLICY_ACTOR,
       correlationId: 'corr-2',
       idempotencyKey: 'idem-resume-policy',
+      expectedEpoch: 1,
     });
     expect(policyResume.kind).toBe('rejected');
     if (policyResume.kind !== 'rejected') throw new Error('unreachable');
@@ -200,13 +201,31 @@ describe('BreakerStore (Postgres integration)', () => {
       actor: MANUAL_ACTOR,
       correlationId: 'corr-3',
       idempotencyKey: 'idem-resume-manual',
+      expectedEpoch: 1,
     });
     expect(manualResume.kind).toBe('applied');
     if (manualResume.kind !== 'applied') throw new Error('unreachable');
     expect(manualResume.record.state).toBe('armed');
 
+    const replayedPolicyResume = await store.resume({
+      scope,
+      reason: 'auto-resume attempt',
+      actor: POLICY_ACTOR,
+      correlationId: 'corr-2',
+      idempotencyKey: 'idem-resume-policy',
+      expectedEpoch: 1,
+    });
+    expect(replayedPolicyResume).toEqual(policyResume);
+
     const permitAfter = await store.permit(scope, 'corr-4');
     expect(permitAfter.allowed).toBe(true);
+
+    const rejectedAudit = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM breaker_audit_log
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND correlation_id=$4`,
+      [scope.tenant, scope.environment, scope.agentId, 'corr-2'],
+    );
+    expect(rejectedAudit.rows[0]?.count).toBe('0');
   });
 
   it('disable overrides enforcement even while tripped, and trip attempts while disabled stay quiet', async () => {
@@ -226,6 +245,7 @@ describe('BreakerStore (Postgres integration)', () => {
       actor: MANUAL_ACTOR,
       correlationId: 'corr-2',
       idempotencyKey: 'idem-disable',
+      expectedEpoch: 1,
     });
     expect(disableResult.kind).toBe('applied');
     if (disableResult.kind !== 'applied') throw new Error('unreachable');
@@ -255,7 +275,7 @@ describe('BreakerStore (Postgres integration)', () => {
   it('a stale expectedEpoch is rejected rather than silently applied', async () => {
     const scope = await register(scopeFor('stale-epoch'));
     await store.permit(scope, 'corr-0'); // creates epoch 0
-    const result = await store.trip({
+    const staleRequest = {
       scope,
       reason: 'x',
       policyVersion: 'v1',
@@ -264,10 +284,334 @@ describe('BreakerStore (Postgres integration)', () => {
       correlationId: 'corr-1',
       idempotencyKey: 'idem-stale',
       expectedEpoch: 7,
-    });
+    };
+    const result = await store.trip(staleRequest);
     expect(result.kind).toBe('rejected');
     if (result.kind !== 'rejected') throw new Error('unreachable');
     expect(result.code).toBe('stale_epoch');
+
+    await store.trip({
+      scope,
+      reason: 'newer valid command',
+      policyVersion: 'v1',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-newer',
+      idempotencyKey: 'idem-newer',
+    });
+    const replay = await store.trip(staleRequest);
+    expect(replay).toEqual(result);
+    if (replay.kind !== 'rejected') throw new Error('unreachable');
+    expect(replay.message).toContain('current epoch is 0');
+
+    const record = await store.getRecord(scope);
+    expect(record?.state).toBe('tripped');
+    expect(record?.epoch).toBe(1);
+    const rejectedAudit = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM breaker_audit_log
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND correlation_id=$4`,
+      [scope.tenant, scope.environment, scope.agentId, 'corr-1'],
+    );
+    expect(rejectedAudit.rows[0]?.count).toBe('0');
+  });
+
+  it('a resume bound to an older trip cannot reopen a retripped breaker', async () => {
+    const scope = await register(scopeFor('resume-retrip'));
+    await store.trip({
+      scope,
+      reason: 'first trip',
+      policyVersion: 'v1',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-first-trip',
+      idempotencyKey: 'idem-first-trip',
+      expectedEpoch: 0,
+    });
+
+    const originalResume = {
+      scope,
+      reason: 'first incident fixed',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-original-resume',
+      idempotencyKey: 'idem-original-resume',
+      expectedEpoch: 1,
+    };
+    const resumed = await store.resume(originalResume);
+    expect(resumed.kind).toBe('applied');
+    if (resumed.kind !== 'applied') throw new Error('unreachable');
+    expect(resumed.record).toMatchObject({ state: 'armed', epoch: 2 });
+
+    await store.trip({
+      scope,
+      reason: 'new incident',
+      policyVersion: 'v2',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-retrip',
+      idempotencyKey: 'idem-retrip',
+      expectedEpoch: 2,
+    });
+
+    // An exact retry remains idempotent and returns its historical result,
+    // but it must not mutate the newer breaker episode.
+    const replay = await store.resume(originalResume);
+    expect(replay.kind).toBe('applied');
+    if (replay.kind !== 'applied') throw new Error('unreachable');
+    expect(replay.replayed).toBe(true);
+    expect(replay.record).toMatchObject({ state: 'armed', epoch: 2 });
+
+    const delayed = await store.resume({
+      ...originalResume,
+      correlationId: 'corr-delayed-resume',
+      idempotencyKey: 'idem-delayed-resume',
+    });
+    expect(delayed).toMatchObject({ kind: 'rejected', code: 'stale_epoch' });
+
+    const record = await store.getRecord(scope);
+    expect(record).toMatchObject({ state: 'tripped', epoch: 3 });
+    const resumeAudits = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM breaker_audit_log
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3
+          AND correlation_id IN ($4, $5)`,
+      [
+        scope.tenant,
+        scope.environment,
+        scope.agentId,
+        'corr-original-resume',
+        'corr-delayed-resume',
+      ],
+    );
+    expect(resumeAudits.rows[0]?.count).toBe('1');
+  });
+
+  it('rejects delayed disable and enable actions after a newer trip', async () => {
+    const disableScope = await register(scopeFor('delayed-disable'));
+    await store.trip({
+      scope: disableScope,
+      reason: 'trip won the race',
+      policyVersion: 'v1',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-disable-trip',
+      idempotencyKey: 'idem-disable-trip',
+      expectedEpoch: 0,
+    });
+    const delayedDisable = await store.disable({
+      scope: disableScope,
+      reason: 'stale maintenance action',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-delayed-disable',
+      idempotencyKey: 'idem-delayed-disable',
+      expectedEpoch: 0,
+    });
+    expect(delayedDisable).toMatchObject({ kind: 'rejected', code: 'stale_epoch' });
+    expect(await store.getRecord(disableScope)).toMatchObject({
+      state: 'tripped',
+      epoch: 1,
+    });
+
+    const enableScope = await register(scopeFor('delayed-enable'));
+    await store.disable({
+      scope: enableScope,
+      reason: 'maintenance starts',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-disable-before-enable',
+      idempotencyKey: 'idem-disable-before-enable',
+      expectedEpoch: 0,
+    });
+    await store.enable({
+      scope: enableScope,
+      reason: 'maintenance ends',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-first-enable',
+      idempotencyKey: 'idem-first-enable',
+      expectedEpoch: 1,
+    });
+    await store.trip({
+      scope: enableScope,
+      reason: 'incident after maintenance',
+      policyVersion: 'v2',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-enable-trip',
+      idempotencyKey: 'idem-enable-trip',
+      expectedEpoch: 2,
+    });
+    const delayedEnable = await store.enable({
+      scope: enableScope,
+      reason: 'delayed enable from the old maintenance episode',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-delayed-enable',
+      idempotencyKey: 'idem-delayed-enable',
+      expectedEpoch: 1,
+    });
+    expect(delayedEnable).toMatchObject({ kind: 'rejected', code: 'stale_epoch' });
+    expect(await store.getRecord(enableScope)).toMatchObject({
+      state: 'tripped',
+      epoch: 3,
+    });
+
+    const staleAudits = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM breaker_audit_log
+        WHERE correlation_id IN ($1, $2)`,
+      ['corr-delayed-disable', 'corr-delayed-enable'],
+    );
+    expect(staleAudits.rows[0]?.count).toBe('0');
+  });
+
+  it('serializes concurrent duplicate resume, disable, and enable actions', async () => {
+    const resumeScope = await register(scopeFor('duplicate-resume'));
+    await store.trip({
+      scope: resumeScope,
+      reason: 'trip before duplicate resume',
+      policyVersion: 'v1',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-trip-before-duplicate-resume',
+      idempotencyKey: 'idem-trip-before-duplicate-resume',
+      expectedEpoch: 0,
+    });
+    const resumeRequest = {
+      scope: resumeScope,
+      reason: 'duplicate resume',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-duplicate-resume',
+      idempotencyKey: 'idem-duplicate-resume',
+      expectedEpoch: 1,
+    };
+
+    const disableScope = await register(scopeFor('duplicate-disable'));
+    const disableRequest = {
+      scope: disableScope,
+      reason: 'duplicate disable',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-duplicate-disable',
+      idempotencyKey: 'idem-duplicate-disable',
+      expectedEpoch: 0,
+    };
+
+    const enableScope = await register(scopeFor('duplicate-enable'));
+    await store.disable({
+      scope: enableScope,
+      reason: 'prepare disabled state',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-prepare-disabled',
+      idempotencyKey: 'idem-prepare-disabled',
+      expectedEpoch: 0,
+    });
+    const enableRequest = {
+      scope: enableScope,
+      reason: 'duplicate enable',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-duplicate-enable',
+      idempotencyKey: 'idem-duplicate-enable',
+      expectedEpoch: 1,
+    };
+
+    const cases = [
+      {
+        scope: resumeScope,
+        correlationId: resumeRequest.correlationId,
+        expectedState: 'armed',
+        expectedEpoch: 2,
+        run: () => store.resume(resumeRequest),
+      },
+      {
+        scope: disableScope,
+        correlationId: disableRequest.correlationId,
+        expectedState: 'disabled',
+        expectedEpoch: 1,
+        run: () => store.disable(disableRequest),
+      },
+      {
+        scope: enableScope,
+        correlationId: enableRequest.correlationId,
+        expectedState: 'armed',
+        expectedEpoch: 2,
+        run: () => store.enable(enableRequest),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const results = await Promise.all(Array.from({ length: 8 }, testCase.run));
+      const originals = results.filter(
+        (result) => result.kind === 'applied' && result.replayed !== true,
+      );
+      expect(originals).toHaveLength(1);
+      const original = originals[0]!;
+      for (const result of results) {
+        expect(result.kind).toBe('applied');
+        if (result.kind !== 'applied') throw new Error('unreachable');
+        const { replayed: _replayed, ...domainResult } = result;
+        expect(domainResult).toEqual(original);
+      }
+      expect(await store.getRecord(testCase.scope)).toMatchObject({
+        state: testCase.expectedState,
+        epoch: testCase.expectedEpoch,
+      });
+      const audits = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM breaker_audit_log
+          WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND correlation_id=$4`,
+        [
+          testCase.scope.tenant,
+          testCase.scope.environment,
+          testCase.scope.agentId,
+          testCase.correlationId,
+        ],
+      );
+      expect(audits.rows[0]?.count).toBe('1');
+    }
+  });
+
+  it('reclaims an expired idempotency key during lookup without waiting for cleanup', async () => {
+    const scope = await register(scopeFor('expired-idempotency'));
+    const idempotencyKey = `idem-expired-${randomUUID()}`;
+    await store.trip({
+      scope,
+      reason: 'first use',
+      policyVersion: 'v1',
+      cooldownSeconds: 0,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-first',
+      idempotencyKey,
+    });
+    await store.resume({
+      scope,
+      reason: 'make a second trip observable',
+      actor: MANUAL_ACTOR,
+      correlationId: 'corr-resume',
+      idempotencyKey: 'idem-expired-resume',
+      expectedEpoch: 1,
+    });
+    await pool.query(
+      `UPDATE idempotency_keys SET expires_at = now() - interval '1 second'
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4`,
+      [scope.tenant, scope.environment, scope.agentId, idempotencyKey],
+    );
+
+    const reused = await store.trip({
+      scope,
+      reason: 'reused after expiry',
+      policyVersion: 'v2',
+      cooldownSeconds: 60,
+      actor: SYSTEM_ACTOR,
+      correlationId: 'corr-reused',
+      idempotencyKey,
+    });
+    expect(reused.kind).toBe('applied');
+    if (reused.kind !== 'applied') throw new Error('unreachable');
+    expect(reused.noop).toBe(false);
+    expect(reused.record.epoch).toBe(3);
+
+    const persisted = await pool.query<{ count: string; request_hashes: string }>(
+      `SELECT count(*)::text AS count,
+              count(DISTINCT request_hash)::text AS request_hashes
+         FROM idempotency_keys
+        WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4
+          AND expires_at > now()`,
+      [scope.tenant, scope.environment, scope.agentId, idempotencyKey],
+    );
+    expect(persisted.rows[0]).toEqual({ count: '1', request_hashes: '1' });
   });
 
   it('survives concurrent trip requests for the same scope: exactly one real transition, rest no-op', async () => {
@@ -462,6 +806,7 @@ describe('BreakerStore (Postgres integration)', () => {
       actor: MANUAL_ACTOR,
       correlationId: 'corr-3',
       idempotencyKey: 'idem-disable',
+      expectedEpoch: 1,
     });
     expect(disableResult.kind).toBe('applied');
     if (disableResult.kind !== 'applied') throw new Error('unreachable');

@@ -22,6 +22,8 @@ import type {
   ScopeRegistration,
   TripRequest,
 } from '@fuse/contracts';
+import { DetectorTypeSchema } from '@fuse/contracts';
+import type { DiagnosisJobSpec } from './diagnosis-job-store.js';
 import {
   CasContentionExhaustedError,
   IdempotencyConflictError,
@@ -100,7 +102,60 @@ interface ExecuteTransitionArgs {
   expectedEpoch?: number | undefined;
   requestForHash: unknown;
   now: Date;
+  diagnosisJob?: DiagnosisJobSpec;
   computeOutcome: (current: BreakerRecord) => ReturnType<typeof applyTrip>;
+}
+
+function inferredDetector(actorId: string): string {
+  const candidate = actorId.split(':').at(-1);
+  const parsed = DetectorTypeSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : 'unknown';
+}
+
+function normalizeDiagnosisJobSpec(
+  req: TripRequest,
+  spec: DiagnosisJobSpec | undefined,
+  now: Date,
+): DiagnosisJobSpec {
+  if (!spec) {
+    return {
+      detector: inferredDetector(req.actor.id),
+      startsAt: now.toISOString(),
+      notifySlack: false,
+    };
+  }
+  if (spec.detector.length < 1 || spec.detector.length > 200) {
+    throw new RangeError('diagnosis detector must contain between 1 and 200 characters');
+  }
+  const startsAtMs = Date.parse(spec.startsAt);
+  if (!Number.isFinite(startsAtMs)) {
+    throw new RangeError('diagnosis startsAt must be a valid timestamp');
+  }
+  let measurement: DiagnosisJobSpec['measurement'];
+  if (spec.measurement) {
+    const windowEndMs = Date.parse(spec.measurement.windowEnd);
+    if (
+      spec.measurement.detectorVersion.length < 1 ||
+      spec.measurement.detectorVersion.length > 200 ||
+      !Number.isFinite(spec.measurement.score) ||
+      !Number.isFinite(spec.measurement.threshold) ||
+      !Number.isFinite(windowEndMs)
+    ) {
+      throw new RangeError('diagnosis measurement must contain bounded finite values');
+    }
+    measurement = {
+      detectorVersion: spec.measurement.detectorVersion,
+      score: spec.measurement.score,
+      threshold: spec.measurement.threshold,
+      windowEnd: new Date(windowEndMs).toISOString(),
+    };
+  }
+  return {
+    detector: spec.detector,
+    startsAt: new Date(startsAtMs).toISOString(),
+    notifySlack: spec.notifySlack,
+    ...(measurement ? { measurement } : {}),
+  };
 }
 
 export class BreakerStore {
@@ -350,6 +405,17 @@ export class BreakerStore {
       try {
         await client.query('SELECT pg_advisory_lock(hashtext($1)::bigint)', [lockKey]);
         try {
+          await client.query(
+            `DELETE FROM idempotency_keys
+              WHERE tenant=$1 AND environment=$2 AND agent_id=$3 AND key=$4
+                AND expires_at <= now()`,
+            [
+              args.scope.tenant,
+              args.scope.environment,
+              args.scope.agentId,
+              args.idempotencyKey,
+            ],
+          );
           const existing = await client.query<{
             request_hash: string;
             response_snapshot: TransitionResult;
@@ -389,18 +455,48 @@ export class BreakerStore {
                 args.expectedEpoch !== undefined &&
                 args.expectedEpoch !== current.epoch
               ) {
-                await client.query('ROLLBACK');
-                return {
+                const result: TransitionResult = {
                   kind: 'rejected',
                   code: 'stale_epoch',
                   message: `expected epoch ${args.expectedEpoch}, current epoch is ${current.epoch}`,
                 };
+                await client.query(
+                  `INSERT INTO idempotency_keys (tenant, environment, agent_id, key, request_hash, response_snapshot, expires_at)
+                   VALUES ($1,$2,$3,$4,$5,$6, now() + ${IDEMPOTENCY_TTL_INTERVAL})`,
+                  [
+                    args.scope.tenant,
+                    args.scope.environment,
+                    args.scope.agentId,
+                    args.idempotencyKey,
+                    requestHash,
+                    JSON.stringify(result),
+                  ],
+                );
+                await client.query('COMMIT');
+                return result;
               }
 
               const outcome = args.computeOutcome(current);
               if (!outcome.ok) {
-                await client.query('ROLLBACK');
-                return { kind: 'rejected', code: outcome.code, message: outcome.message };
+                const result: TransitionResult = {
+                  kind: 'rejected',
+                  code: outcome.code,
+                  message: outcome.message,
+                };
+                await client.query(
+                  `INSERT INTO idempotency_keys (tenant, environment, agent_id, key, request_hash, response_snapshot, expires_at)
+                   VALUES ($1,$2,$3,$4,$5,$6, now() + ${IDEMPOTENCY_TTL_INTERVAL})`,
+                  [
+                    args.scope.tenant,
+                    args.scope.environment,
+                    args.scope.agentId,
+                    args.idempotencyKey,
+                    requestHash,
+                    JSON.stringify(result),
+                  ],
+                );
+                await client.query('COMMIT');
+                return result;
               }
 
               let finalRecord = outcome.record;
@@ -458,10 +554,35 @@ export class BreakerStore {
                   outcome.noop,
                 ],
               );
+              const auditRow = auditRes.rows[0]!;
+              if (
+                !outcome.noop &&
+                current.state === 'armed' &&
+                finalRecord.state === 'tripped' &&
+                args.diagnosisJob
+              ) {
+                await client.query(
+                  `INSERT INTO diagnosis_jobs
+                     (audit_event_id, detector, detector_version, score,
+                      threshold, starts_at, window_end, notify_slack)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   ON CONFLICT (audit_event_id) DO NOTHING`,
+                  [
+                    auditRow.id,
+                    args.diagnosisJob.detector,
+                    args.diagnosisJob.measurement?.detectorVersion ?? null,
+                    args.diagnosisJob.measurement?.score ?? null,
+                    args.diagnosisJob.measurement?.threshold ?? null,
+                    args.diagnosisJob.startsAt,
+                    args.diagnosisJob.measurement?.windowEnd ?? null,
+                    args.diagnosisJob.notifySlack,
+                  ],
+                );
+              }
               const result: TransitionResult = {
                 kind: 'applied',
                 record: finalRecord,
-                auditEvent: rowToAuditEvent(auditRes.rows[0]!),
+                auditEvent: rowToAuditEvent(auditRow),
                 noop: outcome.noop,
                 ...(outcome.noop ? { noopReason: outcome.noopReason } : {}),
               };
@@ -531,8 +652,12 @@ export class BreakerStore {
     });
   }
 
-  async trip(req: TripRequest): Promise<TransitionResult> {
+  async trip(
+    req: TripRequest,
+    diagnosisJob?: DiagnosisJobSpec,
+  ): Promise<TransitionResult> {
     const now = this.clock();
+    const normalizedDiagnosisJob = normalizeDiagnosisJobSpec(req, diagnosisJob, now);
     return this.executeTransition({
       scope: req.scope,
       idempotencyKey: req.idempotencyKey,
@@ -542,6 +667,7 @@ export class BreakerStore {
       expectedEpoch: req.expectedEpoch,
       requestForHash: req,
       now,
+      diagnosisJob: normalizedDiagnosisJob,
       computeOutcome: (current) =>
         applyTrip(current, {
           reason: req.reason,
@@ -577,6 +703,7 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
+      expectedEpoch: req.expectedEpoch,
       requestForHash: req,
       now,
       computeOutcome: (current) =>
@@ -592,6 +719,7 @@ export class BreakerStore {
       correlationId: req.correlationId,
       actor: req.actor,
       reason: req.reason,
+      expectedEpoch: req.expectedEpoch,
       requestForHash: req,
       now,
       computeOutcome: (current) =>

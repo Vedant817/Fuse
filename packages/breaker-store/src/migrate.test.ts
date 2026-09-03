@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -9,6 +9,7 @@ describe('isMainModule', () => {
   const dirs: string[] = [];
 
   afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
     dirs.length = 0;
   });
 
