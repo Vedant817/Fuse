@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Scope } from '@fuse/contracts';
+import type { PreflightState, Scope } from '@fuse/contracts';
 import type { DiagnosisWorkerConfig } from './diagnosis-worker.js';
 
 const fetchIncidentEvidence = vi.fn();
@@ -34,9 +34,38 @@ function baseConfig(
     slackChannel: '#x',
     localSnapshotDir: '/tmp/unused',
     slackSigningSecret: undefined,
+    slackAuthorizedUserIds: [],
+    slackTeamId: undefined,
     operatorToken: undefined,
     ...overrides,
   };
+}
+
+function preflightStatusResponse(state: PreflightState, scope: Scope = SCOPE): Response {
+  const reasonCode = {
+    protected: 'healthy',
+    degraded: 'missing-required-fields',
+    blind: 'no-signal',
+    disabled: 'operator-disabled',
+  }[state];
+  return new Response(
+    JSON.stringify({
+      result: {
+        scope,
+        state,
+        reasonCode,
+        reason: `committed ${state} result`,
+        evaluatedAt: '2026-08-24T12:00:00.000Z',
+        lastGoodAt: state === 'protected' ? '2026-08-24T12:00:00.000Z' : null,
+        requiredFieldCoveragePercent: state === 'protected' ? 100 : 0,
+        orphanRatePercent: 0,
+        freshnessMs: state === 'blind' ? null : 0,
+        pendingRecoveryState: null,
+        pendingSince: null,
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
 }
 
 describe('Slack operator-token selection', () => {
@@ -106,10 +135,48 @@ describe('Slack operator-token selection', () => {
   });
 });
 
+describe('Slack actor authorization config', () => {
+  it('loads explicit user ids and an optional team id', () => {
+    const config = loadDiagnosisWorkerConfig({
+      SLACK_AUTHORIZED_USER_IDS: 'U123,W456,U123',
+      SLACK_TEAM_ID: 'T789',
+    });
+
+    expect(config.slackAuthorizedUserIds).toEqual(['U123', 'W456']);
+    expect(config.slackTeamId).toBe('T789');
+  });
+
+  it('fails closed for malformed user or team ids', () => {
+    expect(
+      loadDiagnosisWorkerConfig({
+        SLACK_AUTHORIZED_USER_IDS: 'U123,not-a-user',
+      }).slackAuthorizedUserIds,
+    ).toEqual([]);
+    expect(
+      loadDiagnosisWorkerConfig({
+        SLACK_AUTHORIZED_USER_IDS: 'U123',
+        SLACK_TEAM_ID: 'not-a-team',
+      }).slackAuthorizedUserIds,
+    ).toEqual([]);
+  });
+
+  it('targets the same-process Preflight status route on the configured port', () => {
+    expect(
+      loadDiagnosisWorkerConfig({ CONTROL_PLANE_PORT: '8181' }).preflightStatusUrl,
+    ).toBe('http://127.0.0.1:8181/v1/preflight/status');
+  });
+});
+
 describe('runDiagnosisAndNotify', () => {
   let snapshotDir: string;
+  let restoreFetch: (() => void) | undefined;
   const logs: Array<{ msg: string; meta?: Record<string, unknown> | undefined }> = [];
   const log = (msg: string, meta?: Record<string, unknown>) => logs.push({ msg, meta });
+  const mockPreflightFetch = (response: Response) => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response);
+    restoreFetch = () => spy.mockRestore();
+    return spy;
+  };
 
   beforeEach(async () => {
     logs.length = 0;
@@ -122,6 +189,8 @@ describe('runDiagnosisAndNotify', () => {
   });
 
   afterEach(async () => {
+    restoreFetch?.();
+    restoreFetch = undefined;
     await rm(snapshotDir, { recursive: true, force: true });
   });
 
@@ -200,6 +269,127 @@ describe('runDiagnosisAndNotify', () => {
     expect(content).toContain('<!doctype html>');
     expect(content).toContain('cost-velocity safeguard fired');
     expect(content).not.toContain('score $0.0000');
+    expect(content).toContain('Preflight:</span> unknown');
+  });
+
+  it.each(['degraded', 'blind'] as const)(
+    'reads and renders the current committed %s Preflight state for the exact incident scope',
+    async (state) => {
+      const fetchSpy = mockPreflightFetch(preflightStatusResponse(state));
+      postIncidentCard.mockResolvedValue({ posted: true, ts: '1234.5678' });
+
+      await runDiagnosisAndNotify(
+        {
+          scope: SCOPE,
+          detector: 'loop-signature',
+          reason: 'r',
+          correlationId: `corr-preflight-${state}`,
+          startsAt: new Date().toISOString(),
+        },
+        baseConfig({
+          localSnapshotDir: snapshotDir,
+          preflightStatusUrl: 'http://127.0.0.1:8090/v1/preflight/status',
+          operatorTokens: [
+            { tenant: 'other-tenant', token: 'other-operator-token-0001' },
+            { tenant: SCOPE.tenant, token: 'matching-operator-token-0002' },
+          ],
+        }),
+        log,
+      );
+
+      const requestedUrl = fetchSpy.mock.calls[0]?.[0] as URL;
+      expect(requestedUrl.searchParams.get('tenant')).toBe(SCOPE.tenant);
+      expect(requestedUrl.searchParams.get('environment')).toBe(SCOPE.environment);
+      expect(requestedUrl.searchParams.get('agentId')).toBe(SCOPE.agentId);
+      expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({
+        headers: {
+          authorization: 'Bearer matching-operator-token-0002',
+          'x-correlation-id': `corr-preflight-${state}`,
+        },
+      });
+      const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+        { blocks?: unknown[] } | undefined;
+      expect(JSON.stringify(postedCard?.blocks)).toContain(`*Preflight*\\n${state}`);
+      const content = await readFile(
+        path.join(snapshotDir, `corr-preflight-${state}.html`),
+        'utf8',
+      );
+      expect(content).toContain(`Preflight:</span> ${state}`);
+    },
+  );
+
+  it.each([
+    { status: 404, label: 'no committed result' },
+    { status: 503, label: 'Preflight store failure' },
+  ])('renders Preflight unknown and still delivers on $label', async ({ status }) => {
+    mockPreflightFetch(new Response(null, { status }));
+    postIncidentCard.mockResolvedValue({ posted: true, ts: '1234.5678' });
+
+    await expect(
+      runDiagnosisAndNotify(
+        {
+          scope: SCOPE,
+          detector: 'loop-signature',
+          reason: 'r',
+          correlationId: `corr-preflight-${status}`,
+          startsAt: new Date().toISOString(),
+        },
+        baseConfig({
+          localSnapshotDir: snapshotDir,
+          preflightStatusUrl: 'http://127.0.0.1:8090/v1/preflight/status',
+          operatorTokens: [
+            { tenant: SCOPE.tenant, token: 'matching-operator-token-0002' },
+          ],
+        }),
+        log,
+      ),
+    ).resolves.toEqual({ delivered: true, channel: 'slack' });
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    expect(JSON.stringify(postedCard?.blocks)).toContain('*Preflight*\\nunknown');
+    expect(logs).toContainEqual({
+      msg: 'Preflight state unavailable for incident card',
+      meta: {
+        reason: 'status endpoint rejected the read',
+        statusCode: status,
+        tenant: SCOPE.tenant,
+      },
+    });
+  });
+
+  it('rejects a committed Preflight result from any other scope', async () => {
+    mockPreflightFetch(
+      preflightStatusResponse('protected', { ...SCOPE, agentId: 'other-agent' }),
+    );
+    postIncidentCard.mockResolvedValue({ posted: true, ts: '1234.5678' });
+
+    await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-preflight-mismatch',
+        startsAt: new Date().toISOString(),
+      },
+      baseConfig({
+        localSnapshotDir: snapshotDir,
+        preflightStatusUrl: 'http://127.0.0.1:8090/v1/preflight/status',
+        operatorTokens: [{ tenant: SCOPE.tenant, token: 'matching-operator-token-0002' }],
+      }),
+      log,
+    );
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    expect(JSON.stringify(postedCard?.blocks)).toContain('*Preflight*\\nunknown');
+    expect(logs).toContainEqual({
+      msg: 'Preflight state unavailable for incident card',
+      meta: {
+        reason: 'status endpoint returned an invalid or mismatched result',
+        tenant: SCOPE.tenant,
+      },
+    });
   });
 
   it('logs (but does not throw) when the Slack post is not delivered', async () => {
@@ -219,13 +409,16 @@ describe('runDiagnosisAndNotify', () => {
         baseConfig({ localSnapshotDir: snapshotDir }),
         log,
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({
+      delivered: false,
+      reason: 'no Slack bot token configured',
+    });
     expect(logs.some((l) => l.msg.includes('not delivered'))).toBe(true);
   });
 
   it('logs Slack message identity after successful delivery', async () => {
     postIncidentCard.mockResolvedValue({ posted: true, ts: '1234.5678' });
-    await runDiagnosisAndNotify(
+    const result = await runDiagnosisAndNotify(
       {
         scope: SCOPE,
         detector: 'loop-signature',
@@ -240,6 +433,49 @@ describe('runDiagnosisAndNotify', () => {
       msg: 'Slack incident post delivered',
       meta: { channel: 'C123', ts: '1234.5678' },
     });
+    expect(result).toEqual({ delivered: true, channel: 'slack' });
+    expect(postIncidentCard.mock.calls[0]?.[1]).toMatchObject({
+      messageIdentity: 'corr-delivered',
+    });
+  });
+
+  it('binds Slack provider deduplication to the durable audit and correlation identity', async () => {
+    postIncidentCard.mockResolvedValue({ posted: true, ts: '1234.5678' });
+    await runDiagnosisAndNotify(
+      {
+        auditEventId: '00000000-0000-4000-8000-000000000001',
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-deterministic',
+        startsAt: new Date().toISOString(),
+      },
+      baseConfig({ localSnapshotDir: snapshotDir }),
+      log,
+    );
+    expect(postIncidentCard.mock.calls[0]?.[1]).toMatchObject({
+      messageIdentity: '00000000-0000-4000-8000-000000000001:corr-deterministic',
+    });
+  });
+
+  it('does not create a Slack delivery when the committed policy excluded Slack', async () => {
+    const result = await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-snapshot-only',
+        startsAt: new Date().toISOString(),
+        notifySlack: false,
+      },
+      baseConfig({
+        localSnapshotDir: snapshotDir,
+        slackBotToken: 'xoxb-configured-but-policy-disabled',
+      }),
+      log,
+    );
+    expect(result).toEqual({ delivered: true, channel: 'snapshot' });
+    expect(postIncidentCard).not.toHaveBeenCalled();
   });
 
   it('includes Resume only when Slack signing and a tenant-matching operator token make it usable', async () => {
@@ -250,11 +486,14 @@ describe('runDiagnosisAndNotify', () => {
         reason: 'r',
         correlationId: 'corr-resume-action',
         startsAt: new Date().toISOString(),
+        tripEpoch: 7,
       },
       baseConfig({
         localSnapshotDir: snapshotDir,
         slackBotToken: 'xoxb-test',
         slackSigningSecret: 'signing-secret',
+        slackAuthorizedUserIds: ['U123'],
+        slackTeamId: 'T123',
         operatorTokens: [{ tenant: SCOPE.tenant, token: 'tenant-operator-token-0001' }],
       }),
       log,
@@ -264,7 +503,8 @@ describe('runDiagnosisAndNotify', () => {
       { blocks?: unknown[] } | undefined;
     const blocks = JSON.stringify(postedCard?.blocks);
     expect(blocks).toContain('"action_id":"fuse_resume"');
-    expect(blocks).toContain(JSON.stringify(JSON.stringify(SCOPE)).slice(1, -1));
+    expect(blocks).toContain('\\"expectedEpoch\\":7');
+    expect(blocks).toContain('\\"correlationId\\":\\"corr-resume-action\\"');
   });
 
   it('omits Resume and logs why when no operator token matches the incident tenant', async () => {
@@ -275,11 +515,13 @@ describe('runDiagnosisAndNotify', () => {
         reason: 'r',
         correlationId: 'corr-no-resume-action',
         startsAt: new Date().toISOString(),
+        tripEpoch: 7,
       },
       baseConfig({
         localSnapshotDir: snapshotDir,
         slackBotToken: 'xoxb-test',
         slackSigningSecret: 'signing-secret',
+        slackAuthorizedUserIds: ['U123'],
         operatorTokens: [
           { tenant: 'different-tenant', token: 'other-operator-token-0001' },
         ],
@@ -295,6 +537,81 @@ describe('runDiagnosisAndNotify', () => {
       meta: {
         hasSigningSecret: true,
         hasTenantOperatorToken: false,
+        hasAuthorizedSlackUsers: true,
+        hasTripEpoch: true,
+        hasConfiguredTeam: false,
+        tenant: SCOPE.tenant,
+      },
+    });
+  });
+
+  it('omits Resume unless explicit Slack users and the exact trip epoch are configured', async () => {
+    const configured = baseConfig({
+      localSnapshotDir: snapshotDir,
+      slackBotToken: 'xoxb-test',
+      slackSigningSecret: 'signing-secret',
+      operatorTokens: [{ tenant: SCOPE.tenant, token: 'tenant-operator-token-0001' }],
+    });
+
+    await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-missing-authorization',
+        startsAt: new Date().toISOString(),
+        tripEpoch: 7,
+      },
+      configured,
+      log,
+    );
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    expect(JSON.stringify(postedCard?.blocks)).not.toContain('fuse_resume');
+    expect(logs).toContainEqual({
+      msg: 'Slack Resume action omitted: interactive authorization unavailable',
+      meta: {
+        hasSigningSecret: true,
+        hasTenantOperatorToken: true,
+        hasAuthorizedSlackUsers: false,
+        hasTripEpoch: true,
+        hasConfiguredTeam: false,
+        tenant: SCOPE.tenant,
+      },
+    });
+  });
+
+  it('omits Resume when the triggering worker does not supply a committed trip epoch', async () => {
+    await runDiagnosisAndNotify(
+      {
+        scope: SCOPE,
+        detector: 'loop-signature',
+        reason: 'r',
+        correlationId: 'corr-missing-epoch',
+        startsAt: new Date().toISOString(),
+      },
+      baseConfig({
+        localSnapshotDir: snapshotDir,
+        slackBotToken: 'xoxb-test',
+        slackSigningSecret: 'signing-secret',
+        slackAuthorizedUserIds: ['U123'],
+        operatorTokens: [{ tenant: SCOPE.tenant, token: 'tenant-operator-token-0001' }],
+      }),
+      log,
+    );
+
+    const postedCard = postIncidentCard.mock.calls[0]?.[0] as
+      { blocks?: unknown[] } | undefined;
+    expect(JSON.stringify(postedCard?.blocks)).not.toContain('fuse_resume');
+    expect(logs).toContainEqual({
+      msg: 'Slack Resume action omitted: interactive authorization unavailable',
+      meta: {
+        hasSigningSecret: true,
+        hasTenantOperatorToken: true,
+        hasAuthorizedSlackUsers: true,
+        hasTripEpoch: false,
+        hasConfiguredTeam: false,
         tenant: SCOPE.tenant,
       },
     });
@@ -317,7 +634,7 @@ describe('runDiagnosisAndNotify', () => {
         }),
         log,
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ delivered: false, reason: 'no bot token' });
     // the pipeline still completes (falls back to an unavailable bundle,
     // still writes a snapshot and attempts a Slack post)
     expect(postIncidentCard).toHaveBeenCalledOnce();

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { FuseHttpError, SignozAlertmanagerWebhookPayloadSchema } from '@fuse/contracts';
 import {
@@ -8,11 +9,7 @@ import {
 } from '@fuse/breaker-store';
 import type { ControlPlaneConfig } from '../config.js';
 import { mapSignozAlertToNormalizedEvent } from '../signoz-alert-mapper.js';
-import {
-  loadDiagnosisWorkerConfig,
-  runDiagnosisAndNotify,
-  type DiagnosisWorkerConfig,
-} from '../diagnosis-worker.js';
+import type { ResolvedDetectorPolicy } from '../policy-loader.js';
 
 const WEBHOOK_BODY_LIMIT_BYTES = 256 * 1024; // grouped Alertmanager deliveries can carry many alerts
 
@@ -33,7 +30,8 @@ interface AlertOutcome {
     | 'invalid-transition'
     | 'stale-epoch'
     | 'idempotency-conflict'
-    | 'stale-alert';
+    | 'stale-alert'
+    | 'unbound-alert';
 }
 
 /** Replay/staleness guard (docs/threat-model.md §3, config.ts's
@@ -60,8 +58,11 @@ export function registerWebhookRoutes(
   app: FastifyInstance,
   store: BreakerStore,
   config: ControlPlaneConfig,
-  diagnosisConfig: DiagnosisWorkerConfig = loadDiagnosisWorkerConfig(),
-  diagnose: typeof runDiagnosisAndNotify = runDiagnosisAndNotify,
+  resolvePolicy?: (scope: {
+    tenant: string;
+    environment: string;
+    agentId: string;
+  }) => ResolvedDetectorPolicy,
 ): void {
   app.post(
     '/v1/webhooks/signoz',
@@ -98,6 +99,14 @@ export function registerWebhookRoutes(
           continue;
         }
 
+        if (normalized.sourceEpoch === undefined) {
+          // Legacy rules did not preserve the breaker's source epoch. Keep
+          // accepting their deliveries for observability, but never claim an
+          // unbound alert is safe to enforce against mutable current state.
+          results.push({ fingerprint: alert.fingerprint, outcome: 'unbound-alert' });
+          continue;
+        }
+
         if (
           isStaleAlert(
             normalized.startsAt,
@@ -112,27 +121,49 @@ export function registerWebhookRoutes(
           continue;
         }
 
-        // Both the idempotency key AND the correlation ID passed to the
-        // store must be derived from the alert's own stable identity
-        // (fingerprint+startsAt), not from this HTTP request's
-        // auto-generated ID — Alertmanager can and does redeliver the
-        // same alert instance in a later webhook call with a brand-new
-        // HTTP request, and the idempotency check hashes the whole
-        // request (including correlationId), so a per-delivery-attempt
-        // correlationId would make every "duplicate" look like a
-        // different request and spuriously trip IdempotencyConflictError.
-        const alertCorrelationId = `signoz:${normalized.fingerprint}:${normalized.startsAt}`;
+        // Hash the complete immutable alert-episode identity. SigNoz
+        // fingerprints are untrusted and not contract-bounded; the digest
+        // keeps both persisted fields under their existing 200-char limits.
+        const alertDigest = createHash('sha256')
+          .update(
+            [
+              normalized.fingerprint,
+              normalized.startsAt,
+              String(normalized.sourceEpoch),
+            ].join('\0'),
+          )
+          .digest('hex');
+        const alertCorrelationId = `signoz:${alertDigest}`;
         const idempotencyKey = alertCorrelationId;
         try {
-          const tripResult = await store.trip({
-            scope: normalized.scope,
-            reason: normalized.reason,
+          const policy = resolvePolicy?.(normalized.scope) ?? {
             policyVersion: config.webhookDefaultPolicyVersion,
             cooldownSeconds: config.webhookDefaultCooldownSeconds,
-            actor: { type: 'system', id: `system:signoz-webhook:${normalized.detector}` },
-            correlationId: alertCorrelationId,
-            idempotencyKey,
-          });
+            storeOutageMode: config.storeOutageMode,
+            controlPlaneOutageMode: 'fail-closed' as const,
+            detectors: {},
+            notificationRoutes: ['slack'] as const,
+          };
+          const tripResult = await store.trip(
+            {
+              scope: normalized.scope,
+              reason: normalized.reason,
+              policyVersion: policy.policyVersion,
+              cooldownSeconds: policy.cooldownSeconds,
+              actor: {
+                type: 'system',
+                id: `system:signoz-webhook:${normalized.detector}`,
+              },
+              correlationId: alertCorrelationId,
+              idempotencyKey,
+              expectedEpoch: normalized.sourceEpoch,
+            },
+            {
+              detector: normalized.detector,
+              startsAt: normalized.startsAt,
+              notifySlack: policy.notificationRoutes.includes('slack'),
+            },
+          );
           if (tripResult.kind === 'rejected') {
             results.push({
               fingerprint: alert.fingerprint,
@@ -155,27 +186,6 @@ export function registerWebhookRoutes(
                 ? 'breaker-disabled'
                 : 'already-tripped';
             results.push({ fingerprint: alert.fingerprint, outcome });
-
-            // Fire-and-forget, deliberately not awaited: the trip already
-            // committed above, and diagnosis/Slack must never slow down or
-            // affect this webhook's own response (task.md §7's "diagnosis/
-            // Slack outages do not weaken the tripped breaker"). Only for a
-            // genuinely NEW trip — a no-op (already-tripped/disabled) alert
-            // would otherwise re-diagnose and re-notify on every duplicate
-            // delivery of an already-firing alert.
-            if (outcome === 'tripped' && !tripResult.replayed) {
-              void diagnose(
-                {
-                  scope: normalized.scope,
-                  detector: normalized.detector,
-                  reason: normalized.reason,
-                  correlationId: alertCorrelationId,
-                  startsAt: normalized.startsAt,
-                },
-                diagnosisConfig,
-                (msg, meta) => request.log.info(meta, msg),
-              );
-            }
           }
         } catch (err) {
           if (err instanceof UnknownScopeError) {

@@ -10,10 +10,6 @@ import {
 } from '@fuse/breaker-store';
 import type { DetectorRunner } from '../detector-runner.js';
 import type { ResolvedDetectorPolicy } from '../policy-loader.js';
-import {
-  runDiagnosisAndNotify,
-  type DiagnosisWorkerConfig,
-} from '../diagnosis-worker.js';
 
 function correlationIdOf(request: FastifyRequest): string {
   const header = request.headers['x-correlation-id'];
@@ -32,8 +28,6 @@ export function registerDetectorRoutes(
       environment: string;
       agentId: string;
     }) => ResolvedDetectorPolicy;
-    diagnosisConfig?: DiagnosisWorkerConfig;
-    diagnose?: typeof runDiagnosisAndNotify;
   },
 ): void {
   app.post('/v1/detectors/observe', async (request, reply) => {
@@ -49,8 +43,18 @@ export function registerDetectorRoutes(
       return reply.code(err.httpStatus).send(err.toBody());
     }
 
+    let baseline: Awaited<ReturnType<BreakerStore['getRecord']>>;
     try {
-      await store.assertScopeRegistered(parsed.data.scope);
+      baseline = await store.getRecord(parsed.data.scope);
+      if (!baseline) {
+        const httpErr = new FuseHttpError(
+          'unknown_scope',
+          'scope must be registered by an operator before detector observations are accepted',
+          404,
+          correlationId,
+        );
+        return reply.code(httpErr.httpStatus).send(httpErr.toBody());
+      }
     } catch (err) {
       if (err instanceof UnknownScopeError) {
         const httpErr = new FuseHttpError(
@@ -64,7 +68,7 @@ export function registerDetectorRoutes(
       if (err instanceof StoreUnavailableError) {
         const httpErr = new FuseHttpError(
           'store_unavailable',
-          'scope registry is unreachable',
+          'breaker state store is unreachable',
           503,
           correlationId,
         );
@@ -98,6 +102,7 @@ export function registerDetectorRoutes(
     const results = runner.evaluateWindow(
       parsed.data.scope,
       parsed.data.steps,
+      baseline.epoch,
       new Date(),
       policy.detectors,
     );
@@ -105,24 +110,23 @@ export function registerDetectorRoutes(
       detector: string;
       outcome: 'tripped' | 'already-tripped' | 'breaker-disabled';
     }> = [];
+    let episodeAlreadyTripped = baseline.state === 'tripped';
 
     for (const result of results.filter((candidate) => candidate.fired)) {
+      if (episodeAlreadyTripped) {
+        enforcement.push({ detector: result.detector, outcome: 'already-tripped' });
+        continue;
+      }
+      if (baseline.state === 'disabled') {
+        enforcement.push({ detector: result.detector, outcome: 'breaker-disabled' });
+        continue;
+      }
       try {
-        const current = await store.getRecord(parsed.data.scope);
-        if (current?.state === 'tripped') {
-          enforcement.push({ detector: result.detector, outcome: 'already-tripped' });
-          continue;
-        }
-        if (current?.state === 'disabled') {
-          enforcement.push({ detector: result.detector, outcome: 'breaker-disabled' });
-          continue;
-        }
-
-        // The current epoch identifies one arm→trip opportunity. Every
+        // The baseline epoch identifies one arm→trip opportunity. Every
         // replica derives the same request for the same detector+epoch, so
         // concurrent observations serialize through BreakerStore's
         // idempotency lock instead of producing duplicate audit events.
-        const epoch = current?.epoch ?? 0;
+        const epoch = baseline.epoch;
         const incidentDigest = createHash('sha256')
           .update(
             [
@@ -136,41 +140,49 @@ export function registerDetectorRoutes(
           )
           .digest('hex');
         const incidentId = `detector:${incidentDigest}`;
-        const trip = await store.trip({
-          scope: parsed.data.scope,
-          reason: `Fuse ${result.detector} detector ${result.detectorVersion} fired`,
-          policyVersion: policy.policyVersion,
-          cooldownSeconds: policy.cooldownSeconds,
-          actor: { type: 'system', id: `system:detector:${result.detector}` },
-          correlationId: incidentId,
-          idempotencyKey: incidentId,
-        });
-        const outcome =
-          trip.kind === 'applied' && !trip.noop
-            ? 'tripped'
-            : trip.kind === 'applied' && trip.noopReason === 'breaker-disabled'
-              ? 'breaker-disabled'
-              : 'already-tripped';
-        enforcement.push({ detector: result.detector, outcome });
-        if (
-          outcome === 'tripped' &&
-          trip.kind === 'applied' &&
-          !trip.replayed &&
-          policy.notificationRoutes.includes('slack') &&
-          options.diagnosisConfig
-        ) {
-          void (options.diagnose ?? runDiagnosisAndNotify)(
-            {
-              scope: parsed.data.scope,
-              detector: result.detector,
-              reason: `Fuse ${result.detector} detector ${result.detectorVersion} fired`,
-              correlationId: incidentId,
-              startsAt: result.windowStart,
-              detectorResult: result,
+        const trip = await store.trip(
+          {
+            scope: parsed.data.scope,
+            reason: `Fuse ${result.detector} detector ${result.detectorVersion} fired`,
+            policyVersion: policy.policyVersion,
+            cooldownSeconds: policy.cooldownSeconds,
+            actor: { type: 'system', id: `system:detector:${result.detector}` },
+            correlationId: incidentId,
+            idempotencyKey: incidentId,
+            expectedEpoch: epoch,
+          },
+          {
+            detector: result.detector,
+            startsAt: result.windowStart,
+            notifySlack: policy.notificationRoutes.includes('slack'),
+            measurement: {
+              detectorVersion: result.detectorVersion,
+              score: result.score,
+              threshold: result.threshold,
+              windowEnd: result.windowEnd,
             },
-            options.diagnosisConfig,
-            (message, meta) => request.log.info(meta, message),
+          },
+        );
+        if (trip.kind === 'rejected') {
+          const httpErr = new FuseHttpError(
+            'contention_exhausted',
+            'breaker state changed before the direct detector trip committed; retry the observation',
+            409,
+            correlationId,
           );
+          return reply
+            .header('retry-after', '1')
+            .code(httpErr.httpStatus)
+            .send(httpErr.toBody());
+        }
+        const outcome = !trip.noop
+          ? 'tripped'
+          : trip.noopReason === 'breaker-disabled'
+            ? 'breaker-disabled'
+            : 'already-tripped';
+        enforcement.push({ detector: result.detector, outcome });
+        if (outcome === 'tripped' || outcome === 'already-tripped') {
+          episodeAlreadyTripped = true;
         }
       } catch (err) {
         if (err instanceof StoreUnavailableError) {

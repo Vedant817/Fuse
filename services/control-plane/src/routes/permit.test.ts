@@ -9,9 +9,14 @@ import type { Scope } from '@fuse/contracts';
 import { registerPermitRoute } from './permit.js';
 
 const addMock = vi.fn();
+const operationalAddMock = vi.fn();
+const operationalLatencyMock = vi.fn();
 
 vi.mock('@fuse/otel', () => ({
+  FUSE_OPERATIONAL_SLO_VERSION: 'v1-provisional',
   getBreakerDecisionCounter: () => ({ add: addMock }),
+  getPermitRequestCounter: () => ({ add: operationalAddMock }),
+  getPermitLatencyHistogram: () => ({ record: operationalLatencyMock }),
 }));
 
 const SCOPE: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-1' };
@@ -23,6 +28,8 @@ function fakeStore(permitImpl: BreakerStore['permit']): BreakerStore {
 describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorded', () => {
   beforeEach(() => {
     addMock.mockReset();
+    operationalAddMock.mockReset();
+    operationalLatencyMock.mockReset();
   });
 
   it('records the real decision (scope + state + allowed + degraded) on a successful permit', async () => {
@@ -58,6 +65,14 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
       'fuse.breaker.allowed': true,
       'fuse.breaker.degraded': false,
     });
+    expect(operationalAddMock).toHaveBeenCalledWith(1, {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'allowed',
+    });
+    expect(operationalLatencyMock).toHaveBeenCalledWith(expect.any(Number), {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'allowed',
+    });
     await app.close();
   });
 
@@ -89,6 +104,46 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
       'fuse.breaker.allowed': true,
       'fuse.breaker.degraded': true,
     });
+    expect(operationalAddMock).toHaveBeenCalledWith(1, {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'degraded',
+    });
+    await app.close();
+  });
+
+  it('records denial latency without putting scope identity on the SLO series', async () => {
+    const app = Fastify();
+    registerPermitRoute(
+      app,
+      fakeStore(async () => ({
+        allowed: false,
+        state: 'tripped',
+        reason: 'loop detector fired',
+        epoch: 4,
+        degraded: false,
+        correlationId: 'deny-correlation',
+        record: {} as never,
+      })),
+      'fail-closed',
+    );
+    await app.ready();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      payload: { scope: SCOPE, correlationId: 'deny-correlation' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(operationalAddMock).toHaveBeenCalledWith(1, {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'denied',
+    });
+    expect(operationalLatencyMock).toHaveBeenCalledWith(expect.any(Number), {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'denied',
+    });
+    expect(operationalLatencyMock.mock.calls[0]?.[1]).not.toHaveProperty('fuse.tenant');
     await app.close();
   });
 
@@ -138,6 +193,10 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
     });
     expect(res.statusCode).toBe(400);
     expect(addMock).not.toHaveBeenCalled();
+    expect(operationalAddMock).toHaveBeenCalledWith(1, {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'client_error',
+    });
     await app.close();
   });
 
@@ -160,6 +219,10 @@ describe('registerPermitRoute: fuse.breaker.permit.decisions is actually recorde
     expect(res.statusCode).toBe(404);
     expect(res.json().error).toBe('unknown_scope');
     expect(addMock).not.toHaveBeenCalled();
+    expect(operationalAddMock).toHaveBeenCalledWith(1, {
+      'fuse.slo.version': 'v1-provisional',
+      'fuse.outcome': 'client_error',
+    });
     await app.close();
   });
 });

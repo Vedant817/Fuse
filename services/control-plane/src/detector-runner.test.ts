@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DetectorResult, Scope, StepObservationWire } from '@fuse/contracts';
+import type { Scope, StepObservationWire } from '@fuse/contracts';
 import { DetectorRunner } from './detector-runner.js';
 
 const recordMock = vi.fn();
@@ -16,9 +16,11 @@ function step(
   overrides: Partial<StepObservationWire> & { timestampMs: number },
 ): StepObservationWire {
   return {
+    executionId: 'execution-1',
     canonicalShape: 'step',
     inputTokens: 100,
     outputTokens: 20,
+    pricingStatus: 'available',
     estimatedCostUsd: 0.001,
     ...overrides,
   };
@@ -30,10 +32,10 @@ describe('DetectorRunner', () => {
     firedRecordMock.mockReset();
   });
 
-  it('emits fuse.detector.score AND fuse.detector.fired gauge points for every detector on every step', () => {
+  it('emits fuse.detector.score and fuse.detector.fired for every window evaluation', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
-    runner.recordStep(SCOPE, step({ timestampMs: now.getTime() }), now);
+    runner.evaluateWindow(SCOPE, [step({ timestampMs: now.getTime() })], 42, now);
 
     expect(recordMock).toHaveBeenCalledTimes(3);
     expect(firedRecordMock).toHaveBeenCalledTimes(3);
@@ -46,6 +48,7 @@ describe('DetectorRunner', () => {
         'fuse.tenant': 't1',
         'fuse.environment': 'test',
         'fuse.agent_id': 'agent-1',
+        'fuse.source_epoch': '42',
       });
     }
     // fired is always 0 or 1, never the raw (differently-scaled) score
@@ -57,17 +60,16 @@ describe('DetectorRunner', () => {
   it('fires the loop-signature detector once a real ping-pong repeats past its threshold', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
-    let results: DetectorResult[] = [];
     // Analyzer/Verifier ping-pong, byte-identical shape each round —
     // DEFAULT_LOOP_SIGNATURE_CONFIG fires at 3 repetitions of a cycle.
-    for (let i = 0; i < 8; i++) {
-      const shape = i % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision';
-      results = runner.recordStep(
-        SCOPE,
-        step({ timestampMs: now.getTime() + i * 1000, canonicalShape: shape }),
-        new Date(now.getTime() + i * 1000),
-      );
-    }
+    const window = Array.from({ length: 8 }, (_, index) =>
+      step({
+        timestampMs: now.getTime() - (8 - index) * 1000,
+        canonicalShape:
+          index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+      }),
+    );
+    const results = runner.evaluateWindow(SCOPE, window, 0, now);
     const loop = results.find((r) => r.detector === 'loop-signature');
     expect(loop?.fired).toBe(true);
 
@@ -92,22 +94,21 @@ describe('DetectorRunner', () => {
       }),
     );
 
-    const first = firstReplica.evaluateWindow(SCOPE, window, now);
-    const second = secondReplica.evaluateWindow(SCOPE, window, now);
+    const first = firstReplica.evaluateWindow(SCOPE, window, 8, now);
+    const second = secondReplica.evaluateWindow(SCOPE, window, 8, now);
     expect(second).toEqual(first);
     expect(second.find((result) => result.detector === 'loop-signature')?.fired).toBe(
       true,
     );
-    expect(firstReplica.trackedScopeCount).toBe(0);
-    expect(secondReplica.trackedScopeCount).toBe(0);
   });
 
   it('fires the context-bloat detector once input tokens cross the absolute ceiling', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
-    const results = runner.recordStep(
+    const results = runner.evaluateWindow(
       SCOPE,
-      step({ timestampMs: now.getTime(), inputTokens: 150_000, canonicalShape: 'a' }),
+      [step({ timestampMs: now.getTime(), inputTokens: 150_000, canonicalShape: 'a' })],
+      0,
       now,
     );
     const bloat = results.find((r) => r.detector === 'context-bloat');
@@ -117,111 +118,67 @@ describe('DetectorRunner', () => {
   it('fires the cost-velocity detector once spend in the trailing window crosses the threshold', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
-    let results: DetectorResult[] = [];
     // DEFAULT_COST_VELOCITY_CONFIG requires >= 2s elapsed across the burst
     // (its "incomplete window" safeguard) — 600ms apart over 5 calls spans
     // 2400ms, comfortably past that, while still landing well inside the
     // default 60s window.
-    for (let i = 0; i < 5; i++) {
-      results = runner.recordStep(
-        SCOPE,
-        step({
-          timestampMs: now.getTime() + i * 600,
-          canonicalShape: `burst-${i}`,
-          estimatedCostUsd: 0.2,
-        }),
-        new Date(now.getTime() + i * 600),
-      );
-    }
+    const window = Array.from({ length: 5 }, (_, index) =>
+      step({
+        timestampMs: now.getTime() - (4 - index) * 600,
+        canonicalShape: `burst-${index}`,
+        estimatedCostUsd: 0.2,
+      }),
+    );
+    const results = runner.evaluateWindow(SCOPE, window, 0, now);
     const velocity = results.find((r) => r.detector === 'cost-velocity');
     expect(velocity?.fired).toBe(true);
   });
 
-  it('keeps two scopes independent — a loop on one agent never fires for another', () => {
+  it('evaluates each caller window independently', () => {
     const runner = new DetectorRunner();
     const now = new Date('2026-07-22T00:00:00.000Z');
     const otherScope: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-2' };
-    for (let i = 0; i < 8; i++) {
-      const shape = i % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision';
-      runner.recordStep(
-        SCOPE,
-        step({ timestampMs: now.getTime() + i * 1000, canonicalShape: shape }),
-        new Date(now.getTime() + i * 1000),
-      );
-    }
-    const otherResults = runner.recordStep(
+    runner.evaluateWindow(
+      SCOPE,
+      Array.from({ length: 8 }, (_, index) =>
+        step({
+          timestampMs: now.getTime() - (8 - index) * 1000,
+          canonicalShape:
+            index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+        }),
+      ),
+      0,
+      now,
+    );
+    const otherResults = runner.evaluateWindow(
       otherScope,
-      step({ timestampMs: now.getTime(), canonicalShape: 'analyzer:first-ever-step' }),
+      [step({ timestampMs: now.getTime(), canonicalShape: 'analyzer:first-ever-step' })],
+      0,
       now,
     );
     const loop = otherResults.find((r) => r.detector === 'loop-signature');
     expect(loop?.fired).toBe(false);
   });
 
-  it('prunes steps older than the buffer age so a stale scope does not grow unbounded', () => {
+  it('ignores observations outside the bounded trailing window', () => {
     const runner = new DetectorRunner();
     const dayOne = new Date('2026-07-01T00:00:00.000Z');
-    runner.recordStep(SCOPE, step({ timestampMs: dayOne.getTime() }), dayOne);
-    // Two hours later — well past the 1-hour buffer age — a fresh single
-    // step should evaluate as if the old one was never there (cost-velocity
-    // needs minCallsForSignal=3, so a lone fresh step never fires).
     const later = new Date(dayOne.getTime() + 2 * 60 * 60 * 1000);
-    const results = runner.recordStep(
+    const results = runner.evaluateWindow(
       SCOPE,
-      step({ timestampMs: later.getTime(), canonicalShape: 'fresh' }),
+      [
+        step({
+          timestampMs: dayOne.getTime(),
+          estimatedCostUsd: 100,
+          canonicalShape: 'stale',
+        }),
+        step({ timestampMs: later.getTime(), canonicalShape: 'fresh' }),
+      ],
+      0,
       later,
     );
     const velocity = results.find((r) => r.detector === 'cost-velocity');
     expect(velocity?.fired).toBe(false);
     expect(velocity?.score).toBe(0);
-  });
-
-  it('caps the number of distinct tracked scopes — a caller sending unbounded distinct agentIds cannot grow memory without limit (task.md §9.2)', () => {
-    const runner = new DetectorRunner(3);
-    const now = new Date('2026-07-22T00:00:00.000Z');
-    const scopeFor = (n: number): Scope => ({
-      tenant: 't1',
-      environment: 'test',
-      agentId: `agent-${n}`,
-    });
-
-    for (let i = 0; i < 3; i++) {
-      runner.recordStep(scopeFor(i), step({ timestampMs: now.getTime() }), now);
-    }
-    expect(runner.trackedScopeCount).toBe(3);
-
-    // A 4th distinct scope must evict the least-recently-touched one
-    // (agent-0, inserted first and never touched again), not grow past
-    // the cap.
-    runner.recordStep(scopeFor(3), step({ timestampMs: now.getTime() }), now);
-    expect(runner.trackedScopeCount).toBe(3);
-    expect(runner.hasScope(scopeFor(0))).toBe(false);
-    expect(runner.hasScope(scopeFor(1))).toBe(true);
-    expect(runner.hasScope(scopeFor(2))).toBe(true);
-    expect(runner.hasScope(scopeFor(3))).toBe(true);
-  });
-
-  it('re-touching an existing scope refreshes its LRU position instead of counting as a new one', () => {
-    const runner = new DetectorRunner(2);
-    const now = new Date('2026-07-22T00:00:00.000Z');
-    const a: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-a' };
-    const b: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-b' };
-    const c: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-c' };
-
-    runner.recordStep(a, step({ timestampMs: now.getTime() }), now);
-    runner.recordStep(b, step({ timestampMs: now.getTime() }), now);
-    // Re-touch `a` — it should now be the most-recently-used, so the next
-    // new scope evicts `b` (never touched again), not `a`.
-    runner.recordStep(
-      a,
-      step({ timestampMs: now.getTime(), canonicalShape: 'again' }),
-      now,
-    );
-    runner.recordStep(c, step({ timestampMs: now.getTime() }), now);
-
-    expect(runner.trackedScopeCount).toBe(2);
-    expect(runner.hasScope(a)).toBe(true);
-    expect(runner.hasScope(b)).toBe(false);
-    expect(runner.hasScope(c)).toBe(true);
   });
 });

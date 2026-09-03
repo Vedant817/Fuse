@@ -28,6 +28,7 @@ const CONFIG: ControlPlaneConfig = {
   storeOutageMode: 'fail-closed',
   apiTokens: [VALID_TOKEN],
   agentApiTokens: [],
+  exporterEvidenceTokens: [],
   webhookTokens: [],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
@@ -160,7 +161,11 @@ describe('control-plane HTTP API (Postgres integration)', () => {
       expect((await request()).statusCode).toBe(200);
       const limited = await request();
       expect(limited.statusCode).toBe(429);
-      expect(limited.json().error).toBe('invalid_request');
+      expect(limited.json()).toMatchObject({
+        error: 'rate_limited',
+        message: 'rate limit exceeded',
+      });
+      expect(limited.json().correlationId).toBeTypeOf('string');
     } finally {
       await limitedApp.close();
     }
@@ -247,6 +252,7 @@ describe('control-plane HTTP API (Postgres integration)', () => {
         actor: { type: 'policy', id: 'policy:auto' },
         correlationId: 'c2',
         idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: 1,
       },
     });
     expect(policyResume.statusCode).toBe(409);
@@ -262,6 +268,7 @@ describe('control-plane HTTP API (Postgres integration)', () => {
         actor: { type: 'manual', id: 'user:oncall' },
         correlationId: 'c3',
         idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: 1,
       },
     });
     expect(manualResume.statusCode).toBe(200);
@@ -322,6 +329,188 @@ describe('control-plane HTTP API (Postgres integration)', () => {
     });
     expect(first.json()).toEqual(second.json());
   });
+
+  it('requires expectedEpoch on resume, disable, and enable requests', async () => {
+    const scope = scopeFor('operator-epoch-required');
+    for (const action of ['resume', 'disable', 'enable']) {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/v1/breaker/${action}`,
+        headers: authed(),
+        payload: {
+          scope,
+          reason: `unbound ${action} must fail`,
+          actor: { type: 'manual', id: 'user:oncall' },
+          correlationId: `corr-unbound-${action}`,
+          idempotencyKey: `idem-unbound-${action}`,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ error: 'invalid_request' });
+    }
+
+    const status = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      headers: authed(),
+    });
+    expect(status.json().record).toMatchObject({ state: 'armed', epoch: 0 });
+  });
+
+  it('returns stable structured stale_epoch for delayed resume, disable, and enable', async () => {
+    const scope = scopeFor('operator-stale-epoch');
+    const trip = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/trip',
+      headers: authed(),
+      payload: {
+        scope,
+        reason: 'new incident supersedes old operator actions',
+        policyVersion: 'v1',
+        cooldownSeconds: 0,
+        actor: { type: 'system', id: 'system:detector' },
+        correlationId: 'corr-trip-before-stale-actions',
+        idempotencyKey: 'idem-trip-before-stale-actions',
+        expectedEpoch: 0,
+      },
+    });
+    expect(trip.statusCode).toBe(200);
+
+    for (const action of ['resume', 'disable', 'enable']) {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/v1/breaker/${action}`,
+        headers: authed({ 'x-correlation-id': `http-stale-${action}` }),
+        payload: {
+          scope,
+          reason: `delayed ${action}`,
+          actor: { type: 'manual', id: 'user:oncall' },
+          correlationId: `body-stale-${action}`,
+          idempotencyKey: `idem-stale-${action}`,
+          expectedEpoch: 0,
+        },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toEqual({
+        error: 'stale_epoch',
+        message: 'expected epoch 0, current epoch is 1',
+        correlationId: `http-stale-${action}`,
+      });
+    }
+
+    const status = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      headers: authed(),
+    });
+    expect(status.json().record).toMatchObject({ state: 'tripped', epoch: 1 });
+  });
+
+  it('binds an agent credential to one complete scope across permit, Preflight, and detectors without exposing peer scope existence', async () => {
+    const scopedStore = new BreakerStore(pool);
+    const own: Scope = {
+      tenant: 'credential-tenant',
+      environment: 'production',
+      agentId: `credential-agent-${randomUUID().slice(0, 8)}`,
+    };
+    const peers: Scope[] = [
+      { ...own, tenant: 'peer-tenant' },
+      { ...own, environment: 'staging' },
+      { ...own, agentId: `peer-agent-${randomUUID().slice(0, 8)}` },
+    ];
+    const deniedScopes = [
+      ...peers,
+      { ...own, agentId: `unregistered-agent-${randomUUID().slice(0, 8)}` },
+    ];
+    for (const [index, scope] of [own, ...peers].entries()) {
+      await scopedStore.registerScope({
+        scope,
+        policyVersion: 'test-v1',
+        actor: { type: 'system', id: 'test:setup' },
+        reason: 'agent credential scope integration setup',
+        correlationId: `credential-scope-${index}`,
+      });
+    }
+
+    const agentToken = 'exact-agent-credential-'.padEnd(32, '0');
+    const scopedApp = await buildApp({
+      store: scopedStore,
+      preflightStore: new PreflightStore(pool),
+      pool,
+      config: {
+        ...CONFIG,
+        agentApiTokens: [{ ...own, token: agentToken }],
+        exporterEvidenceTokens: [],
+      },
+    });
+    await scopedApp.ready();
+    try {
+      const routes = [
+        {
+          name: 'permit',
+          url: '/v1/permit',
+          payload: (scope: Scope) => ({ scope, correlationId: 'credential-test' }),
+        },
+        {
+          name: 'Preflight',
+          url: '/v1/preflight/report',
+          payload: (scope: Scope) => ({ scope, spans: [] }),
+        },
+        {
+          name: 'detectors',
+          url: '/v1/detectors/observe',
+          payload: (scope: Scope) => ({
+            scope,
+            steps: [
+              {
+                executionId: 'credential-scope-execution',
+                timestampMs: Date.now(),
+                canonicalShape: 'credential-scope-test',
+                inputTokens: 10,
+                outputTokens: 2,
+                pricingStatus: 'available',
+                estimatedCostUsd: 0.0001,
+              },
+            ],
+          }),
+        },
+      ];
+      const headers = {
+        authorization: `Bearer ${agentToken}`,
+        'x-correlation-id': 'credential-scope-auth',
+      };
+
+      for (const route of routes) {
+        const allowed = await scopedApp.inject({
+          method: 'POST',
+          url: route.url,
+          headers,
+          payload: route.payload(own),
+        });
+        expect(allowed.statusCode, `${route.name} should allow own scope`).toBe(200);
+
+        let deniedBody: { error: string; message: string } | undefined;
+        for (const peer of deniedScopes) {
+          const denied = await scopedApp.inject({
+            method: 'POST',
+            url: route.url,
+            headers,
+            payload: route.payload(peer),
+          });
+          expect(denied.statusCode, `${route.name} should deny peer scope`).toBe(403);
+          const body = denied.json() as { error: string; message: string };
+          expect(body).toMatchObject({
+            error: 'unauthorized',
+            message: 'this token is not authorized for the requested scope',
+          });
+          deniedBody ??= { error: body.error, message: body.message };
+          expect({ error: body.error, message: body.message }).toEqual(deniedBody);
+        }
+      }
+    } finally {
+      await scopedApp.close();
+    }
+  });
 });
 
 describe('control-plane token scoping: agent tokens cannot resume/trip/disable/enable', () => {
@@ -373,6 +562,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         storeOutageMode: 'fail-closed',
         apiTokens: [OPERATOR_TOKEN],
         agentApiTokens: [AGENT_TOKEN],
+        exporterEvidenceTokens: [],
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
@@ -459,6 +649,7 @@ describe('control-plane token scoping: agent tokens cannot resume/trip/disable/e
         actor: { type: 'manual', id: 'not-really-a-human' },
         correlationId: 'c2',
         idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: 1,
       },
     });
     expect(res.statusCode).toBe(403);
@@ -533,6 +724,7 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
         storeOutageMode: 'fail-closed',
         apiTokens: [TENANT_A_TOKEN, TENANT_B_TOKEN, WILDCARD_TOKEN],
         agentApiTokens: [],
+        exporterEvidenceTokens: [],
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
@@ -638,6 +830,7 @@ describe('control-plane tenant-scoped tokens: closing the cross-tenant blast rad
         actor: { type: 'manual', id: 'user:tenant-b-admin' },
         correlationId: 'c2',
         idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: 1,
       },
     });
     expect(res.statusCode).toBe(403);

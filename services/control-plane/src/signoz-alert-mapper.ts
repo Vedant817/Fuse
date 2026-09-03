@@ -1,5 +1,6 @@
 import {
   ScopeSchema,
+  SourceBreakerEpochSchema,
   type NormalizedAlertEvent,
   type SignozAlertmanagerAlert,
 } from '@fuse/contracts';
@@ -67,6 +68,9 @@ export function mapSignozAlertToNormalizedEvent(
     alert.annotations['summary'] ??
     alert.annotations['description'] ??
     `SigNoz alert ${alert.fingerprint} (${detector}) fired`;
+  const sourceEpoch = parseSourceEpoch(
+    findLabel(alert.labels, 'fuse.source_epoch', 'fuse_source_epoch'),
+  );
 
   return {
     scope: scopeResult.data,
@@ -75,7 +79,18 @@ export function mapSignozAlertToNormalizedEvent(
     reason: reason.slice(0, 2000),
     fingerprint: alert.fingerprint,
     startsAt: alert.startsAt,
+    ...(sourceEpoch === undefined ? {} : { sourceEpoch }),
   };
+}
+
+/** Accept only a canonical unsigned base-10 integer. `Number("1e3")`,
+ * whitespace, signs, decimals, and values beyond the exact integer range are
+ * deliberately rejected rather than coerced into an enforcement epoch. */
+function parseSourceEpoch(value: string | undefined): number | undefined {
+  if (value === undefined || !/^(0|[1-9]\d*)$/.test(value)) return undefined;
+  const parsed = Number(value);
+  const result = SourceBreakerEpochSchema.safeParse(parsed);
+  return result.success ? result.data : undefined;
 }
 
 function findLabel(

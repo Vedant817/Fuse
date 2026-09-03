@@ -8,6 +8,8 @@ describe('createShutdownHandler', () => {
       releaseApp = resolve;
     });
     const closeApp = vi.fn(() => appClosed);
+    const stopDiagnosisDispatcher = vi.fn(async () => undefined);
+    const closeRateLimitRedis = vi.fn(async () => undefined);
     const closePool = vi.fn(async () => undefined);
     const shutdownOtel = vi.fn(async () => undefined);
     const exit = vi.fn();
@@ -15,6 +17,8 @@ describe('createShutdownHandler', () => {
     const shutdown = createShutdownHandler({
       log,
       closeApp,
+      stopDiagnosisDispatcher,
+      closeRateLimitRedis,
       closePool,
       shutdownOtel,
       exit,
@@ -29,6 +33,8 @@ describe('createShutdownHandler', () => {
     await Promise.all([first, duplicate]);
 
     expect(closePool).toHaveBeenCalledTimes(1);
+    expect(stopDiagnosisDispatcher).toHaveBeenCalledTimes(1);
+    expect(closeRateLimitRedis).toHaveBeenCalledTimes(1);
     expect(shutdownOtel).toHaveBeenCalledTimes(1);
     expect(exit).toHaveBeenCalledOnce();
     expect(exit).toHaveBeenCalledWith(0);
@@ -38,6 +44,8 @@ describe('createShutdownHandler', () => {
 
   it('attempts every cleanup step and exits nonzero when one fails', async () => {
     const closeApp = vi.fn(async () => undefined);
+    const stopDiagnosisDispatcher = vi.fn(async () => undefined);
+    const closeRateLimitRedis = vi.fn(async () => undefined);
     const closePool = vi.fn(async () => {
       throw new Error('pool close failed');
     });
@@ -47,6 +55,8 @@ describe('createShutdownHandler', () => {
     const shutdown = createShutdownHandler({
       log,
       closeApp,
+      stopDiagnosisDispatcher,
+      closeRateLimitRedis,
       closePool,
       shutdownOtel,
       exit,
@@ -56,8 +66,37 @@ describe('createShutdownHandler', () => {
 
     expect(closeApp).toHaveBeenCalledOnce();
     expect(closePool).toHaveBeenCalledOnce();
+    expect(stopDiagnosisDispatcher).toHaveBeenCalledOnce();
+    expect(closeRateLimitRedis).toHaveBeenCalledOnce();
     expect(shutdownOtel).toHaveBeenCalledOnce();
     expect(log.error).toHaveBeenCalledOnce();
     expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('drains diagnosis work after HTTP closes and before the database pool closes', async () => {
+    const order: string[] = [];
+    const shutdown = createShutdownHandler({
+      log: { info: vi.fn(), error: vi.fn() },
+      closeApp: vi.fn(async () => {
+        order.push('app');
+      }),
+      stopDiagnosisDispatcher: vi.fn(async () => {
+        order.push('dispatcher');
+      }),
+      closeRateLimitRedis: vi.fn(async () => {
+        order.push('redis');
+      }),
+      closePool: vi.fn(async () => {
+        order.push('pool');
+      }),
+      shutdownOtel: vi.fn(async () => {
+        order.push('otel');
+      }),
+      exit: vi.fn(),
+    });
+
+    await shutdown('SIGTERM');
+
+    expect(order).toEqual(['app', 'dispatcher', 'redis', 'pool', 'otel']);
   });
 });

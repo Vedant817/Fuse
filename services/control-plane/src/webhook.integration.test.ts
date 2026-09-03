@@ -6,9 +6,15 @@ import {
 import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { BreakerStore, PreflightStore, runMigrations } from '@fuse/breaker-store';
+import {
+  BreakerStore,
+  PreflightStore,
+  StoreUnavailableError,
+  runMigrations,
+} from '@fuse/breaker-store';
 import { buildApp } from './app.js';
 import type { ControlPlaneConfig } from './config.js';
+import { DetectorPolicyResolver } from './policy-loader.js';
 
 const OPERATOR_TOKEN = 'operator-'.padEnd(32, '0');
 const AGENT_TOKEN = 'agent-'.padEnd(32, '0');
@@ -30,6 +36,7 @@ const CONFIG: ControlPlaneConfig = {
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],
   agentApiTokens: [AGENT_TOKEN],
+  exporterEvidenceTokens: [],
   webhookTokens: [WEBHOOK_TOKEN],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
@@ -44,10 +51,51 @@ const CONFIG: ControlPlaneConfig = {
   preflightMinRecoveryDwellMs: 60_000,
 };
 
+class FailableDirectTripStore extends BreakerStore {
+  failNextDetectorTrip = false;
+  private nextRecordReadGate:
+    { observed: () => void; released: Promise<void> } | undefined;
+
+  pauseNextRecordRead(): { observed: Promise<void>; release: () => void } {
+    let markObserved!: () => void;
+    let release!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      markObserved = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.nextRecordReadGate = { observed: markObserved, released };
+    return { observed, release };
+  }
+
+  override async getRecord(...args: Parameters<BreakerStore['getRecord']>) {
+    const record = await super.getRecord(...args);
+    const gate = this.nextRecordReadGate;
+    if (gate) {
+      this.nextRecordReadGate = undefined;
+      gate.observed();
+      await gate.released;
+    }
+    return record;
+  }
+
+  override trip(...args: Parameters<BreakerStore['trip']>) {
+    if (this.failNextDetectorTrip && args[0].actor.id.startsWith('system:detector:')) {
+      this.failNextDetectorTrip = false;
+      return Promise.reject(new StoreUnavailableError('injected direct-trip outage'));
+    }
+    return super.trip(...args);
+  }
+}
+
 describe('SigNoz alert webhook (real Postgres + control plane)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
+  let replicaPool: pg.Pool;
   let app: FastifyInstance;
+  let replica: FastifyInstance;
+  let store: FailableDirectTripStore;
   const registeredAgentIds: string[] = [];
 
   beforeAll(async () => {
@@ -57,9 +105,10 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       .withPassword('fuse')
       .start();
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
+    replicaPool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
-    const store = new BreakerStore(pool);
-    for (let index = 0; index < 30; index++) {
+    store = new FailableDirectTripStore(pool);
+    for (let index = 0; index < 50; index++) {
       const agentId = `agent-registered-${index}-${randomUUID().slice(0, 8)}`;
       await store.registerScope({
         scope: { tenant: 't1', environment: 'test', agentId },
@@ -71,13 +120,40 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       registeredAgentIds.push(agentId);
     }
     const preflightStore = new PreflightStore(pool);
-    app = await buildApp({ store, preflightStore, pool, config: CONFIG });
+    const detectorPolicyResolver = new DetectorPolicyResolver([
+      {
+        policyVersion: 'effective-scope-policy-v7',
+        scope: { tenant: '*', environment: '*', agentId: '*' },
+        cooldownSeconds: 47,
+        storeOutageMode: 'fail-closed',
+        controlPlaneOutageMode: 'fail-closed',
+        detectors: {},
+        notificationRoutes: ['slack'],
+      },
+    ]);
+    app = await buildApp({
+      store,
+      preflightStore,
+      pool,
+      config: CONFIG,
+      detectorPolicyResolver,
+    });
+    replica = await buildApp({
+      store: new BreakerStore(replicaPool),
+      preflightStore: new PreflightStore(replicaPool),
+      pool: replicaPool,
+      config: CONFIG,
+      detectorPolicyResolver,
+    });
     await app.ready();
+    await replica.ready();
   }, 120_000);
 
   afterAll(async () => {
     await app.close();
+    await replica.close();
     await pool.end();
+    await replicaPool.end();
     await container.stop();
   });
 
@@ -99,6 +175,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
                 throw new Error('registered webhook scope pool exhausted');
               })(),
             fuse_detector: 'loop-signature',
+            fuse_source_epoch: '0',
           },
           annotations: { summary: 'loop detected' },
           startsAt: new Date().toISOString(),
@@ -114,6 +191,27 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     const agentId = registeredAgentIds.pop();
     if (!agentId) throw new Error('registered webhook scope pool exhausted');
     return agentId;
+  }
+
+  async function durableEvidence(agentId: string) {
+    const { rows } = await pool.query<{
+      transitions: string;
+      diagnosis_jobs: string;
+    }>(
+      `SELECT
+         count(DISTINCT a.id) FILTER (
+           WHERE a.from_state='armed' AND a.to_state='tripped' AND NOT a.noop
+         )::text AS transitions,
+         count(DISTINCT j.audit_event_id)::text AS diagnosis_jobs
+       FROM breaker_audit_log a
+       LEFT JOIN diagnosis_jobs j ON j.audit_event_id=a.id
+       WHERE a.tenant='t1' AND a.environment='test' AND a.agent_id=$1`,
+      [agentId],
+    );
+    return {
+      transitions: Number(rows[0]!.transitions),
+      diagnosisJobs: Number(rows[0]!.diagnosis_jobs),
+    };
   }
 
   it('an agent token gets 403 on the webhook route (not a silent pass)', async () => {
@@ -136,7 +234,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it('a webhook token can call the route and trips the breaker for a firing alert', async () => {
+  it('an epoch-bound alert trips as fallback while state remains at its source epoch', async () => {
     const payload = firingAlert();
     const agentId = (payload.alerts[0]!.labels as Record<string, string>)[
       'fuse_agent_id'
@@ -150,16 +248,192 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().results[0]).toMatchObject({ outcome: 'tripped' });
 
-    const permitRes = await app.inject({
+    expect(
+      await store.getRecord({ tenant: 't1', environment: 'test', agentId }),
+    ).toMatchObject({ state: 'tripped', epoch: 1 });
+
+    const statusRes = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    const record = statusRes.json().record as {
+      policyVersion: string;
+      updatedAt: string;
+      cooldownUntil: string;
+    };
+    expect(record.policyVersion).toBe('effective-scope-policy-v7');
+    expect(Date.parse(record.cooldownUntil) - Date.parse(record.updatedAt)).toBe(47_000);
+  });
+
+  it('falls back to the epoch-bound alert when the direct commit fails and epoch stays unchanged', async () => {
+    const agentId = registeredAgentId();
+    const scope = { tenant: 't1', environment: 'test', agentId };
+    const now = Date.now();
+    const steps = Array.from({ length: 8 }, (_, index) => ({
+      executionId: 'direct-failure-execution',
+      timestampMs: now - (8 - index) * 100,
+      canonicalShape: index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+      inputTokens: 100,
+      outputTokens: 20,
+      pricingStatus: 'available',
+      estimatedCostUsd: 0.001,
+    }));
+
+    store.failNextDetectorTrip = true;
+    const direct = await app.inject({
       method: 'POST',
-      url: '/v1/permit',
+      url: '/v1/detectors/observe',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope, steps },
+    });
+    expect(direct.statusCode).toBe(503);
+
+    const unchanged = await store.getRecord(scope);
+    expect(unchanged).toMatchObject({ state: 'armed', epoch: 0 });
+
+    const fallback = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_detector: 'loop-signature',
+            fuse_source_epoch: '0',
+          },
+        },
+      ),
+    });
+    expect(fallback.statusCode).toBe(200);
+    expect(fallback.json().results[0].outcome).toBe('tripped');
+    expect(await store.getRecord(scope)).toMatchObject({ state: 'tripped', epoch: 1 });
+  });
+
+  it('does not let a delayed source-epoch alert undo a later authorized resume, but a new epoch trips', async () => {
+    const agentId = registeredAgentId();
+    const scope = { tenant: 't1', environment: 'test', agentId };
+    const oldAlertStartsAt = new Date(Date.now() - 1_000).toISOString();
+    const now = Date.now();
+    const steps = Array.from({ length: 8 }, (_, index) => ({
+      executionId: 'resume-epoch-execution',
+      timestampMs: now - (8 - index) * 100,
+      canonicalShape: index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+      inputTokens: 100,
+      outputTokens: 20,
+      pricingStatus: 'available',
+      estimatedCostUsd: 0.001,
+    }));
+
+    const direct = await app.inject({
+      method: 'POST',
+      url: '/v1/detectors/observe',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope, steps },
+    });
+    expect(direct.statusCode).toBe(200);
+    expect(direct.json().enforcement).toContainEqual({
+      detector: 'loop-signature',
+      outcome: 'tripped',
+    });
+
+    const trippedStatus = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    const trippedEpoch = trippedStatus.json().record.epoch as number;
+    expect(trippedStatus.json().record.updatedBy.id).toBe(
+      'system:detector:loop-signature',
+    );
+
+    const resume = await app.inject({
+      method: 'POST',
+      url: '/v1/breaker/resume',
       headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
       payload: {
-        scope: { tenant: 't1', environment: 'test', agentId },
-        correlationId: 'c1',
+        scope,
+        reason: 'authorized recovery after direct enforcement',
+        actor: { type: 'manual', id: 'operator:test' },
+        expectedEpoch: trippedEpoch,
+        correlationId: `resume-${randomUUID()}`,
+        idempotencyKey: `resume-${randomUUID()}`,
       },
     });
-    expect(permitRes.json().allowed).toBe(false);
+    expect(resume.statusCode).toBe(200);
+    expect(resume.json().record.state).toBe('armed');
+    const resumedRecord = resume.json().record as { epoch: number; updatedAt: string };
+    expect(resumedRecord.epoch).toBe(trippedEpoch + 1);
+
+    const oldAlert = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_detector: 'loop-signature',
+            fuse_source_epoch: '0',
+          },
+          startsAt: oldAlertStartsAt,
+        },
+      ),
+    });
+    expect(oldAlert.statusCode).toBe(200);
+    expect(oldAlert.json().results[0].outcome).toBe('stale-epoch');
+
+    const stillArmed = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(stillArmed.json().record).toMatchObject({
+      state: 'armed',
+      epoch: resumedRecord.epoch,
+    });
+
+    const newAlertStartsAt = new Date(
+      Math.max(Date.now(), Date.parse(resumedRecord.updatedAt) + 1),
+    ).toISOString();
+    const newAlert = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: firingAlert(
+        {},
+        {
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_detector: 'loop-signature',
+            fuse_source_epoch: String(resumedRecord.epoch),
+          },
+          startsAt: newAlertStartsAt,
+        },
+      ),
+    });
+    expect(newAlert.statusCode).toBe(200);
+    expect(newAlert.json().results[0].outcome).toBe('tripped');
+
+    const finallyTripped = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=t1&environment=test&agentId=${agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(finallyTripped.json().record).toMatchObject({
+      state: 'tripped',
+      epoch: resumedRecord.epoch + 1,
+      updatedBy: { id: 'system:signoz-webhook:loop-signature' },
+    });
   });
 
   it('an operator token (superset) can also call the webhook route', async () => {
@@ -224,6 +498,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
               fuse_tenant: 't1',
               fuse_environment: 'test',
               fuse_agent_id: agentId,
+              fuse_source_epoch: '0',
             },
             annotations: {},
             startsAt,
@@ -275,7 +550,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       alerts: [
         {
           status: 'firing',
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: '0',
+          },
           annotations: {},
           startsAt: new Date().toISOString(),
           fingerprint: randomUUID(),
@@ -311,6 +591,215 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     expect(statusRes.json().record.epoch).toBe(1); // exactly one real transition
   });
 
+  it('concurrent identical delivery to two replicas commits one transition and one diagnosis job', async () => {
+    const agentId = registeredAgentId();
+    const payload = firingAlert(
+      {},
+      {
+        labels: {
+          fuse_tenant: 't1',
+          fuse_environment: 'test',
+          fuse_agent_id: agentId,
+          fuse_detector: 'loop-signature',
+          fuse_source_epoch: '0',
+        },
+      },
+    );
+    const request = (target: FastifyInstance) =>
+      target.inject({
+        method: 'POST',
+        url: '/v1/webhooks/signoz',
+        headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+        payload,
+      });
+
+    const [left, right] = await Promise.all([request(app), request(replica)]);
+    expect(left.statusCode).toBe(200);
+    expect(right.statusCode).toBe(200);
+    expect(right.json().results).toEqual(left.json().results);
+    expect(left.json().results[0]).toMatchObject({ outcome: 'tripped' });
+    expect(await durableEvidence(agentId)).toEqual({
+      transitions: 1,
+      diagnosisJobs: 1,
+    });
+
+    const replay = await request(replica);
+    expect(replay.json().results).toEqual(left.json().results);
+    expect(await durableEvidence(agentId)).toEqual({
+      transitions: 1,
+      diagnosisJobs: 1,
+    });
+  });
+
+  it('direct observation and SigNoz fallback racing from the same epoch commit one incident', async () => {
+    const agentId = registeredAgentId();
+    const scope = { tenant: 't1', environment: 'test', agentId };
+    const now = Date.now();
+    const steps = Array.from({ length: 8 }, (_, index) => ({
+      executionId: 'race-execution',
+      timestampMs: now - (8 - index) * 100,
+      canonicalShape: index % 2 === 0 ? 'analyzer:unchanged' : 'verifier:needs-revision',
+      inputTokens: 100,
+      outputTokens: 20,
+      pricingStatus: 'available',
+      estimatedCostUsd: 0.001,
+    }));
+    const payload = firingAlert(
+      {},
+      {
+        labels: {
+          fuse_tenant: 't1',
+          fuse_environment: 'test',
+          fuse_agent_id: agentId,
+          fuse_detector: 'loop-signature',
+          fuse_source_epoch: '0',
+        },
+      },
+    );
+
+    const baselineGate = store.pauseNextRecordRead();
+    const directPromise = app.inject({
+      method: 'POST',
+      url: '/v1/detectors/observe',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope, steps },
+    });
+    await baselineGate.observed;
+    const fallbackPromise = replica.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload,
+    });
+    baselineGate.release();
+
+    const [direct, fallback] = await Promise.all([directPromise, fallbackPromise]);
+    expect([200, 409]).toContain(direct.statusCode);
+    expect(fallback.statusCode).toBe(200);
+    const fallbackOutcome = fallback.json().results[0].outcome as string;
+    expect(['tripped', 'stale-epoch']).toContain(fallbackOutcome);
+    expect(
+      direct.statusCode === 200
+        ? direct
+            .json()
+            .enforcement.some(
+              (entry: { detector: string; outcome: string }) =>
+                entry.detector === 'loop-signature' && entry.outcome === 'tripped',
+            )
+        : fallbackOutcome === 'tripped',
+    ).toBe(true);
+    expect(await store.getRecord(scope)).toMatchObject({ state: 'tripped', epoch: 1 });
+    expect(await durableEvidence(agentId)).toEqual({
+      transitions: 1,
+      diagnosisJobs: 1,
+    });
+
+    const fallbackReplay = await replica.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload,
+    });
+    expect(fallbackReplay.json().results).toEqual(fallback.json().results);
+    expect(await durableEvidence(agentId)).toEqual({
+      transitions: 1,
+      diagnosisJobs: 1,
+    });
+  });
+
+  it('a delayed old epoch after resume and retrip leaves the later episode intact', async () => {
+    const agentId = registeredAgentId();
+    const scope = { tenant: 't1', environment: 'test', agentId };
+    const firstPayload = firingAlert(
+      {},
+      {
+        labels: {
+          fuse_tenant: 't1',
+          fuse_environment: 'test',
+          fuse_agent_id: agentId,
+          fuse_detector: 'loop-signature',
+          fuse_source_epoch: '0',
+        },
+      },
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/webhooks/signoz',
+          headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+          payload: firstPayload,
+        })
+      ).json().results[0].outcome,
+    ).toBe('tripped');
+
+    const resume = await store.resume({
+      scope,
+      reason: 'operator fixed the first episode',
+      actor: { type: 'manual', id: 'operator:test' },
+      expectedEpoch: 1,
+      correlationId: `resume-${randomUUID()}`,
+      idempotencyKey: `resume-${randomUUID()}`,
+    });
+    expect(resume).toMatchObject({ kind: 'applied', noop: false });
+
+    const laterPayload = firingAlert(
+      {},
+      {
+        labels: {
+          fuse_tenant: 't1',
+          fuse_environment: 'test',
+          fuse_agent_id: agentId,
+          fuse_detector: 'context-bloat',
+          fuse_source_epoch: '2',
+        },
+      },
+    );
+    const later = await replica.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: laterPayload,
+    });
+    expect(later.json().results[0].outcome).toBe('tripped');
+    const beforeOldDelivery = await durableEvidence(agentId);
+    expect(beforeOldDelivery).toEqual({ transitions: 2, diagnosisJobs: 2 });
+
+    const delayedOldPayload = firingAlert(
+      {},
+      {
+        labels: {
+          fuse_tenant: 't1',
+          fuse_environment: 'test',
+          fuse_agent_id: agentId,
+          fuse_detector: 'loop-signature',
+          fuse_source_epoch: '0',
+        },
+        startsAt: firstPayload.alerts[0]!.startsAt,
+      },
+    );
+    const delayed = await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: delayedOldPayload,
+    });
+    expect(delayed.json().results[0].outcome).toBe('stale-epoch');
+    const replay = await replica.inject({
+      method: 'POST',
+      url: '/v1/webhooks/signoz',
+      headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
+      payload: delayedOldPayload,
+    });
+    expect(replay.json().results).toEqual(delayed.json().results);
+    expect(await store.getRecord(scope)).toMatchObject({
+      state: 'tripped',
+      epoch: 3,
+      updatedBy: { id: 'system:signoz-webhook:context-bloat' },
+    });
+    expect(await durableEvidence(agentId)).toEqual(beforeOldDelivery);
+  });
+
   it('processes a grouped delivery (multiple alerts, mixed firing/resolved) independently', async () => {
     const agentA = registeredAgentId();
     const agentB = registeredAgentId();
@@ -327,6 +816,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
               fuse_tenant: 't1',
               fuse_environment: 'test',
               fuse_agent_id: agentA,
+              fuse_source_epoch: '0',
             },
             annotations: {},
             startsAt: new Date().toISOString(),
@@ -338,6 +828,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
               fuse_tenant: 't1',
               fuse_environment: 'test',
               fuse_agent_id: agentB,
+              fuse_source_epoch: '0',
             },
             annotations: {},
             startsAt: new Date().toISOString(),
@@ -362,7 +853,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       payload: firingAlert(
         {},
         {
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: '0',
+          },
           startsAt: staleStartsAt,
         },
       ),
@@ -388,7 +884,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       payload: firingAlert(
         {},
         {
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: '0',
+          },
           startsAt: futureStartsAt,
         },
       ),
@@ -406,7 +907,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       payload: firingAlert(
         {},
         {
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: '0',
+          },
           startsAt: 'not-a-real-timestamp',
         },
       ),
@@ -415,12 +921,13 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
     expect(res.json().results[0].outcome).toBe('stale-alert');
   });
 
-  it('a genuinely already-tripped scope reports already-tripped, not breaker-disabled', async () => {
+  it('a distinct alert bound to an already-consumed epoch reports stale-epoch', async () => {
     const agentId = registeredAgentId();
     const labels = {
       fuse_tenant: 't1',
       fuse_environment: 'test',
       fuse_agent_id: agentId,
+      fuse_source_epoch: '0',
     };
 
     const first = await app.inject({
@@ -439,7 +946,7 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
       payload: firingAlert({}, { labels, startsAt: new Date().toISOString() }),
     });
-    expect(second.json().results[0]).toMatchObject({ outcome: 'already-tripped' });
+    expect(second.json().results[0]).toMatchObject({ outcome: 'stale-epoch' });
 
     const statusRes = await app.inject({
       method: 'GET',
@@ -463,9 +970,11 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
         actor: { type: 'manual', id: 'operator:test' },
         correlationId: `disable-${randomUUID()}`,
         idempotencyKey: `disable-${randomUUID()}`,
+        expectedEpoch: 0,
       },
     });
     expect(disableRes.json().record.state).toBe('disabled');
+    const disabledEpoch = disableRes.json().record.epoch as number;
 
     const webhookRes = await app.inject({
       method: 'POST',
@@ -474,7 +983,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       payload: firingAlert(
         {},
         {
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: String(disabledEpoch),
+          },
           startsAt: new Date().toISOString(),
         },
       ),
@@ -500,7 +1014,12 @@ describe('SigNoz alert webhook (real Postgres + control plane)', () => {
       payload: firingAlert(
         {},
         {
-          labels: { fuse_tenant: 't1', fuse_environment: 'test', fuse_agent_id: agentId },
+          labels: {
+            fuse_tenant: 't1',
+            fuse_environment: 'test',
+            fuse_agent_id: agentId,
+            fuse_source_epoch: '0',
+          },
           startsAt: freshStartsAt,
         },
       ),

@@ -6,6 +6,8 @@ interface ShutdownLogger {
 export interface ShutdownDependencies {
   log: ShutdownLogger;
   closeApp: () => Promise<unknown>;
+  stopDiagnosisDispatcher: () => Promise<unknown>;
+  closeRateLimitRedis: () => Promise<unknown>;
   closePool: () => Promise<unknown>;
   shutdownOtel: () => Promise<unknown>;
   exit: (code: number) => void;
@@ -25,6 +27,8 @@ export function createShutdownHandler(
       const failures: Array<{ step: string; error: unknown }> = [];
       const steps: Array<[string, () => Promise<unknown>]> = [
         ['app', dependencies.closeApp],
+        ['diagnosis-dispatcher', dependencies.stopDiagnosisDispatcher],
+        ['rate-limit-redis', dependencies.closeRateLimitRedis],
         ['pool', dependencies.closePool],
         ['otel', dependencies.shutdownOtel],
       ];

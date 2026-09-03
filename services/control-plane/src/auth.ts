@@ -1,7 +1,15 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { FuseHttpError } from '@fuse/contracts';
-import { normalizeTokens, type ScopedToken, type TokenConfigEntry } from './config.js';
+import {
+  normalizeTokens,
+  type AgentTokenConfigEntry,
+  type NormalizedToken,
+  type TokenConfigEntry,
+} from './config.js';
+
+type RequestScope = { tenant: string; environment: string; agentId: string };
+type AuthorizationTarget = string | RequestScope;
 
 function digest(value: string): Buffer {
   return createHash('sha256').update(value).digest();
@@ -16,15 +24,35 @@ function digest(value: string): Buffer {
  * or undefined. */
 function tokenRecordMatches(
   candidateDigest: Buffer,
-  tokens: readonly ScopedToken[],
-): ScopedToken | undefined {
-  let found: ScopedToken | undefined;
+  tokens: readonly NormalizedToken[],
+): NormalizedToken | undefined {
+  let found: NormalizedToken | undefined;
   for (const candidate of tokens) {
     if (timingSafeEqual(candidateDigest, digest(candidate.token))) {
       found = candidate;
     }
   }
   return found;
+}
+
+function tokenAllowsTarget(
+  token: NormalizedToken,
+  target: AuthorizationTarget | undefined,
+): boolean {
+  if (target === undefined) {
+    return (
+      token.tenant === '*' &&
+      (!('environment' in token) || (token.environment === '*' && token.agentId === '*'))
+    );
+  }
+  const tenant = typeof target === 'string' ? target : target.tenant;
+  if (token.tenant !== '*' && token.tenant !== tenant) return false;
+  if (!('environment' in token)) return true;
+  if (typeof target === 'string') return false;
+  return (
+    (token.environment === '*' || token.environment === target.environment) &&
+    (token.agentId === '*' || token.agentId === target.agentId)
+  );
 }
 
 /** Reads the tenant a request targets, for tenant-scope enforcement: a
@@ -39,6 +67,31 @@ export function extractTenantFromRequest(request: FastifyRequest): string | unde
   const query = request.query as { tenant?: unknown } | undefined;
   if (typeof query?.tenant === 'string') return query.tenant;
   return undefined;
+}
+
+/** Reads a complete tenant/environment/agent tuple. Exact agent credentials
+ * fail closed unless all three request fields are available before the route
+ * handler accesses state. */
+export function extractScopeFromRequest(
+  request: FastifyRequest,
+): RequestScope | undefined {
+  const body = request.body as
+    | { scope?: { tenant?: unknown; environment?: unknown; agentId?: unknown } }
+    | null
+    | undefined;
+  const source = body?.scope ?? (request.query as Record<string, unknown> | undefined);
+  if (
+    typeof source?.tenant !== 'string' ||
+    typeof source.environment !== 'string' ||
+    typeof source.agentId !== 'string'
+  ) {
+    return undefined;
+  }
+  return {
+    tenant: source.tenant,
+    environment: source.environment,
+    agentId: source.agentId,
+  };
 }
 
 /** A grouped SigNoz delivery can contain several alerts. A tenant-scoped
@@ -83,9 +136,9 @@ export function extractTenantFromWebhookRequest(
  * or configuring only unscoped tokens reproduces the exact prior behavior.
  */
 export function requireBearerAuth(
-  allowedTokens: readonly TokenConfigEntry[],
-  allKnownTokens: readonly TokenConfigEntry[] = allowedTokens,
-  extractTenant?: (request: FastifyRequest) => string | undefined,
+  allowedTokens: readonly (TokenConfigEntry | AgentTokenConfigEntry)[],
+  allKnownTokens: readonly (TokenConfigEntry | AgentTokenConfigEntry)[] = allowedTokens,
+  extractTarget?: (request: FastifyRequest) => AuthorizationTarget | undefined,
 ) {
   const normalizedAllowed = normalizeTokens(allowedTokens);
   const normalizedAllKnown = normalizeTokens(allKnownTokens);
@@ -120,12 +173,12 @@ export function requireBearerAuth(
     const candidateDigest = digest(token);
     const matched = tokenRecordMatches(candidateDigest, normalizedAllowed);
     if (matched) {
-      if (extractTenant && matched.tenant !== '*') {
-        const requestTenant = extractTenant(request);
-        if (requestTenant === undefined || requestTenant !== matched.tenant) {
+      if (extractTarget) {
+        const target = extractTarget(request);
+        if (!tokenAllowsTarget(matched, target)) {
           const err = new FuseHttpError(
             'unauthorized',
-            'this token is not authorized for the requested tenant',
+            'this token is not authorized for the requested scope',
             403,
             correlationId,
           );

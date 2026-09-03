@@ -11,17 +11,52 @@ const ScopedTokenSchema = z.object({
 });
 export type ScopedToken = z.infer<typeof ScopedTokenSchema>;
 
+const AgentScopedTokenSchema = ScopedTokenSchema.extend({
+  environment: z.string().min(1),
+  agentId: z.string().min(1),
+});
+export type AgentScopedToken = z.infer<typeof AgentScopedTokenSchema>;
+
 /** A plain string is accepted for backward compatibility and normalizes to
  * `{ tenant: '*' }` (see `normalizeToken`) — every existing single-tenant
  * config/token continues to work unchanged; tenant scoping is opt-in. */
 const TokenConfigEntrySchema = z.union([z.string().min(16), ScopedTokenSchema]);
 export type TokenConfigEntry = z.infer<typeof TokenConfigEntrySchema>;
 
-export function normalizeToken(entry: TokenConfigEntry): ScopedToken {
+// Strings and tenant-only records remain valid for programmatic development
+// configs and legacy tenant:token env entries. Production validation below
+// requires the complete AgentScopedToken shape with no wildcard selectors.
+const AgentTokenConfigEntrySchema = z.union([
+  z.string().min(16),
+  AgentScopedTokenSchema,
+  ScopedTokenSchema,
+]);
+export type AgentTokenConfigEntry = z.infer<typeof AgentTokenConfigEntrySchema>;
+export type ExporterEvidenceTokenConfigEntry = AgentTokenConfigEntry;
+export type NormalizedToken = ScopedToken | AgentScopedToken;
+
+const MIN_PRODUCTION_TOKEN_BYTES = 32;
+
+const RedisUrlSchema = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      const protocol = new URL(value).protocol;
+      return protocol === 'redis:' || protocol === 'rediss:';
+    },
+    { message: 'must use the redis:// or rediss:// scheme' },
+  );
+
+export function normalizeToken(
+  entry: TokenConfigEntry | AgentTokenConfigEntry,
+): NormalizedToken {
   return typeof entry === 'string' ? { token: entry, tenant: '*' } : entry;
 }
 
-export function normalizeTokens(entries: readonly TokenConfigEntry[]): ScopedToken[] {
+export function normalizeTokens(
+  entries: readonly (TokenConfigEntry | AgentTokenConfigEntry)[],
+): NormalizedToken[] {
   return entries.map(normalizeToken);
 }
 
@@ -56,6 +91,9 @@ const ConfigSchema = z.object({
    * source at two calls/second per shared token. */
   rateLimitMax: z.number().int().positive().default(120),
   rateLimitWindowMs: z.number().int().positive().default(60_000),
+  /** Shared store used by @fastify/rate-limit. Optional for local/test only;
+   * production validation below rejects replica-local in-memory limiting. */
+  rateLimitRedisUrl: RedisUrlSchema.optional(),
   /** Behavior for the /permit fast path only, when the store cannot be
    * reached. Mutating endpoints (trip/resume/disable/enable) always fail
    * with 503 on store outage regardless of this setting — a control
@@ -67,13 +105,18 @@ const ConfigSchema = z.object({
    * may override a cooldown via a manual-actor resume, disable
    * enforcement, or force a trip — never an agent-scoped token. */
   apiTokens: z.array(TokenConfigEntrySchema).min(1),
-  /** Agent tokens: permit-check only. Meant for the SDK embedded in a
+  /** Agent tokens: permit, Preflight, and detector access only. Meant for the SDK embedded in a
    * customer/agent process — a lower-trust caller that must be able to ask
    * "am I allowed to make this call?" without also being able to resume,
    * disable, or force-trip any breaker. Comma-separated in
    * CONTROL_PLANE_AGENT_API_TOKENS; optional — if empty, only operator
-   * tokens can call /v1/permit (still secure, just no separate role). */
-  agentApiTokens: z.array(TokenConfigEntrySchema).default([]),
+   * tokens can call these agent routes (still secure, just no separate role). */
+  agentApiTokens: z.array(AgentTokenConfigEntrySchema).default([]),
+  /** Exporter-evidence tokens can call only the Preflight exporter evidence
+   * endpoint. Production requires at least one exact tenant/environment/agent
+   * binding and rejects wildcard or partial entries. These credentials must be
+   * held separately from ordinary agent/operator/webhook credentials. */
+  exporterEvidenceTokens: z.array(AgentTokenConfigEntrySchema).default([]),
   /** Webhook tokens: SigNoz's alert-webhook channel only. SigNoz has no
    * HMAC-signing option (verified against its current docs — the channel
    * authenticates via HTTP Basic Auth, or a bearer token when the
@@ -163,6 +206,57 @@ function parseTokenList(raw: string | undefined): TokenConfigEntry[] {
     .map(parseTokenEntry);
 }
 
+/** Agent credentials use `tenant:environment:agentId:token`. Development may
+ * deliberately use wildcard selectors (for example `*:*:*:token`) or the
+ * legacy tenant-only `tenant:token` form. A plain token is rejected because
+ * it would create an implicit, easy-to-miss global wildcard. */
+function parseExactScopeTokenEntry(
+  raw: string,
+  credentialKind: 'agent' | 'exporter evidence',
+): AgentTokenConfigEntry {
+  const first = raw.indexOf(':');
+  if (first < 0) {
+    throw new Error(
+      `invalid ${credentialKind} token entry: use tenant:environment:agentId:token (or an explicit development wildcard such as *:*:*:token)`,
+    );
+  }
+  const second = raw.indexOf(':', first + 1);
+  if (second < 0) return parseTokenEntry(raw);
+  const third = raw.indexOf(':', second + 1);
+  if (third < 0) {
+    throw new Error(
+      `invalid ${credentialKind} token entry: expected tenant:environment:agentId:token`,
+    );
+  }
+
+  const tenant = raw.slice(0, first).trim();
+  const environment = raw.slice(first + 1, second).trim();
+  const agentId = raw.slice(second + 1, third).trim();
+  const token = raw.slice(third + 1).trim();
+  if (
+    tenant.length === 0 ||
+    environment.length === 0 ||
+    agentId.length === 0 ||
+    token.length === 0
+  ) {
+    throw new Error(
+      `invalid ${credentialKind} token entry: tenant:environment:agentId:token entries require every field to be non-empty`,
+    );
+  }
+  return { tenant, environment, agentId, token };
+}
+
+function parseExactScopeTokenList(
+  raw: string | undefined,
+  credentialKind: 'agent' | 'exporter evidence',
+): AgentTokenConfigEntry[] {
+  return (raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => parseExactScopeTokenEntry(entry, credentialKind));
+}
+
 /** `.env.example`'s own placeholder token values (e.g.
  * `changeme-generate-a-strong-random-token`) are 39 characters long — long
  * enough to pass `TokenConfigEntrySchema`'s `min(16)` check, so a fresh
@@ -176,26 +270,150 @@ function parseTokenList(raw: string | undefined): TokenConfigEntry[] {
  * rejecting any real token an operator would plausibly choose. */
 function assertNoPlaceholderTokens(
   envVarName: string,
-  entries: readonly TokenConfigEntry[],
+  entries: readonly (TokenConfigEntry | AgentTokenConfigEntry)[],
 ): void {
   for (const entry of entries) {
     const token = typeof entry === 'string' ? entry : entry.token;
     if (token.toLowerCase().startsWith('changeme')) {
       throw new Error(
-        `${envVarName} still contains a placeholder value from .env.example ` +
-          `("${token}") — generate a real random token (e.g. \`openssl rand -hex 32\`) ` +
+        `${envVarName} still contains a placeholder value from .env.example; ` +
+          'the value is intentionally omitted from this error. Generate a real random token ' +
+          '(e.g. `openssl rand -hex 32`) ' +
           'and set it before starting the control plane.',
       );
     }
   }
 }
 
+export function assertSecureAgentTokenConfiguration(
+  config: Pick<ControlPlaneConfig, 'deploymentEnvironment' | 'agentApiTokens'>,
+): void {
+  if (config.deploymentEnvironment !== 'production') return;
+  for (const entry of config.agentApiTokens) {
+    if (
+      typeof entry === 'string' ||
+      !('environment' in entry) ||
+      entry.tenant === '*' ||
+      entry.environment === '*' ||
+      entry.agentId === '*'
+    ) {
+      throw new Error(
+        'invalid control-plane configuration: production agent credentials must bind tenant, environment, and agentId without wildcards',
+      );
+    }
+  }
+}
+
+export function assertSecureExporterEvidenceTokenConfiguration(
+  config: Pick<ControlPlaneConfig, 'deploymentEnvironment' | 'exporterEvidenceTokens'>,
+): void {
+  if (config.deploymentEnvironment !== 'production') return;
+  if (config.exporterEvidenceTokens.length === 0) {
+    throw new Error(
+      'invalid control-plane configuration: CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS requires at least one exact-scope credential in production',
+    );
+  }
+  for (const entry of config.exporterEvidenceTokens) {
+    if (
+      typeof entry === 'string' ||
+      !('environment' in entry) ||
+      entry.tenant === '*' ||
+      entry.environment === '*' ||
+      entry.agentId === '*'
+    ) {
+      throw new Error(
+        'invalid control-plane configuration: production exporter evidence credentials must bind tenant, environment, and agentId without wildcards',
+      );
+    }
+  }
+}
+
+export function assertExporterCredentialSeparation(
+  config: Pick<
+    ControlPlaneConfig,
+    'apiTokens' | 'agentApiTokens' | 'exporterEvidenceTokens' | 'webhookTokens'
+  >,
+): void {
+  const exporterTokens = normalizeTokens(config.exporterEvidenceTokens).map(
+    ({ token }) => token,
+  );
+  if (new Set(exporterTokens).size !== exporterTokens.length) {
+    throw new Error(
+      'invalid control-plane configuration: each exporter evidence credential must use a unique token value for exactly one scope',
+    );
+  }
+  const ordinaryTokens = new Set(
+    normalizeTokens([
+      ...config.apiTokens,
+      ...config.agentApiTokens,
+      ...config.webhookTokens,
+    ]).map(({ token }) => token),
+  );
+  if (exporterTokens.some((token) => ordinaryTokens.has(token))) {
+    throw new Error(
+      'invalid control-plane configuration: exporter evidence credentials must not reuse operator, agent, or webhook token values',
+    );
+  }
+}
+
+export function assertProductionCredentialConfiguration(
+  config: Pick<
+    ControlPlaneConfig,
+    | 'deploymentEnvironment'
+    | 'apiTokens'
+    | 'agentApiTokens'
+    | 'exporterEvidenceTokens'
+    | 'webhookTokens'
+  >,
+): void {
+  if (config.deploymentEnvironment !== 'production') return;
+  for (const [envVarName, entries] of [
+    ['CONTROL_PLANE_API_TOKENS', config.apiTokens],
+    ['CONTROL_PLANE_AGENT_API_TOKENS', config.agentApiTokens],
+    ['CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS', config.exporterEvidenceTokens],
+    ['CONTROL_PLANE_WEBHOOK_TOKENS', config.webhookTokens],
+  ] as const) {
+    for (const entry of entries) {
+      const token = typeof entry === 'string' ? entry : entry.token;
+      if (Buffer.byteLength(token, 'utf8') < MIN_PRODUCTION_TOKEN_BYTES) {
+        throw new Error(
+          `invalid control-plane configuration: ${envVarName} credentials must be at least ${MIN_PRODUCTION_TOKEN_BYTES} bytes in production; generate each independently with \`openssl rand -hex 32\``,
+        );
+      }
+    }
+  }
+}
+
+export function assertProductionRateLimitConfiguration(
+  config: Pick<ControlPlaneConfig, 'deploymentEnvironment' | 'rateLimitRedisUrl'>,
+): void {
+  if (
+    config.deploymentEnvironment === 'production' &&
+    config.rateLimitRedisUrl === undefined
+  ) {
+    throw new Error(
+      'invalid control-plane configuration: CONTROL_PLANE_RATE_LIMIT_REDIS_URL is required when CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production; replica-local in-memory rate limiting is not safe for a distributed deployment',
+    );
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
   const apiTokens = parseTokenList(env['CONTROL_PLANE_API_TOKENS']);
-  const agentApiTokens = parseTokenList(env['CONTROL_PLANE_AGENT_API_TOKENS']);
+  const agentApiTokens = parseExactScopeTokenList(
+    env['CONTROL_PLANE_AGENT_API_TOKENS'],
+    'agent',
+  );
+  const exporterEvidenceTokens = parseExactScopeTokenList(
+    env['CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS'],
+    'exporter evidence',
+  );
   const webhookTokens = parseTokenList(env['CONTROL_PLANE_WEBHOOK_TOKENS']);
   assertNoPlaceholderTokens('CONTROL_PLANE_API_TOKENS', apiTokens);
   assertNoPlaceholderTokens('CONTROL_PLANE_AGENT_API_TOKENS', agentApiTokens);
+  assertNoPlaceholderTokens(
+    'CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS',
+    exporterEvidenceTokens,
+  );
   assertNoPlaceholderTokens('CONTROL_PLANE_WEBHOOK_TOKENS', webhookTokens);
 
   const parsed = ConfigSchema.safeParse({
@@ -225,9 +443,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     rateLimitWindowMs: env['CONTROL_PLANE_RATE_LIMIT_WINDOW_MS']
       ? Number(env['CONTROL_PLANE_RATE_LIMIT_WINDOW_MS'])
       : undefined,
+    rateLimitRedisUrl: env['CONTROL_PLANE_RATE_LIMIT_REDIS_URL'] || undefined,
     storeOutageMode: env['CONTROL_PLANE_STORE_OUTAGE_MODE'],
     apiTokens,
     agentApiTokens,
+    exporterEvidenceTokens,
     webhookTokens,
     webhookDefaultPolicyVersion: env['CONTROL_PLANE_WEBHOOK_POLICY_VERSION'],
     webhookDefaultCooldownSeconds: env['CONTROL_PLANE_WEBHOOK_COOLDOWN_SECONDS']
@@ -281,5 +501,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
       'invalid control-plane configuration: CONTROL_PLANE_DETECTOR_POLICY_FILE is required when CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT=production',
     );
   }
+  assertSecureAgentTokenConfiguration(parsed.data);
+  assertSecureExporterEvidenceTokenConfiguration(parsed.data);
+  assertExporterCredentialSeparation(parsed.data);
+  assertProductionCredentialConfiguration(parsed.data);
+  assertProductionRateLimitConfiguration(parsed.data);
   return parsed.data;
 }

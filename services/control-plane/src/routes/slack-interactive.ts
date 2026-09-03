@@ -12,10 +12,23 @@ import {
   type DiagnosisWorkerConfig,
 } from '../diagnosis-worker.js';
 
-interface SlackInteractivePayload {
-  type?: string;
-  trigger_id?: string;
-  actions?: Array<{ action_id?: string; value?: string }>;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isAuthorizedSlackActor(
+  payload: Record<string, unknown>,
+  config: DiagnosisWorkerConfig,
+): boolean {
+  const user = payload['user'];
+  if (!isRecord(user) || typeof user['id'] !== 'string') return false;
+  if (!config.slackAuthorizedUserIds.includes(user['id'])) return false;
+
+  if (config.slackTeamId) {
+    const team = payload['team'];
+    if (!isRecord(team) || team['id'] !== config.slackTeamId) return false;
+  }
+  return true;
 }
 
 function correlationIdOf(request: FastifyRequest): string {
@@ -76,18 +89,38 @@ export function registerSlackInteractiveRoute(
     } catch {
       return reply.code(400).send({ error: 'invalid_request', correlationId });
     }
-    const payload = parsed as SlackInteractivePayload;
+    if (!isRecord(parsed)) {
+      return reply.code(400).send({ error: 'invalid_request', correlationId });
+    }
+    const payload = parsed;
 
-    if (payload.type === 'block_actions') {
-      const action = payload.actions?.[0];
-      const triggerId = payload.trigger_id;
-      if (action?.action_id === 'fuse_resume' && action.value && triggerId) {
+    if (
+      (payload['type'] === 'block_actions' || payload['type'] === 'view_submission') &&
+      !isAuthorizedSlackActor(payload, config)
+    ) {
+      return reply.code(403).send({ error: 'forbidden', correlationId });
+    }
+
+    if (payload['type'] === 'block_actions') {
+      const actions = payload['actions'];
+      const action =
+        Array.isArray(actions) && isRecord(actions[0]) ? actions[0] : undefined;
+      const triggerId = payload['trigger_id'];
+      if (
+        action?.['action_id'] === 'fuse_resume' &&
+        typeof action['value'] === 'string' &&
+        typeof triggerId === 'string'
+      ) {
+        const view = buildResumeReasonModalView(action['value']);
+        if (!view) {
+          return reply.code(400).send({ error: 'invalid_request', correlationId });
+        }
         // Fire-and-forget within Slack's ~3s ack window — the ack itself
         // (the empty 200 below) is what Slack actually waits on.
         void openResumeModal({
           botToken: config.slackBotToken,
           triggerId,
-          view: buildResumeReasonModalView(action.value),
+          view,
         }).then((result) => {
           if (result.opened) {
             request.log.info({ correlationId }, 'Slack resume modal opened');
@@ -102,10 +135,8 @@ export function registerSlackInteractiveRoute(
       return reply.code(200).send();
     }
 
-    if (payload.type === 'view_submission') {
-      const submission = parseResumeSubmission(
-        parsed as Parameters<typeof parseResumeSubmission>[0],
-      );
+    if (payload['type'] === 'view_submission') {
+      const submission = parseResumeSubmission(parsed);
       if (!submission) {
         return reply.code(200).send({
           response_action: 'errors',

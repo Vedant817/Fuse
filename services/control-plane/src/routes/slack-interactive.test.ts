@@ -19,6 +19,20 @@ vi.mock('@fuse/diagnosis', async () => {
 
 const SIGNING_SECRET = 'test-signing-secret';
 const CONTROL_PLANE_URL = 'http://127.0.0.1:8090';
+const DEFAULT_SCOPE = { tenant: 't1', environment: 'prod', agentId: 'agent-1' };
+
+function privateMetadata(
+  scope = DEFAULT_SCOPE,
+  overrides: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    version: 1,
+    scope,
+    expectedEpoch: 7,
+    correlationId: 'incident-1',
+    ...overrides,
+  });
+}
 
 function sign(timestamp: string, rawBody: string): string {
   return (
@@ -42,6 +56,8 @@ function buildApp(configOverrides: Partial<DiagnosisWorkerConfig> = {}) {
     slackChannel: '#x',
     localSnapshotDir: '/tmp/unused',
     slackSigningSecret: SIGNING_SECRET,
+    slackAuthorizedUserIds: ['U123'],
+    slackTeamId: 'T123',
     operatorToken: 'op-token',
     ...configOverrides,
   };
@@ -111,15 +127,12 @@ describe('registerSlackInteractiveRoute', () => {
     const app = buildApp();
     await app.ready();
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const scopeValue = JSON.stringify({
-      tenant: 't1',
-      environment: 'prod',
-      agentId: 'agent-1',
-    });
     const bodyObj = {
       type: 'block_actions',
+      user: { id: 'U123' },
+      team: { id: 'T123' },
       trigger_id: 'trigger-123',
-      actions: [{ action_id: 'fuse_resume', value: scopeValue }],
+      actions: [{ action_id: 'fuse_resume', value: privateMetadata() }],
     };
     const rawBody = `payload=${encodeURIComponent(JSON.stringify(bodyObj))}`;
     const res = await post(app, rawBody, {
@@ -139,6 +152,8 @@ describe('registerSlackInteractiveRoute', () => {
     const timestamp = String(Math.floor(Date.now() / 1000));
     const bodyObj = {
       type: 'block_actions',
+      user: { id: 'U123' },
+      team: { id: 'T123' },
       trigger_id: 'trigger-123',
       actions: [{ action_id: 'something_else', value: 'x' }],
     };
@@ -160,13 +175,10 @@ describe('registerSlackInteractiveRoute', () => {
     const bodyObj = {
       type: 'view_submission',
       user: { id: 'U123' },
+      team: { id: 'T123' },
       view: {
         id: 'V123',
-        private_metadata: JSON.stringify({
-          tenant: 't1',
-          environment: 'prod',
-          agentId: 'agent-1',
-        }),
+        private_metadata: privateMetadata(),
         state: { values: { reason_block: { reason_input: { value: 'verified fix' } } } },
       },
     };
@@ -178,7 +190,13 @@ describe('registerSlackInteractiveRoute', () => {
     expect(res.statusCode).toBe(200);
     expect(executeAuthorizedResume).toHaveBeenCalledOnce();
     const [submission, options] = executeAuthorizedResume.mock.calls[0]!;
-    expect(submission).toMatchObject({ reason: 'verified fix', slackUserId: 'U123' });
+    expect(submission).toMatchObject({
+      reason: 'verified fix',
+      slackUserId: 'U123',
+      slackTeamId: 'T123',
+      expectedEpoch: 7,
+      correlationId: 'incident-1',
+    });
     expect(options).toMatchObject({
       controlPlaneUrl: CONTROL_PLANE_URL,
       operatorToken: 'op-token',
@@ -200,9 +218,10 @@ describe('registerSlackInteractiveRoute', () => {
     const bodyObj = {
       type: 'view_submission',
       user: { id: 'U123' },
+      team: { id: 'T123' },
       view: {
         id: 'V123',
-        private_metadata: JSON.stringify({
+        private_metadata: privateMetadata({
           tenant: 'tenant-b',
           environment: 'prod',
           agentId: 'agent-1',
@@ -234,9 +253,10 @@ describe('registerSlackInteractiveRoute', () => {
     const bodyObj = {
       type: 'view_submission',
       user: { id: 'U123' },
+      team: { id: 'T123' },
       view: {
         id: 'V123',
-        private_metadata: JSON.stringify({
+        private_metadata: privateMetadata({
           tenant: 'tenant-b',
           environment: 'prod',
           agentId: 'agent-1',
@@ -267,13 +287,10 @@ describe('registerSlackInteractiveRoute', () => {
     const bodyObj = {
       type: 'view_submission',
       user: { id: 'U123' },
+      team: { id: 'T123' },
       view: {
         id: 'V123',
-        private_metadata: JSON.stringify({
-          tenant: 't1',
-          environment: 'prod',
-          agentId: 'agent-1',
-        }),
+        private_metadata: privateMetadata(),
         state: { values: { reason_block: { reason_input: { value: 'x' } } } },
       },
     };
@@ -291,13 +308,91 @@ describe('registerSlackInteractiveRoute', () => {
     const app = buildApp();
     await app.ready();
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const rawBody = `payload=${encodeURIComponent(JSON.stringify({ type: 'view_submission' }))}`;
+    const rawBody = `payload=${encodeURIComponent(
+      JSON.stringify({
+        type: 'view_submission',
+        user: { id: 'U123' },
+        team: { id: 'T123' },
+        view: {
+          id: 'V123',
+          private_metadata: '{not-json',
+          state: {
+            values: { reason_block: { reason_input: { value: 'fixed' } } },
+          },
+        },
+      }),
+    )}`;
     const res = await post(app, rawBody, {
       'x-slack-signature': sign(timestamp, rawBody),
       'x-slack-request-timestamp': timestamp,
     });
     expect(res.statusCode).toBe(200);
     expect(executeAuthorizedResume).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it.each([
+    ['button user', 'block_actions', { user: { id: 'U999' }, team: { id: 'T123' } }],
+    ['button team', 'block_actions', { user: { id: 'U123' }, team: { id: 'T999' } }],
+    ['modal user', 'view_submission', { user: { id: 'U999' }, team: { id: 'T123' } }],
+    ['modal team', 'view_submission', { user: { id: 'U123' }, team: { id: 'T999' } }],
+  ])(
+    'rejects an unauthorized %s before any privileged action',
+    async (_name, type, actor) => {
+      const app = buildApp();
+      await app.ready();
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const bodyObj =
+        type === 'block_actions'
+          ? {
+              type,
+              ...actor,
+              trigger_id: 'trigger-123',
+              actions: [{ action_id: 'fuse_resume', value: privateMetadata() }],
+            }
+          : {
+              type,
+              ...actor,
+              view: {
+                id: 'V123',
+                private_metadata: privateMetadata(),
+                state: {
+                  values: { reason_block: { reason_input: { value: 'fixed' } } },
+                },
+              },
+            };
+      const rawBody = `payload=${encodeURIComponent(JSON.stringify(bodyObj))}`;
+      const res = await post(app, rawBody, {
+        'x-slack-signature': sign(timestamp, rawBody),
+        'x-slack-request-timestamp': timestamp,
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(openResumeModal).not.toHaveBeenCalled();
+      expect(executeAuthorizedResume).not.toHaveBeenCalled();
+      await app.close();
+    },
+  );
+
+  it('rejects malformed button metadata without opening a modal', async () => {
+    const app = buildApp();
+    await app.ready();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      type: 'block_actions',
+      user: { id: 'U123' },
+      team: { id: 'T123' },
+      trigger_id: 'trigger-123',
+      actions: [{ action_id: 'fuse_resume', value: '{not-json' }],
+    };
+    const rawBody = `payload=${encodeURIComponent(JSON.stringify(bodyObj))}`;
+    const res = await post(app, rawBody, {
+      'x-slack-signature': sign(timestamp, rawBody),
+      'x-slack-request-timestamp': timestamp,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(openResumeModal).not.toHaveBeenCalled();
     await app.close();
   });
 });

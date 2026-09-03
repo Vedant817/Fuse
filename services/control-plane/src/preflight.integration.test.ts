@@ -12,7 +12,14 @@ import type { ControlPlaneConfig } from './config.js';
 
 const OPERATOR_TOKEN = 'operator-'.padEnd(32, '0');
 const AGENT_TOKEN = 'agent-'.padEnd(32, '0');
+const EXPORTER_TOKEN = 'exporter-'.padEnd(32, '0');
+const EXACT_EXPORTER_TOKEN = 'exact-exporter-'.padEnd(32, '0');
 const WEBHOOK_TOKEN = 'webhook-'.padEnd(32, '0');
+const EXACT_EXPORTER_SCOPE = {
+  tenant: 't1',
+  environment: 'test',
+  agentId: 'exact-exporter-agent',
+};
 
 const CONFIG: ControlPlaneConfig = {
   port: 0,
@@ -30,6 +37,10 @@ const CONFIG: ControlPlaneConfig = {
   storeOutageMode: 'fail-closed',
   apiTokens: [OPERATOR_TOKEN],
   agentApiTokens: [AGENT_TOKEN],
+  exporterEvidenceTokens: [
+    EXPORTER_TOKEN,
+    { ...EXACT_EXPORTER_SCOPE, token: EXACT_EXPORTER_TOKEN },
+  ],
   webhookTokens: [WEBHOOK_TOKEN],
   webhookDefaultPolicyVersion: 'signoz-webhook-v1',
   webhookDefaultCooldownSeconds: 300,
@@ -57,6 +68,15 @@ function healthySpan(timestampMs: number) {
   };
 }
 
+function delivered(observedAtMs: number, sequence = 1) {
+  return {
+    status: 'success' as const,
+    observedAtMs,
+    sourceInstanceId: 'control-plane-test-process',
+    sequence,
+  };
+}
+
 describe('Preflight API (real Postgres + control plane)', () => {
   let container: StartedPostgreSqlContainer;
   let pool: pg.Pool;
@@ -80,6 +100,13 @@ describe('Preflight API (real Postgres + control plane)', () => {
     pool = new pg.Pool({ connectionString: container.getConnectionUri() });
     await runMigrations(pool);
     const store = new BreakerStore(pool);
+    await store.registerScope({
+      scope: EXACT_EXPORTER_SCOPE,
+      policyVersion: 'test-v1',
+      actor: { type: 'system', id: 'test:setup' },
+      reason: 'exact exporter integration scope',
+      correlationId: 'setup-exact-exporter',
+    });
     for (let index = 0; index < 30; index++) {
       const registeredScope = {
         tenant: 't1',
@@ -144,17 +171,60 @@ describe('Preflight API (real Postgres + control plane)', () => {
     expect(res.json().error).toBe('unknown_scope');
   });
 
-  it('an agent token can report its own telemetry health', async () => {
+  it('an ordinary agent token cannot forge exporter success', async () => {
     const s = scope();
     const now = Date.now();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/preflight/report',
       headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: s, spans: [healthySpan(now)] },
+      payload: {
+        scope: s,
+        spans: [healthySpan(now)],
+        exporterDelivery: delivered(now),
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('invalid_request');
+
+    const status = await app.inject({
+      method: 'GET',
+      url: `/v1/preflight/status?tenant=${s.tenant}&environment=${s.environment}&agentId=${s.agentId}`,
+      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
+    });
+    expect(status.statusCode).toBe(404);
+  });
+
+  it('an exact-scope exporter credential establishes protected for its own scope', async () => {
+    const now = Date.now();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXACT_EXPORTER_TOKEN}` },
+      payload: {
+        scope: EXACT_EXPORTER_SCOPE,
+        spans: [healthySpan(now)],
+        exporterDelivery: delivered(now),
+      },
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().result.state).toBe('protected');
+  });
+
+  it('denies an exact exporter credential for a different scope', async () => {
+    const wrongScope = scope();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXACT_EXPORTER_TOKEN}` },
+      payload: {
+        scope: wrongScope,
+        spans: [healthySpan(Date.now())],
+        exporterDelivery: delivered(Date.now()),
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('unauthorized');
   });
 
   it('an operator token can read a status the agent reported', async () => {
@@ -162,9 +232,13 @@ describe('Preflight API (real Postgres + control plane)', () => {
     const now = Date.now();
     await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: s, spans: [healthySpan(now)] },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: s,
+        spans: [healthySpan(now)],
+        exporterDelivery: delivered(now),
+      },
     });
     const res = await app.inject({
       method: 'GET',
@@ -185,9 +259,9 @@ describe('Preflight API (real Postgres + control plane)', () => {
     }));
     const res = await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: s, spans: brokenSpans },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: { scope: s, spans: brokenSpans, exporterDelivery: delivered(now) },
     });
     expect(res.json().result.state).toBe('blind');
   });
@@ -195,8 +269,8 @@ describe('Preflight API (real Postgres + control plane)', () => {
   it('rejects a malformed report with 400 invalid_request', async () => {
     const res = await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
       payload: { scope: scope(), spans: [{ notAValidSpan: true }] },
     });
     expect(res.statusCode).toBe(400);
@@ -205,7 +279,7 @@ describe('Preflight API (real Postgres + control plane)', () => {
 
   it('persists hysteresis across separate HTTP report calls (recovery does not commit instantly)', async () => {
     const s = scope();
-    const t0 = Date.now();
+    const t0 = Date.now() - 10_000;
     const brokenSpans = Array.from({ length: 6 }, (_, i) => ({
       ...healthySpan(t0 - (6 - i) * 1000),
       hasInputTokens: false,
@@ -213,17 +287,22 @@ describe('Preflight API (real Postgres + control plane)', () => {
     }));
     const first = await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: s, spans: brokenSpans },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: { scope: s, spans: brokenSpans, exporterDelivery: delivered(t0) },
     });
     expect(first.json().result.state).toBe('blind');
 
+    const recoveryEvidenceAt = Date.now();
     const second = await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: s, spans: [healthySpan(t0 + 5_000)] },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: s,
+        spans: [healthySpan(recoveryEvidenceAt)],
+        exporterDelivery: delivered(recoveryEvidenceAt, 2),
+      },
     });
     expect(second.json().result.state).toBe('blind'); // held, recovering
     expect(second.json().result.reasonCode).toBe('recovering');
@@ -288,10 +367,36 @@ describe('Preflight API (real Postgres + control plane)', () => {
       method: 'POST',
       url: '/v1/preflight/report',
       headers: { authorization: `Bearer ${WEBHOOK_TOKEN}` },
-      payload: { scope: s, spans: [healthySpan(Date.now())] },
+      payload: {
+        scope: s,
+        spans: [healthySpan(Date.now())],
+        exporterDelivery: delivered(Date.now()),
+      },
     });
     expect(report.statusCode).toBe(403);
     expect(report.json().error).toBe('unauthorized');
+  });
+
+  it('keeps an exporter credential out of permit and operator routes', async () => {
+    const permit = await app.inject({
+      method: 'POST',
+      url: '/v1/permit',
+      headers: { authorization: `Bearer ${EXACT_EXPORTER_TOKEN}` },
+      payload: {
+        scope: EXACT_EXPORTER_SCOPE,
+        correlationId: 'exporter-role-escape-permit',
+      },
+    });
+    expect(permit.statusCode).toBe(403);
+    expect(permit.json().error).toBe('unauthorized');
+
+    const operatorStatus = await app.inject({
+      method: 'GET',
+      url: `/v1/breaker/status?tenant=${EXACT_EXPORTER_SCOPE.tenant}&environment=${EXACT_EXPORTER_SCOPE.environment}&agentId=${EXACT_EXPORTER_SCOPE.agentId}`,
+      headers: { authorization: `Bearer ${EXACT_EXPORTER_TOKEN}` },
+    });
+    expect(operatorStatus.statusCode).toBe(403);
+    expect(operatorStatus.json().error).toBe('unauthorized');
   });
 
   it('a disabled scope stays disabled when an agent reports ordinary telemetry that omits `disabled` entirely', async () => {
@@ -325,7 +430,7 @@ describe('Preflight API (real Postgres + control plane)', () => {
     expect(statusRes.json().result.state).toBe('disabled');
   });
 
-  it('an explicit `disabled: false` re-enables a previously-disabled scope', async () => {
+  it('an explicit operator `disabled: false` re-enables monitoring without fabricating exporter evidence', async () => {
     const s = scope();
     await app.inject({
       method: 'POST',
@@ -338,9 +443,14 @@ describe('Preflight API (real Postgres + control plane)', () => {
       method: 'POST',
       url: '/v1/preflight/report',
       headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
-      payload: { scope: s, spans: [healthySpan(Date.now())], disabled: false },
+      payload: {
+        scope: s,
+        spans: [healthySpan(Date.now())],
+        disabled: false,
+      },
     });
-    expect(reenable.json().result.state).toBe('protected');
+    expect(reenable.json().result.state).not.toBe('disabled');
+    expect(reenable.json().result.state).not.toBe('protected');
   });
 
   it('a configured, non-default preflightMaxEvidenceStalenessMs changes evaluator behavior end-to-end through the real HTTP route', async () => {
@@ -353,9 +463,13 @@ describe('Preflight API (real Postgres + control plane)', () => {
     const defaultScope = scope();
     const defaultRes = await app.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: defaultScope, spans: [healthySpan(staleSpanTimestamp)] },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: defaultScope,
+        spans: [healthySpan(staleSpanTimestamp)],
+        exporterDelivery: delivered(Date.now()),
+      },
     });
     expect(defaultRes.json().result.state).toBe('blind');
     expect(defaultRes.json().result.reasonCode).toBe('stale-evidence');
@@ -363,10 +477,70 @@ describe('Preflight API (real Postgres + control plane)', () => {
     const widenedScope = scope();
     const widenedRes = await appWidenedStaleness.inject({
       method: 'POST',
-      url: '/v1/preflight/report',
-      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
-      payload: { scope: widenedScope, spans: [healthySpan(staleSpanTimestamp)] },
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: widenedScope,
+        spans: [healthySpan(staleSpanTimestamp)],
+        exporterDelivery: delivered(Date.now()),
+      },
     });
     expect(widenedRes.json().result.state).toBe('protected');
+  });
+
+  it('does not report protected when local callbacks ran but OTLP was never confirmed or failed', async () => {
+    const neverConfirmedScope = scope();
+    const now = Date.now();
+    const neverConfirmed = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/report',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+      payload: { scope: neverConfirmedScope, spans: [healthySpan(now)] },
+    });
+    expect(neverConfirmed.json().result.state).toBe('degraded');
+    expect(neverConfirmed.json().result.reasonCode).toBe('exporter-delivery-unconfirmed');
+
+    const failedScope = scope();
+    const failed = await app.inject({
+      method: 'POST',
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: failedScope,
+        spans: [healthySpan(now)],
+        exporterDelivery: {
+          status: 'failure',
+          observedAtMs: now,
+          sourceInstanceId: 'control-plane-test-process',
+          sequence: 1,
+        },
+      },
+    });
+    expect(failed.json().result.state).toBe('blind');
+    expect(failed.json().result.reasonCode).toBe('exporter-delivery-failed');
+  });
+
+  it('uses database receipt time instead of reporter wall-clock skew for liveness', async () => {
+    const s = scope();
+    const spanAt = Date.now();
+    const exporterAt = spanAt - 6 * 60_000;
+    const initiallyProtected = await appWidenedStaleness.inject({
+      method: 'POST',
+      url: '/v1/preflight/exporter-evidence',
+      headers: { authorization: `Bearer ${EXPORTER_TOKEN}` },
+      payload: {
+        scope: s,
+        spans: [healthySpan(spanAt)],
+        exporterDelivery: delivered(exporterAt),
+      },
+    });
+    expect(initiallyProtected.json().result.state).toBe('protected');
+
+    const status = await appWidenedStaleness.inject({
+      method: 'GET',
+      url: `/v1/preflight/status?tenant=${s.tenant}&environment=${s.environment}&agentId=${s.agentId}`,
+      headers: { authorization: `Bearer ${AGENT_TOKEN}` },
+    });
+    expect(status.json().result.state).toBe('protected');
   });
 });

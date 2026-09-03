@@ -11,7 +11,12 @@ import {
   UnknownScopeError,
   type BreakerStore,
 } from '@fuse/breaker-store';
-import { getBreakerDecisionCounter } from '@fuse/otel';
+import {
+  FUSE_OPERATIONAL_SLO_VERSION,
+  getBreakerDecisionCounter,
+  getPermitLatencyHistogram,
+  getPermitRequestCounter,
+} from '@fuse/otel';
 
 function correlationIdOf(request: FastifyRequest): string {
   const header = request.headers['x-correlation-id'];
@@ -22,7 +27,25 @@ function correlationIdOf(request: FastifyRequest): string {
  * — the actual dimension `fuse.breaker.permit.decisions`'s own doc comment
  * (packages/otel/src/metrics.ts) promises, recorded where the decision is
  * actually authoritative (this route), not client-side per SDK instance. */
-function recordDecision(scope: Scope, result: PermitResponse): void {
+type PermitOperationalOutcome =
+  'allowed' | 'denied' | 'degraded' | 'client_error' | 'server_error';
+
+function recordOperationalPermit(
+  outcome: PermitOperationalOutcome,
+  startedAt: number,
+): void {
+  const attributes = {
+    'fuse.slo.version': FUSE_OPERATIONAL_SLO_VERSION,
+    'fuse.outcome': outcome,
+  };
+  getPermitRequestCounter().add(1, attributes);
+  getPermitLatencyHistogram().record(
+    Math.max(0, performance.now() - startedAt) / 1_000,
+    attributes,
+  );
+}
+
+function recordDecision(scope: Scope, result: PermitResponse, startedAt: number): void {
   getBreakerDecisionCounter().add(1, {
     'fuse.tenant': scope.tenant,
     'fuse.environment': scope.environment,
@@ -31,6 +54,10 @@ function recordDecision(scope: Scope, result: PermitResponse): void {
     'fuse.breaker.allowed': result.allowed,
     'fuse.breaker.degraded': result.degraded,
   });
+  recordOperationalPermit(
+    result.degraded ? 'degraded' : result.allowed ? 'allowed' : 'denied',
+    startedAt,
+  );
 }
 
 export function registerPermitRoute(
@@ -39,9 +66,11 @@ export function registerPermitRoute(
   resolveStoreOutageMode: OutageMode | ((scope: Scope) => OutageMode),
 ): void {
   app.post('/v1/permit', async (request, reply) => {
+    const startedAt = performance.now();
     const correlationId = correlationIdOf(request);
     const parsed = PermitRequestSchema.safeParse(request.body);
     if (!parsed.success) {
+      recordOperationalPermit('client_error', startedAt);
       const err = new FuseHttpError(
         'invalid_request',
         parsed.error.message,
@@ -53,10 +82,11 @@ export function registerPermitRoute(
 
     try {
       const result = await store.permit(parsed.data.scope, parsed.data.correlationId);
-      recordDecision(parsed.data.scope, result);
+      recordDecision(parsed.data.scope, result, startedAt);
       return reply.code(200).send(result);
     } catch (err) {
       if (err instanceof UnknownScopeError) {
+        recordOperationalPermit('client_error', startedAt);
         const httpErr = new FuseHttpError(
           'unknown_scope',
           err.message,
@@ -83,9 +113,10 @@ export function registerPermitRoute(
           degraded: true,
           correlationId: parsed.data.correlationId,
         };
-        recordDecision(parsed.data.scope, degradedResult);
+        recordDecision(parsed.data.scope, degradedResult, startedAt);
         return reply.code(200).send(degradedResult);
       }
+      recordOperationalPermit('server_error', startedAt);
       throw err;
     }
   });

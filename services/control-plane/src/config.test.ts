@@ -32,6 +32,67 @@ describe('loadConfig token parsing', () => {
     ]);
   });
 
+  it('parses an agent credential bound to tenant, environment, and agentId', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_AGENT_API_TOKENS: `t1:production:agent-1:${'d'.repeat(16)}`,
+    });
+    expect(config.agentApiTokens).toEqual([
+      {
+        tenant: 't1',
+        environment: 'production',
+        agentId: 'agent-1',
+        token: 'd'.repeat(16),
+      },
+    ]);
+  });
+
+  it('rejects a plain agent token instead of silently treating it as a global wildcard', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_AGENT_API_TOKENS: 'd'.repeat(16),
+      }),
+    ).toThrow(/explicit development wildcard/);
+  });
+
+  it('allows an explicitly configured wildcard agent credential in development', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_AGENT_API_TOKENS: `*:*:*:${'d'.repeat(16)}`,
+    });
+    expect(config.agentApiTokens).toEqual([
+      { tenant: '*', environment: '*', agentId: '*', token: 'd'.repeat(16) },
+    ]);
+  });
+
+  it('allows an explicit exporter wildcard only in development', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `*:*:*:${'e'.repeat(16)}`,
+    });
+    expect(config.exporterEvidenceTokens).toEqual([
+      { tenant: '*', environment: '*', agentId: '*', token: 'e'.repeat(16) },
+    ]);
+  });
+
+  it('retains the legacy tenant-only agent form in development', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CONTROL_PLANE_AGENT_API_TOKENS: `t1:${'d'.repeat(16)}`,
+    });
+    expect(config.agentApiTokens).toEqual([{ tenant: 't1', token: 'd'.repeat(16) }]);
+  });
+
+  it('rejects malformed three-part agent credentials', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_AGENT_API_TOKENS: `t1:production:${'d'.repeat(16)}`,
+      }),
+    ).toThrow(/expected tenant:environment:agentId:token/);
+  });
+
   it('rejects an entry with an empty tenant instead of widening it to wildcard', () => {
     expect(() =>
       loadConfig({
@@ -80,7 +141,7 @@ describe('loadConfig token parsing', () => {
       loadConfig({
         ...BASE_ENV,
         CONTROL_PLANE_AGENT_API_TOKENS:
-          'changeme-generate-a-different-strong-random-token',
+          't1:development:agent-1:changeme-generate-a-different-strong-random-token',
       }),
     ).toThrow(/CONTROL_PLANE_AGENT_API_TOKENS still contains a placeholder value/);
   });
@@ -92,6 +153,24 @@ describe('loadConfig token parsing', () => {
         CONTROL_PLANE_WEBHOOK_TOKENS: 'changeme-generate-a-third-strong-random-token',
       }),
     ).toThrow(/CONTROL_PLANE_WEBHOOK_TOKENS still contains a placeholder value/);
+  });
+
+  it('rejects a placeholder exporter evidence token without echoing it', () => {
+    const placeholder = 'changeme-exporter-evidence-token-value';
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:test:agent-1:${placeholder}`,
+      }),
+    ).toThrow(/CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS still contains a placeholder/);
+    try {
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:test:agent-1:${placeholder}`,
+      });
+    } catch (error) {
+      expect(String(error)).not.toContain(placeholder);
+    }
   });
 
   it('rejects a placeholder token even in tenant:token form', () => {
@@ -172,20 +251,109 @@ describe('loadConfig listener and rate-limit options', () => {
   });
 
   it('requires an explicit detector policy file in production', () => {
+    const productionBase = {
+      ...BASE_ENV,
+      CONTROL_PLANE_API_TOKENS: 'a'.repeat(64),
+      CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:production:agent-1:${'e'.repeat(64)}`,
+    };
     expect(() =>
       loadConfig({
-        ...BASE_ENV,
+        ...productionBase,
         CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+        CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'redis://redis.internal:6379',
       }),
     ).toThrow(/CONTROL_PLANE_DETECTOR_POLICY_FILE is required/);
 
     expect(
       loadConfig({
-        ...BASE_ENV,
+        ...productionBase,
         CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
         CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+        CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'redis://redis.internal:6379',
       }).detectorPolicyFile,
     ).toBe('/etc/fuse/policies/production.json');
+  });
+
+  it('accepts only exact agent credentials in production', () => {
+    const productionEnv = {
+      ...BASE_ENV,
+      CONTROL_PLANE_API_TOKENS: 'a'.repeat(64),
+      CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+      CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+      CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'redis://redis.internal:6379',
+      CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:production:agent-1:${'e'.repeat(64)}`,
+    };
+    const exact = loadConfig({
+      ...productionEnv,
+      CONTROL_PLANE_AGENT_API_TOKENS: `t1:production:agent-1:${'d'.repeat(64)}`,
+    });
+    expect(exact.agentApiTokens[0]).toMatchObject({
+      tenant: 't1',
+      environment: 'production',
+      agentId: 'agent-1',
+    });
+
+    expect(() =>
+      loadConfig({
+        ...productionEnv,
+        CONTROL_PLANE_AGENT_API_TOKENS: `*:*:*:${'d'.repeat(64)}`,
+      }),
+    ).toThrow(/production agent credentials must bind tenant, environment, and agentId/);
+    expect(() =>
+      loadConfig({
+        ...productionEnv,
+        CONTROL_PLANE_AGENT_API_TOKENS: `t1:${'d'.repeat(64)}`,
+      }),
+    ).toThrow(/production agent credentials must bind tenant, environment, and agentId/);
+  });
+
+  it('requires exact, complete exporter evidence credentials in production', () => {
+    const productionEnv = {
+      ...BASE_ENV,
+      CONTROL_PLANE_API_TOKENS: 'a'.repeat(64),
+      CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+      CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+      CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'redis://redis.internal:6379',
+    };
+    expect(() => loadConfig(productionEnv)).toThrow(
+      /PREFLIGHT_EXPORTER_TOKENS requires at least one exact-scope credential/,
+    );
+    for (const value of [`*:*:*:${'e'.repeat(64)}`, `t1:${'e'.repeat(64)}`]) {
+      expect(() =>
+        loadConfig({
+          ...productionEnv,
+          CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: value,
+        }),
+      ).toThrow(/production exporter evidence credentials must bind/);
+    }
+    expect(
+      loadConfig({
+        ...productionEnv,
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:production:agent-1:${'e'.repeat(64)}`,
+      }).exporterEvidenceTokens[0],
+    ).toMatchObject({ tenant: 't1', environment: 'production', agentId: 'agent-1' });
+  });
+
+  it('rejects exporter token reuse across credential classes', () => {
+    const reused = 'r'.repeat(64);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_AGENT_API_TOKENS: `t1:test:agent-1:${reused}`,
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:test:agent-1:${reused}`,
+      }),
+    ).toThrow(/must not reuse operator, agent, or webhook token values/);
+  });
+
+  it('rejects one exporter token bound to multiple scopes', () => {
+    const reused = 'r'.repeat(64);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS:
+          `t1:test:agent-1:${reused},` + `t1:test:agent-2:${reused}`,
+      }),
+    ).toThrow(/unique token value for exactly one scope/);
   });
 
   it('parses explicit rate-limit overrides', () => {
@@ -196,6 +364,61 @@ describe('loadConfig listener and rate-limit options', () => {
     });
     expect(config.rateLimitMax).toBe(5000);
     expect(config.rateLimitWindowMs).toBe(10_000);
+  });
+
+  it('rejects production without shared rate-limit Redis', () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_API_TOKENS: 'a'.repeat(64),
+        CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+        CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+        CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:production:agent-1:${'e'.repeat(64)}`,
+      }),
+    ).toThrow(/CONTROL_PLANE_RATE_LIMIT_REDIS_URL is required/);
+  });
+
+  it('requires independently generated 32-byte bearer credentials in production', () => {
+    const productionEnv = {
+      ...BASE_ENV,
+      CONTROL_PLANE_DEPLOYMENT_ENVIRONMENT: 'production',
+      CONTROL_PLANE_DETECTOR_POLICY_FILE: '/etc/fuse/policies/production.json',
+      CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'rediss://redis.internal:6380/0',
+      CONTROL_PLANE_API_TOKENS: `t1:${'a'.repeat(64)}`,
+      CONTROL_PLANE_AGENT_API_TOKENS: `t1:production:agent-1:${'b'.repeat(64)}`,
+      CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS: `t1:production:agent-1:${'d'.repeat(64)}`,
+      CONTROL_PLANE_WEBHOOK_TOKENS: `t1:${'c'.repeat(64)}`,
+    };
+
+    expect(() => loadConfig(productionEnv)).not.toThrow();
+    for (const [name, value] of [
+      ['CONTROL_PLANE_API_TOKENS', `t1:${'a'.repeat(31)}`],
+      ['CONTROL_PLANE_AGENT_API_TOKENS', `t1:production:agent-1:${'b'.repeat(31)}`],
+      [
+        'CONTROL_PLANE_PREFLIGHT_EXPORTER_TOKENS',
+        `t1:production:agent-1:${'d'.repeat(31)}`,
+      ],
+      ['CONTROL_PLANE_WEBHOOK_TOKENS', `t1:${'c'.repeat(31)}`],
+    ] as const) {
+      expect(() => loadConfig({ ...productionEnv, [name]: value })).toThrow(
+        /at least 32 bytes in production/,
+      );
+    }
+  });
+
+  it('accepts redis and rediss URLs but rejects unrelated schemes', () => {
+    expect(
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'rediss://redis.internal:6380/0',
+      }).rateLimitRedisUrl,
+    ).toBe('rediss://redis.internal:6380/0');
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        CONTROL_PLANE_RATE_LIMIT_REDIS_URL: 'https://redis.internal',
+      }),
+    ).toThrow(/redis:\/\/ or rediss:\/\//);
   });
 
   it('rejects invalid rate-limit overrides', () => {
@@ -303,6 +526,16 @@ describe('normalizeToken / normalizeTokens', () => {
 
   it('leaves an already-scoped token record unchanged', () => {
     const scoped = { token: 'abc', tenant: 't1' };
+    expect(normalizeToken(scoped)).toEqual(scoped);
+  });
+
+  it('leaves a completely agent-scoped token record unchanged', () => {
+    const scoped = {
+      token: 'abc',
+      tenant: 't1',
+      environment: 'prod',
+      agentId: 'a1',
+    };
     expect(normalizeToken(scoped)).toEqual(scoped);
   });
 

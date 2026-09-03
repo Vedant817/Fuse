@@ -1,11 +1,33 @@
+import { createHash } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import helmet from '@fastify/helmet';
+import { Redis } from 'ioredis';
 import type pg from 'pg';
 import { FuseHttpError } from '@fuse/contracts';
-import type { BreakerStore, PreflightStore } from '@fuse/breaker-store';
-import type { ControlPlaneConfig } from './config.js';
 import {
+  FUSE_OPERATIONAL_SLO_VERSION,
+  getDetectorObservationLatencyHistogram,
+  getDetectorObservationRequestCounter,
+  getWebhookLatencyHistogram,
+  getWebhookRequestCounter,
+} from '@fuse/otel';
+import {
+  DiagnosisJobStore,
+  type BreakerStore,
+  type PreflightStore,
+} from '@fuse/breaker-store';
+import {
+  assertSecureAgentTokenConfiguration,
+  assertSecureExporterEvidenceTokenConfiguration,
+  assertExporterCredentialSeparation,
+  assertProductionCredentialConfiguration,
+  assertProductionRateLimitConfiguration,
+  normalizeTokens,
+  type ControlPlaneConfig,
+} from './config.js';
+import {
+  extractScopeFromRequest,
   extractTenantFromRequest,
   extractTenantFromWebhookRequest,
   requireBearerAuth,
@@ -19,6 +41,7 @@ import { registerDetectorRoutes } from './routes/detectors.js';
 import { registerSlackInteractiveRoute } from './routes/slack-interactive.js';
 import { registerScopeRoutes } from './routes/scopes.js';
 import { registerPolicyRoutes } from './routes/policies.js';
+import { registerDiagnosisRoutes } from './routes/diagnosis.js';
 import { DetectorRunner } from './detector-runner.js';
 import type { DetectorPolicyResolver } from './policy-loader.js';
 import {
@@ -27,6 +50,89 @@ import {
 } from './diagnosis-worker.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
+const RATE_LIMIT_REDIS_CONNECT_TIMEOUT_MS = 2_000;
+const RATE_LIMIT_REDIS_COMMAND_TIMEOUT_MS = 1_000;
+const RATE_LIMIT_REDIS_MAX_RETRIES_PER_REQUEST = 1;
+
+type OperationalHttpOutcome =
+  'success' | 'auth_failure' | 'client_error' | 'server_error';
+
+function operationalHttpOutcome(statusCode: number): OperationalHttpOutcome {
+  if (statusCode === 401 || statusCode === 403) return 'auth_failure';
+  if (statusCode >= 500) return 'server_error';
+  if (statusCode >= 400) return 'client_error';
+  return 'success';
+}
+
+function hashRateLimitValue(value: string): string {
+  return createHash('sha256').update(value).digest('base64url');
+}
+
+export function rateLimitKey(
+  request: {
+    ip: string;
+    url: string;
+    headers: { authorization?: string | undefined };
+  },
+  knownAuthorizationHashes: ReadonlySet<string> = new Set(),
+): string {
+  if (request.url.startsWith('/healthz') || request.url.startsWith('/readyz')) {
+    return `ip:${request.ip}`;
+  }
+  const authorization = request.headers.authorization;
+  if (authorization) {
+    const authorizationHash = hashRateLimitValue(authorization);
+    if (knownAuthorizationHashes.has(authorizationHash)) {
+      return `auth:${authorizationHash}`;
+    }
+  }
+  return `ip:${request.ip}`;
+}
+
+/** Creates the documented ioredis integration with bounded connection and
+ * command retries. `lazyConnect` lets the real entrypoint prove connectivity
+ * before Fastify starts accepting traffic. */
+export function createRateLimitRedis(
+  config: Pick<ControlPlaneConfig, 'rateLimitRedisUrl'>,
+): Redis | undefined {
+  if (!config.rateLimitRedisUrl) return undefined;
+  return new Redis(config.rateLimitRedisUrl, {
+    connectionName: 'fuse-control-plane-rate-limit',
+    lazyConnect: true,
+    connectTimeout: RATE_LIMIT_REDIS_CONNECT_TIMEOUT_MS,
+    commandTimeout: RATE_LIMIT_REDIS_COMMAND_TIMEOUT_MS,
+    maxRetriesPerRequest: RATE_LIMIT_REDIS_MAX_RETRIES_PER_REQUEST,
+    enableOfflineQueue: false,
+    // Retry connection establishment indefinitely with bounded backoff, while
+    // each individual limiter command still fails quickly and closed.
+    retryStrategy: (attempt: number) => Math.min(attempt * 100, 5_000),
+  });
+}
+
+export async function connectRateLimitRedis(redis: Redis): Promise<void> {
+  try {
+    await redis.connect();
+    await redis.ping();
+  } catch (error) {
+    redis.disconnect(false);
+    throw new Error('shared rate-limit Redis is unavailable; startup refused', {
+      cause: error,
+    });
+  }
+}
+
+export async function closeRateLimitRedis(redis: Redis): Promise<void> {
+  if (redis.status === 'end') return;
+  if (redis.status !== 'ready') {
+    redis.disconnect(false);
+    return;
+  }
+  try {
+    await redis.quit();
+  } finally {
+    redis.disconnect(false);
+  }
+}
 
 export interface BuildAppDeps {
   store: BreakerStore;
@@ -37,11 +143,28 @@ export interface BuildAppDeps {
   detectorPolicyResolver?: DetectorPolicyResolver;
   /** Defaults to `loadDiagnosisWorkerConfig()` (reads env) if omitted. */
   diagnosisConfig?: DiagnosisWorkerConfig;
+  diagnosisJobStore?: DiagnosisJobStore;
+  /** Required in production and passed directly to @fastify/rate-limit's
+   * documented `redis` option. Local/test callers may omit it. */
+  rateLimitRedis?: Redis;
   pool: pg.Pool;
   config: ControlPlaneConfig;
 }
 
 export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
+  assertSecureAgentTokenConfiguration(deps.config);
+  assertSecureExporterEvidenceTokenConfiguration(deps.config);
+  assertExporterCredentialSeparation(deps.config);
+  assertProductionCredentialConfiguration(deps.config);
+  assertProductionRateLimitConfiguration(deps.config);
+  if (
+    deps.config.deploymentEnvironment === 'production' &&
+    deps.rateLimitRedis?.status !== 'ready'
+  ) {
+    throw new Error(
+      'invalid control-plane configuration: a connected shared rate-limit Redis client is required in production',
+    );
+  }
   // No @fastify/cors is registered anywhere in this app, deliberately: every
   // route requires a bearer token (see the preHandler hook below), this API
   // has no browser-facing frontend, and Fastify sets no CORS headers unless
@@ -78,6 +201,15 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   );
 
   const diagnosisConfig = deps.diagnosisConfig ?? loadDiagnosisWorkerConfig();
+  const rateLimitHookPending = new WeakSet<object>();
+  const knownAuthorizationHashes = new Set(
+    normalizeTokens([
+      ...deps.config.apiTokens,
+      ...deps.config.agentApiTokens,
+      ...deps.config.exporterEvidenceTokens,
+      ...deps.config.webhookTokens,
+    ]).map(({ token }) => hashRateLimitValue(`Bearer ${token}`)),
+  );
 
   // Baseline response headers (X-Content-Type-Options, X-Frame-Options,
   // Referrer-Policy, etc.) — this is a JSON-only API with no browser
@@ -90,29 +222,63 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   await app.register(rateLimit, {
     max: deps.config.rateLimitMax,
     timeWindow: deps.config.rateLimitWindowMs,
-    // Authenticated callers are scoped per-token; unauthenticated ones
-    // (health checks) are rate-limited per IP by the plugin default.
+    ...(deps.rateLimitRedis ? { redis: deps.rateLimitRedis } : {}),
+    nameSpace: `fuse-rate-limit:${hashRateLimitValue(deps.config.deploymentEnvironment).slice(0, 16)}:`,
+    // A storage outage must deny the request rather than silently create
+    // unbounded access. This is also @fastify/rate-limit's documented default,
+    // kept explicit because it is a production safety property.
+    skipOnError: false,
     keyGenerator: (request) => {
-      const auth = request.headers.authorization;
-      return auth ?? request.ip;
+      // The Redis store call follows immediately inside the plugin's route-level
+      // onRequest hook. preParsing clears this only after every onRequest hook
+      // completed, so a raw store error can be identified without inspecting
+      // unstable ioredis error classes or conflating later route failures.
+      rateLimitHookPending.add(request);
+      return rateLimitKey(request, knownAuthorizationHashes);
     },
+    errorResponseBuilder: (request) =>
+      new FuseHttpError('rate_limited', 'rate limit exceeded', 429, request.id),
   });
 
-  registerHealthRoutes(app, deps.pool);
+  app.addHook('preParsing', async (request) => {
+    rateLimitHookPending.delete(request);
+  });
+
+  registerHealthRoutes(app, deps.pool, deps.rateLimitRedis);
 
   const operatorTokens = deps.config.apiTokens;
   const agentAllowedTokens = [...deps.config.apiTokens, ...deps.config.agentApiTokens];
   const webhookAllowedTokens = [...deps.config.apiTokens, ...deps.config.webhookTokens];
+  const exporterEvidenceTokens = deps.config.exporterEvidenceTokens;
   const allKnownTokens = [
     ...deps.config.apiTokens,
     ...deps.config.agentApiTokens,
+    ...deps.config.exporterEvidenceTokens,
     ...deps.config.webhookTokens,
   ];
+
+  // These are infrastructure-wide SLO series. They intentionally carry no
+  // tenant, agent, token, correlation, alert, or detector identity.
+  app.addHook('onResponse', async (request, reply) => {
+    const attributes = {
+      'fuse.slo.version': FUSE_OPERATIONAL_SLO_VERSION,
+      'fuse.outcome': operationalHttpOutcome(reply.statusCode),
+    };
+    const durationSeconds = Math.max(0, reply.elapsedTime) / 1_000;
+    if (request.url.startsWith('/v1/detectors/observe')) {
+      getDetectorObservationRequestCounter().add(1, attributes);
+      getDetectorObservationLatencyHistogram().record(durationSeconds, attributes);
+    } else if (request.url.startsWith('/v1/webhooks/signoz')) {
+      getWebhookRequestCounter().add(1, attributes);
+      getWebhookLatencyHistogram().record(durationSeconds, attributes);
+    }
+  });
 
   app.addHook('preHandler', async (request, reply) => {
     if (
       request.url.startsWith('/v1/scopes/') ||
-      request.url.startsWith('/v1/policies/')
+      request.url.startsWith('/v1/policies/') ||
+      request.url.startsWith('/v1/diagnosis/')
     ) {
       await requireBearerAuth(
         operatorTokens,
@@ -126,7 +292,16 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       await requireBearerAuth(
         agentAllowedTokens,
         allKnownTokens,
-        extractTenantFromRequest,
+        extractScopeFromRequest,
+      )(request, reply);
+    } else if (request.url.startsWith('/v1/preflight/exporter-evidence')) {
+      // Exporter delivery is a separate capability from agent observations.
+      // Only exact-scope exporter credentials reach this endpoint; operator,
+      // agent, and webhook credentials are known but intentionally forbidden.
+      await requireBearerAuth(
+        exporterEvidenceTokens,
+        allKnownTokens,
+        extractScopeFromRequest,
       )(request, reply);
     } else if (request.url.startsWith('/v1/preflight/')) {
       // An agent reports and reads its own telemetry-health evidence —
@@ -142,7 +317,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       await requireBearerAuth(
         changesDisabledState ? operatorTokens : agentAllowedTokens,
         allKnownTokens,
-        extractTenantFromRequest,
+        extractScopeFromRequest,
       )(request, reply);
     } else if (request.url.startsWith('/v1/detectors/')) {
       // An agent reports its own step telemetry for detector evaluation —
@@ -152,7 +327,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       await requireBearerAuth(
         agentAllowedTokens,
         allKnownTokens,
-        extractTenantFromRequest,
+        extractScopeFromRequest,
       )(request, reply);
     } else if (request.url.startsWith('/v1/webhooks/')) {
       // The SigNoz alert webhook — its own least-privilege tier: this
@@ -200,8 +375,19 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
         notificationRoutes: ['slack'],
       },
   );
+  registerDiagnosisRoutes(
+    app,
+    deps.diagnosisJobStore ?? new DiagnosisJobStore(deps.pool),
+  );
   registerBreakerRoutes(app, deps.store);
-  registerWebhookRoutes(app, deps.store, deps.config, diagnosisConfig);
+  registerWebhookRoutes(
+    app,
+    deps.store,
+    deps.config,
+    deps.detectorPolicyResolver
+      ? (scope) => deps.detectorPolicyResolver!.resolve(scope)
+      : undefined,
+  );
   registerSlackInteractiveRoute(
     app,
     diagnosisConfig,
@@ -222,14 +408,29 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     ...(deps.detectorPolicyResolver
       ? { resolvePolicy: (scope) => deps.detectorPolicyResolver!.resolve(scope) }
       : {}),
-    diagnosisConfig,
   });
 
   app.setErrorHandler((err, request, reply) => {
     if (reply.sent) return;
-    const correlationId = request.id;
+    const correlationHeader = request.headers['x-correlation-id'];
+    const correlationId =
+      typeof correlationHeader === 'string' && correlationHeader.length > 0
+        ? correlationHeader
+        : request.id;
     if (err instanceof FuseHttpError) {
       reply.code(err.httpStatus).send(err.toBody());
+      return;
+    }
+
+    if (deps.rateLimitRedis && rateLimitHookPending.has(request)) {
+      request.log.warn({ err }, 'rate-limit store unavailable; request denied');
+      const httpErr = new FuseHttpError(
+        'store_unavailable',
+        'rate limit store is unavailable; request denied',
+        503,
+        correlationId,
+      );
+      reply.code(httpErr.httpStatus).send(httpErr.toBody());
       return;
     }
 

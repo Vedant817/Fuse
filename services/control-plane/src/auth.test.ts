@@ -1,11 +1,12 @@
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 import {
+  extractScopeFromRequest,
   extractTenantFromRequest,
   extractTenantFromWebhookRequest,
   requireBearerAuth,
 } from './auth.js';
-import type { ScopedToken } from './config.js';
+import type { AgentScopedToken, ScopedToken } from './config.js';
 
 const TOKEN_A = 'a'.repeat(32);
 const TOKEN_B = 'b'.repeat(32);
@@ -247,6 +248,76 @@ describe('requireBearerAuth with tenant-scoped tokens', () => {
   });
 });
 
+describe('requireBearerAuth with agent-scoped tokens', () => {
+  const AGENT_TOKEN: AgentScopedToken = {
+    token: 'agent-exact-token-'.padEnd(32, '0'),
+    tenant: 't1',
+    environment: 'production',
+    agentId: 'agent-1',
+  };
+
+  async function buildAgentScopedApp() {
+    const app = Fastify();
+    app.addHook(
+      'preHandler',
+      requireBearerAuth([AGENT_TOKEN], [AGENT_TOKEN], extractScopeFromRequest),
+    );
+    app.post('/scoped', async () => ({ ok: true }));
+    app.get('/scoped', async () => ({ ok: true }));
+    await app.ready();
+    return app;
+  }
+
+  it('allows only the credential own complete body scope', async () => {
+    const app = await buildAgentScopedApp();
+    const own = await app.inject({
+      method: 'POST',
+      url: '/scoped',
+      headers: { authorization: `Bearer ${AGENT_TOKEN.token}` },
+      payload: {
+        scope: { tenant: 't1', environment: 'production', agentId: 'agent-1' },
+      },
+    });
+    expect(own.statusCode).toBe(200);
+
+    for (const scope of [
+      { tenant: 't2', environment: 'production', agentId: 'agent-1' },
+      { tenant: 't1', environment: 'staging', agentId: 'agent-1' },
+      { tenant: 't1', environment: 'production', agentId: 'agent-2' },
+    ]) {
+      const peer = await app.inject({
+        method: 'POST',
+        url: '/scoped',
+        headers: { authorization: `Bearer ${AGENT_TOKEN.token}` },
+        payload: { scope },
+      });
+      expect(peer.statusCode).toBe(403);
+      expect(peer.json()).toMatchObject({
+        error: 'unauthorized',
+        message: 'this token is not authorized for the requested scope',
+      });
+    }
+    await app.close();
+  });
+
+  it('enforces the complete query scope and fails closed when any field is missing', async () => {
+    const app = await buildAgentScopedApp();
+    const own = await app.inject({
+      method: 'GET',
+      url: '/scoped?tenant=t1&environment=production&agentId=agent-1',
+      headers: { authorization: `Bearer ${AGENT_TOKEN.token}` },
+    });
+    const incomplete = await app.inject({
+      method: 'GET',
+      url: '/scoped?tenant=t1&environment=production',
+      headers: { authorization: `Bearer ${AGENT_TOKEN.token}` },
+    });
+    expect(own.statusCode).toBe(200);
+    expect(incomplete.statusCode).toBe(403);
+    await app.close();
+  });
+});
+
 describe('extractTenantFromRequest', () => {
   it('reads tenant from a POST body scope.tenant', async () => {
     const app = Fastify();
@@ -276,6 +347,37 @@ describe('extractTenantFromRequest', () => {
     await app.ready();
     const res = await app.inject({ method: 'POST', url: '/echo', payload: {} });
     expect(res.json().tenant).toBeUndefined();
+    await app.close();
+  });
+});
+
+describe('extractScopeFromRequest', () => {
+  it('reads all three scope fields from a body or query', async () => {
+    const app = Fastify();
+    app.post('/echo', async (request) => ({ scope: extractScopeFromRequest(request) }));
+    app.get('/echo', async (request) => ({ scope: extractScopeFromRequest(request) }));
+    await app.ready();
+    const scope = { tenant: 't1', environment: 'prod', agentId: 'a1' };
+    const body = await app.inject({ method: 'POST', url: '/echo', payload: { scope } });
+    const query = await app.inject({
+      method: 'GET',
+      url: '/echo?tenant=t1&environment=prod&agentId=a1',
+    });
+    expect(body.json().scope).toEqual(scope);
+    expect(query.json().scope).toEqual(scope);
+    await app.close();
+  });
+
+  it('returns undefined rather than authorizing a partial scope', async () => {
+    const app = Fastify();
+    app.post('/echo', async (request) => ({ scope: extractScopeFromRequest(request) }));
+    await app.ready();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/echo',
+      payload: { scope: { tenant: 't1', environment: 'prod' } },
+    });
+    expect(response.json().scope).toBeUndefined();
     await app.close();
   });
 });

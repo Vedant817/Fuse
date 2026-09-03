@@ -17,12 +17,15 @@ function baseAlert(
 
 describe('mapSignozAlertToNormalizedEvent', () => {
   it('maps an alert using underscored label keys', () => {
-    const result = mapSignozAlertToNormalizedEvent(baseAlert());
+    const result = mapSignozAlertToNormalizedEvent(
+      baseAlert({ labels: { ...baseAlert().labels, fuse_source_epoch: '7' } }),
+    );
     expect(result?.scope).toEqual({
       tenant: 't1',
       environment: 'prod',
       agentId: 'agent-1',
     });
+    expect(result?.sourceEpoch).toBe(7);
   });
 
   it('maps an alert using dotted label keys', () => {
@@ -32,6 +35,7 @@ describe('mapSignozAlertToNormalizedEvent', () => {
           'fuse.tenant': 't1',
           'fuse.environment': 'prod',
           'fuse.agent_id': 'agent-1',
+          'fuse.source_epoch': '9',
         },
       }),
     );
@@ -40,6 +44,7 @@ describe('mapSignozAlertToNormalizedEvent', () => {
       environment: 'prod',
       agentId: 'agent-1',
     });
+    expect(result?.sourceEpoch).toBe(9);
   });
 
   it('returns undefined when the tenant label is missing (unresolvable scope)', () => {
@@ -100,6 +105,22 @@ describe('mapSignozAlertToNormalizedEvent', () => {
     expect(resolved?.status).toBe('resolved');
     expect(resolved?.fingerprint).toBe('abc123');
     expect(resolved?.startsAt).toBe('2026-07-21T00:00:00Z');
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['negative', '-1'],
+    ['signed', '+1'],
+    ['leading zero', '01'],
+    ['decimal', '1.5'],
+    ['exponent', '1e3'],
+    ['whitespace', ' 1'],
+    ['unsafe integer', String(Number.MAX_SAFE_INTEGER + 1)],
+  ])('leaves a %s source epoch unbound', (_name, sourceEpoch) => {
+    const labels = { ...baseAlert().labels };
+    if (sourceEpoch !== undefined) labels['fuse_source_epoch'] = sourceEpoch;
+    const result = mapSignozAlertToNormalizedEvent(baseAlert({ labels }));
+    expect(result?.sourceEpoch).toBeUndefined();
   });
 
   it('rejects a scope with an empty agentId even if the label key is technically present', () => {
