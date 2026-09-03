@@ -3850,3 +3850,11 @@ the earlier checkmarks:
   `task.md` entry). Last full gate: `pnpm run check:full` green twice (618
   unit + 148 integration per run) with no source changes after except this
   entry; commit/push recorded below once complete.
+- Pushed 2026-09-03 as 7 cohesive commits to `origin/main`
+  (`https://github.com/Vedant817/Fuse.git`, `293eeee..5c89116`):
+  `b03fdd1` feat(contracts), `1ab6817` feat(breaker-store), `e9236ab`
+  feat(sdk), `98db523` feat(control-plane), `ff3d6c4` feat(broken-agent),
+  `2e37a26` build(release), `5c89116` docs. Close-out `pnpm run check:full`
+  re-verified green on the exact committed tree (control-plane unit 217,
+  integration: otel 4, breaker-store 55, control-plane 73, sdk 11,
+  broken-agent 5). Working tree clean after push.
