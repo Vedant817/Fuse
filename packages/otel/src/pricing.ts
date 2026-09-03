@@ -20,12 +20,22 @@ export interface PriceEntry {
   effectiveDate: string;
 }
 
-export const PRICE_TABLE_VERSION = 'fuse-price-table-v1';
+export const PRICE_TABLE_VERSION = 'fuse-price-table-v2';
 
 /** Illustrative estimates as of the effectiveDate below — verify against
  * each provider's current published pricing before relying on these for
  * anything beyond directional cost-velocity telemetry. */
 export const PRICE_TABLE: readonly PriceEntry[] = [
+  {
+    // Demo-only synthetic pricing for the bounded broken-agent cost-velocity
+    // scenario. It is an estimate fixture, not a provider price or real bill.
+    provider: 'fuse-synthetic',
+    model: 'mock-cost-velocity-v1',
+    pricingAvailable: true,
+    inputPricePerMillionTokensUsd: 2.5,
+    outputPricePerMillionTokensUsd: 5,
+    effectiveDate: '2026-08-24',
+  },
   {
     provider: 'groq',
     model: 'llama-3.1-8b-instant',
@@ -56,14 +66,19 @@ export const PRICE_TABLE: readonly PriceEntry[] = [
   },
 ];
 
-export interface CostEstimate {
-  costUsd: number;
-  /** false means no price-table entry matched — `costUsd` is 0 and MUST
-   * NOT be treated as "this call was free." Callers should omit cost
-   * attributes/metrics entirely rather than emit a misleading zero. */
-  priced: boolean;
-  priceTableVersion: string;
-}
+export type CostEstimate =
+  | {
+      costUsd: number;
+      priced: true;
+      priceTableVersion: string;
+    }
+  | {
+      /** `null` is intentionally not a numeric placeholder. No defensible
+       * estimate exists for this provider/model pair. */
+      costUsd: null;
+      priced: false;
+      priceTableVersion: string;
+    };
 
 export function estimateCostUsd(
   provider: string,
@@ -73,7 +88,7 @@ export function estimateCostUsd(
 ): CostEstimate {
   const entry = PRICE_TABLE.find((e) => e.provider === provider && e.model === model);
   if (!entry || !entry.pricingAvailable) {
-    return { costUsd: 0, priced: false, priceTableVersion: PRICE_TABLE_VERSION };
+    return { costUsd: null, priced: false, priceTableVersion: PRICE_TABLE_VERSION };
   }
   const costUsd =
     (inputTokens / 1_000_000) * entry.inputPricePerMillionTokensUsd +

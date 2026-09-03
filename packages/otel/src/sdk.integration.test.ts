@@ -14,9 +14,11 @@ interface CapturedRequest {
 async function startCapturingServer(): Promise<{
   url: string;
   requests: CapturedRequest[];
+  setStatus: (status: number) => void;
   close: () => Promise<void>;
 }> {
   const requests: CapturedRequest[] = [];
+  let responseStatus = 200;
   const server: Server = createServer((req, res) => {
     let body = '';
     req.setEncoding('utf8');
@@ -29,7 +31,7 @@ async function startCapturingServer(): Promise<{
         headers: req.headers,
         bodyBytes: Buffer.byteLength(body),
       });
-      res.writeHead(200, { 'content-type': 'application/x-protobuf' });
+      res.writeHead(responseStatus, { 'content-type': 'application/x-protobuf' });
       res.end();
     });
   });
@@ -41,6 +43,9 @@ async function startCapturingServer(): Promise<{
   return {
     url: `http://127.0.0.1:${address.port}`,
     requests,
+    setStatus: (status) => {
+      responseStatus = status;
+    },
     close: () =>
       new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),
@@ -84,6 +89,10 @@ describe('bootstrapOtel: real OTLP HTTP delivery to a local receiver', () => {
   });
 
   it('exports a real span to /v1/traces with a non-empty body and the configured header', async () => {
+    const exportResults: Array<{
+      exporterDelivery: { status: string };
+      spans: Array<{ hasInputTokens: boolean; hasOutputTokens: boolean }>;
+    }> = [];
     handle = bootstrapOtel({
       serviceName: 'fuse-otel-test',
       serviceVersion: '0.0.0-test',
@@ -91,10 +100,35 @@ describe('bootstrapOtel: real OTLP HTTP delivery to a local receiver', () => {
       otlpEndpoint: receiver.url,
       otlpHeaders: { 'x-fuse-test': 'yes' },
       metricExportIntervalMillis: 100_000, // don't let a metrics tick interleave with this test
+      traceExportMaxSpansPerScope: 2,
+      onTraceExportResult: (result) => {
+        exportResults.push(result);
+      },
     });
 
     const tracer = trace.getTracer('test');
-    tracer.startSpan('test-span').end();
+    const span = tracer.startSpan('test-span');
+    span.setAttributes({
+      'fuse.tenant': 't1',
+      'fuse.environment': 'test',
+      'fuse.agent_id': 'agent-1',
+      'gen_ai.request.model': 'test-model',
+      'gen_ai.usage.input_tokens': 10,
+      'gen_ai.usage.output_tokens': 2,
+    });
+    span.end();
+    for (let index = 0; index < 2; index++) {
+      const extra = tracer.startSpan(`test-span-${index}`);
+      extra.setAttributes({
+        'fuse.tenant': 't1',
+        'fuse.environment': 'test',
+        'fuse.agent_id': 'agent-1',
+        'gen_ai.request.model': 'test-model',
+        'gen_ai.usage.input_tokens': 10,
+        'gen_ai.usage.output_tokens': 2,
+      });
+      extra.end();
+    }
     await handle.shutdown(); // flush + close before inspecting captured requests
     handle = undefined;
 
@@ -102,6 +136,103 @@ describe('bootstrapOtel: real OTLP HTTP delivery to a local receiver', () => {
     expect(traceRequests.length).toBeGreaterThan(0);
     expect(traceRequests[0]!.bodyBytes).toBeGreaterThan(0);
     expect(traceRequests[0]!.headers['x-fuse-test']).toBe('yes');
+    expect(exportResults).toHaveLength(1);
+    expect(exportResults[0]!.exporterDelivery.status).toBe('success');
+    expect(exportResults[0]!.exporterDelivery).toMatchObject({
+      sourceInstanceId: expect.any(String),
+      sequence: 1,
+    });
+    expect(exportResults[0]!.spans).toHaveLength(2);
+    expect(exportResults[0]!.spans[0]).toMatchObject({
+      hasInputTokens: true,
+      hasOutputTokens: true,
+    });
+  });
+
+  it('reports a scoped exporter failure and never turns it into successful delivery evidence', async () => {
+    // 400 is deliberately non-retryable so this test exercises the failure
+    // callback without waiting through the exporter's production retry budget.
+    receiver.setStatus(400);
+    const exportResults: Array<{ exporterDelivery: { status: string } }> = [];
+    handle = bootstrapOtel({
+      serviceName: 'fuse-otel-test',
+      serviceVersion: '0.0.0-test',
+      deploymentEnvironment: 'test',
+      otlpEndpoint: receiver.url,
+      metricExportIntervalMillis: 100_000,
+      onTraceExportResult: (result) => {
+        exportResults.push(result);
+      },
+    });
+    const span = trace.getTracer('test').startSpan('failed-export');
+    span.setAttributes({
+      'fuse.tenant': 't1',
+      'fuse.environment': 'test',
+      'fuse.agent_id': 'agent-1',
+      'gen_ai.request.model': 'test-model',
+      'gen_ai.usage.input_tokens': 10,
+      'gen_ai.usage.output_tokens': 2,
+    });
+    span.end();
+
+    await handle.shutdown().catch(() => {});
+    handle = undefined;
+
+    expect(exportResults).toHaveLength(1);
+    expect(exportResults[0]!.exporterDelivery.status).toBe('failure');
+  });
+
+  it('drains an asynchronous failure observer before forceFlush preserves the batch error', async () => {
+    receiver.setStatus(400);
+    let observerStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      observerStarted = resolve;
+    });
+    let releaseObserver!: () => void;
+    const observerBarrier = new Promise<void>((resolve) => {
+      releaseObserver = resolve;
+    });
+    let observedStatus: string | undefined;
+    handle = bootstrapOtel({
+      serviceName: 'fuse-otel-test',
+      serviceVersion: '0.0.0-test',
+      deploymentEnvironment: 'test',
+      otlpEndpoint: receiver.url,
+      metricExportIntervalMillis: 100_000,
+      onTraceExportResult: async (result) => {
+        observedStatus = result.exporterDelivery.status;
+        observerStarted();
+        await observerBarrier;
+      },
+    });
+    const span = trace.getTracer('test').startSpan('failed-export-with-slow-observer');
+    span.setAttributes({
+      'fuse.tenant': 't1',
+      'fuse.environment': 'test',
+      'fuse.agent_id': 'agent-1',
+    });
+    span.end();
+
+    let settled = false;
+    let flushError: unknown;
+    const flush = handle
+      .forceFlush()
+      .catch((error: unknown) => {
+        flushError = error;
+      })
+      .finally(() => {
+        settled = true;
+      });
+    await started;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const settledBeforeObserver = settled;
+    releaseObserver();
+    await flush;
+
+    expect(observedStatus).toBe('failure');
+    expect(settledBeforeObserver).toBe(false);
+    expect(flushError).toBeInstanceOf(Error);
+    receiver.setStatus(200);
   });
 
   it('exports metrics to /v1/metrics with a non-empty body', async () => {

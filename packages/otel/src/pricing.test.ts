@@ -2,6 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { estimateCostUsd } from './pricing.js';
 
 describe('estimateCostUsd', () => {
+  it('labels the bounded demo cost-velocity model with explicit synthetic estimated pricing', () => {
+    const result = estimateCostUsd(
+      'fuse-synthetic',
+      'mock-cost-velocity-v1',
+      50_000,
+      10_000,
+    );
+    expect(result).toEqual({
+      costUsd: 0.175,
+      priced: true,
+      priceTableVersion: 'fuse-price-table-v2',
+    });
+  });
+
   it('computes cost from the price table for a known provider/model', () => {
     const result = estimateCostUsd('groq', 'llama-3.1-8b-instant', 1_000_000, 1_000_000);
     expect(result.priced).toBe(true);
@@ -16,7 +30,7 @@ describe('estimateCostUsd', () => {
   it('reports priced:false (not a misleading zero cost) for an unknown model', () => {
     const result = estimateCostUsd('groq', 'nonexistent-model', 1000, 1000);
     expect(result.priced).toBe(false);
-    expect(result.costUsd).toBe(0);
+    expect(result.costUsd).toBeNull();
   });
 
   it('reports priced:false for an unknown provider even with a known model name', () => {
@@ -37,9 +51,9 @@ describe('estimateCostUsd', () => {
       1_000_000,
     );
     expect(result).toEqual({
-      costUsd: 0,
+      costUsd: null,
       priced: false,
-      priceTableVersion: 'fuse-price-table-v1',
+      priceTableVersion: 'fuse-price-table-v2',
     });
   });
 });

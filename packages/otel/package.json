@@ -1,18 +1,78 @@
 {
   "name": "@fuse/otel",
   "version": "0.1.0",
-  "private": true,
+  "description": "OpenTelemetry instrumentation and OTLP runtime for Fuse agents",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vedant817/Fuse.git",
+    "directory": "packages/otel"
+  },
+  "homepage": "https://github.com/Vedant817/Fuse#readme",
+  "bugs": "https://github.com/Vedant817/Fuse/issues",
+  "keywords": [
+    "ai",
+    "gen-ai",
+    "opentelemetry",
+    "otlp",
+    "signoz"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist/attributes.d.ts",
+    "dist/attributes.d.ts.map",
+    "dist/attributes.js",
+    "dist/attributes.js.map",
+    "dist/exporter-health.d.ts",
+    "dist/exporter-health.d.ts.map",
+    "dist/exporter-health.js",
+    "dist/exporter-health.js.map",
+    "dist/gen-ai-span.d.ts",
+    "dist/gen-ai-span.d.ts.map",
+    "dist/gen-ai-span.js",
+    "dist/gen-ai-span.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/metrics.d.ts",
+    "dist/metrics.d.ts.map",
+    "dist/metrics.js",
+    "dist/metrics.js.map",
+    "dist/pricing.d.ts",
+    "dist/pricing.d.ts.map",
+    "dist/pricing.js",
+    "dist/pricing.js.map",
+    "dist/resource.d.ts",
+    "dist/resource.d.ts.map",
+    "dist/resource.js",
+    "dist/resource.js.map",
+    "dist/sdk.d.ts",
+    "dist/sdk.d.ts.map",
+    "dist/sdk.js",
+    "dist/sdk.js.map",
+    "LICENSE",
+    "README.md"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
       "default": "./dist/index.js"
     }
   },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('tsconfig.tsbuildinfo',{force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
     "test": "vitest run --exclude '**/*.integration.test.ts'",
     "test:integration": "vitest run integration",
@@ -27,11 +87,11 @@
     "@opentelemetry/sdk-logs": "^0.220.0",
     "@opentelemetry/sdk-metrics": "^2.9.0",
     "@opentelemetry/sdk-node": "^0.220.0",
+    "@opentelemetry/sdk-trace-base": "^2.9.0",
     "@opentelemetry/semantic-conventions": "^1.43.0"
   },
   "devDependencies": {
     "@opentelemetry/context-async-hooks": "^2.9.0",
-    "@opentelemetry/sdk-trace-base": "^2.9.0",
     "@opentelemetry/sdk-trace-node": "^2.9.0",
     "typescript": "^5.7.3",
     "vitest": "^3.0.0"

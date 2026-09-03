@@ -1,22 +1,39 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Scope, StepObservationWire } from '@fuse/contracts';
+import type { Scope, StepObservationInputWire } from '@fuse/contracts';
 import { StepObservationReporter } from './step-observation-reporter.js';
 
 const SCOPE: Scope = { tenant: 't1', environment: 'test', agentId: 'agent-1' };
 
-function step(overrides: Partial<StepObservationWire> = {}): StepObservationWire {
+function step(
+  overrides: Partial<StepObservationInputWire> = {},
+): StepObservationInputWire {
   return {
+    executionId: 'execution-1',
     timestampMs: Date.now(),
     canonicalShape: 'step',
     inputTokens: 100,
     outputTokens: 20,
+    pricingStatus: 'available',
     estimatedCostUsd: 0.001,
     ...overrides,
-  };
+  } as StepObservationInputWire;
 }
 
 function okResponse(): Response {
-  return new Response(null, { status: 200 });
+  return new Response(JSON.stringify({ results: [], enforcement: [] }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function trippedResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      results: [],
+      enforcement: [{ detector: 'context-bloat', outcome: 'tripped' }],
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
 }
 
 describe('StepObservationReporter', () => {
@@ -54,7 +71,7 @@ describe('StepObservationReporter', () => {
     expect(body.steps).toHaveLength(2);
   });
 
-  it('clears the buffer after a successful flush (no duplicate reporting)', async () => {
+  it('does not resend an unchanged window after a successful flush', async () => {
     const fetchImpl = vi.fn().mockImplementation(() => okResponse());
     const reporter = new StepObservationReporter({
       scope: SCOPE,
@@ -81,9 +98,9 @@ describe('StepObservationReporter', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     const secondBody = JSON.parse(fetchImpl.mock.calls[1]![1].body as string);
-    expect(secondBody.steps.map((item: StepObservationWire) => item.timestampMs)).toEqual(
-      [1, 2],
-    );
+    expect(
+      secondBody.steps.map((item: StepObservationInputWire) => item.timestampMs),
+    ).toEqual([1, 2]);
   });
 
   it('auto-flushes once the buffer reaches maxBatchSize, without waiting for the timer', async () => {
@@ -119,7 +136,9 @@ describe('StepObservationReporter', () => {
     reporter.record(step({ timestampMs: 3 }));
     await reporter.flush();
     const body = JSON.parse(fetchImpl.mock.calls[0]![1].body as string);
-    expect(body.steps.map((s: StepObservationWire) => s.timestampMs)).toEqual([2, 3]);
+    expect(body.steps.map((s: StepObservationInputWire) => s.timestampMs)).toEqual([
+      2, 3,
+    ]);
   });
 
   it('never sends more than the API contract maximum of 200 observations', async () => {
@@ -220,6 +239,170 @@ describe('StepObservationReporter', () => {
     await expect(reporter.flush()).rejects.toThrow('down');
     await reporter.flush();
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('enforces a hard timeout even when fetch ignores the abort signal', async () => {
+    const fetchImpl = vi.fn().mockImplementation(() => new Promise(() => {}));
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://blackhole',
+      apiToken: 'tok',
+      fetchImpl,
+      timeoutMs: 20,
+    });
+    reporter.record(step());
+
+    await expect(reporter.flush()).rejects.toThrow(
+      'step observation report timed out after 20ms',
+    );
+  });
+
+  it('rejects a malformed successful detector response', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ accepted: true }), { status: 200 }),
+      );
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    reporter.record(step());
+
+    await expect(reporter.flush()).rejects.toThrow(
+      'control plane returned a malformed detector response',
+    );
+  });
+
+  it('clears acknowledged history after a detector-triggered trip', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockImplementationOnce(() => trippedResponse())
+      .mockImplementationOnce(() => okResponse());
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    await reporter.recordAndFlush(step({ timestampMs: 1, inputTokens: 100_000 }));
+    await reporter.recordAndFlush(step({ timestampMs: 2, inputTokens: 100 }));
+
+    const secondBody = JSON.parse(fetchImpl.mock.calls[1]![1].body as string);
+    expect(secondBody.steps).toEqual([
+      expect.objectContaining({ timestampMs: 2, inputTokens: 100 }),
+    ]);
+  });
+
+  it('clearHistory removes pre-denial observations from the next window', async () => {
+    const fetchImpl = vi.fn().mockImplementation(() => okResponse());
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+    await reporter.recordAndFlush(step({ timestampMs: 1 }));
+    reporter.clearHistory();
+    await reporter.recordAndFlush(step({ timestampMs: 2 }));
+
+    const secondBody = JSON.parse(fetchImpl.mock.calls[1]![1].body as string);
+    expect(
+      secondBody.steps.map((item: StepObservationInputWire) => item.timestampMs),
+    ).toEqual([2]);
+  });
+
+  it('keeps concurrent execution histories separate even when completions interleave', async () => {
+    const bodies: Array<{ steps: StepObservationInputWire[] }> = [];
+    const fetchImpl = vi.fn().mockImplementation((_url, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return okResponse();
+    });
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl,
+    });
+
+    await Promise.all([
+      reporter.recordAndFlush(step({ executionId: 'execution-a', timestampMs: 1 })),
+      reporter.recordAndFlush(step({ executionId: 'execution-b', timestampMs: 2 })),
+    ]);
+    await reporter.recordAndFlush(step({ executionId: 'execution-a', timestampMs: 3 }));
+
+    expect(bodies).toHaveLength(3);
+    expect(
+      bodies.every(
+        ({ steps }) => new Set(steps.map((item) => item.executionId)).size === 1,
+      ),
+    ).toBe(true);
+    expect(
+      bodies
+        .find(({ steps }) => steps.at(-1)?.timestampMs === 3)!
+        .steps.map((item) => item.timestampMs),
+    ).toEqual([1, 3]);
+  });
+
+  it('degrades only cost velocity when execution pricing is unavailable', async () => {
+    const reporter = new StepObservationReporter({
+      scope: SCOPE,
+      controlPlaneUrl: 'http://cp',
+      apiToken: 'tok',
+      fetchImpl: vi.fn().mockImplementation(() => okResponse()),
+    });
+    await reporter.recordAndFlush(
+      step({
+        pricingStatus: 'unavailable',
+        estimatedCostUsd: null,
+      }),
+    );
+
+    expect(reporter.getDetectorProtection('execution-1')).toEqual([
+      expect.objectContaining({ detector: 'loop-signature', status: 'protected' }),
+      expect.objectContaining({ detector: 'context-bloat', status: 'protected' }),
+      expect.objectContaining({
+        detector: 'cost-velocity',
+        status: 'degraded',
+        reasonCode: 'pricing-unavailable',
+      }),
+    ]);
+  });
+
+  it('supports explicit reset/end and bounded oldest-history eviction', () => {
+    vi.useFakeTimers({ now: 1 });
+    try {
+      const reporter = new StepObservationReporter({
+        scope: SCOPE,
+        controlPlaneUrl: 'http://cp',
+        apiToken: 'tok',
+        maxExecutions: 2,
+      });
+      reporter.record(step({ executionId: 'oldest' }));
+      vi.setSystemTime(2);
+      reporter.record(step({ executionId: 'kept' }));
+      vi.setSystemTime(3);
+      reporter.record(step({ executionId: 'newest' }));
+
+      expect(reporter.getDetectorProtection('oldest')[0]).toMatchObject({
+        status: 'degraded',
+        reasonCode: 'no-observations',
+      });
+      reporter.clearHistory('kept');
+      expect(reporter.getDetectorProtection('kept')[0]).toMatchObject({
+        status: 'degraded',
+        reasonCode: 'no-observations',
+      });
+      reporter.endExecution('newest');
+      expect(reporter.getDetectorProtection('newest')[0]).toMatchObject({
+        status: 'degraded',
+        reasonCode: 'no-observations',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('start()/stop() manage a background timer without leaving it dangling', async () => {

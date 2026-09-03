@@ -101,13 +101,23 @@ export interface SpanTelemetryObservation {
  * (kept as a locally-owned type for the same reason `SpanTelemetryObservation`
  * is — this package stays free of a dependency on the wire-contract layer).
  */
-export interface StepObservation {
+interface StepObservationBase {
+  executionId: string;
   timestampMs: number;
   canonicalShape: string;
   inputTokens: number;
   outputTokens: number;
-  estimatedCostUsd: number;
 }
+
+export type StepObservation =
+  | (StepObservationBase & {
+      pricingStatus: 'available';
+      estimatedCostUsd: number;
+    })
+  | (StepObservationBase & {
+      pricingStatus: 'unavailable';
+      estimatedCostUsd: null;
+    });
 
 /**
  * Wraps one gen_ai client operation in a CLIENT-kind span carrying the
@@ -202,13 +212,32 @@ export async function withGenAiSpan<T>(
         getOperationDurationHistogram().record(durationSeconds, metricAttributes);
 
         if (outcome.canonicalShape !== undefined && outcome.outcome === 'success') {
-          await ctx.onStepObserved?.({
-            timestampMs: observedAtMs,
-            canonicalShape: outcome.canonicalShape,
-            inputTokens: outcome.inputTokens,
-            outputTokens: outcome.outputTokens,
-            estimatedCostUsd: cost.priced ? cost.costUsd : 0,
-          });
+          try {
+            const observationBase = {
+              executionId: ctx.sessionId,
+              timestampMs: observedAtMs,
+              canonicalShape: outcome.canonicalShape,
+              inputTokens: outcome.inputTokens,
+              outputTokens: outcome.outputTokens,
+            };
+            await ctx.onStepObserved?.(
+              cost.priced
+                ? {
+                    ...observationBase,
+                    pricingStatus: 'available',
+                    estimatedCostUsd: cost.costUsd,
+                  }
+                : {
+                    ...observationBase,
+                    pricingStatus: 'unavailable',
+                    estimatedCostUsd: null,
+                  },
+            );
+          } catch {
+            // Post-call detector reporting does not own the provider outcome.
+            // Fail-closed integrations latch this failure and deny the next
+            // guarded call; an already-paid successful result remains success.
+          }
         }
 
         if (outcome.outcome === 'error') {

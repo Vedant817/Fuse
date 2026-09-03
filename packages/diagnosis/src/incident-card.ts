@@ -8,7 +8,10 @@ export interface IncidentCardContext {
   /** Present only once a resume action can actually be authorized — the
    * card's Resume button (when rendered for real Slack) carries this. */
   resumeActionValue?: string;
-  preflightState?: 'protected' | 'degraded' | 'blind' | 'disabled' | 'unknown';
+  /** The current committed state read for this exact incident scope. `unknown`
+   * means that no committed result could be read; it must never be promoted to
+   * `protected` by a card-rendering fallback. */
+  preflightState: 'protected' | 'degraded' | 'blind' | 'disabled' | 'unknown';
 }
 
 export interface IncidentCardBlocks {
@@ -60,7 +63,7 @@ export function buildIncidentCardBlocks(
         },
         {
           type: 'mrkdwn',
-          text: `*Preflight*\n${context.preflightState ?? 'unknown'}`,
+          text: `*Preflight*\n${context.preflightState}`,
         },
         { type: 'mrkdwn', text: `*Correlation*\n${context.correlationId}` },
       ],
@@ -161,6 +164,7 @@ export function renderLocalIncidentCardHtml(
     <div class="field"><span class="label">Immediate containment:</span> ${escape(diagnosis.immediateContainment)}</div>
     <div class="field"><span class="label">Recommended fix:</span> ${escape(diagnosis.recommendedFix)}</div>
     <div class="field"><span class="label">Confidence:</span> ${confidenceLabel(diagnosis.confidence)}</div>
+    <div class="field"><span class="label">Preflight:</span> ${context.preflightState}</div>
     <div class="field"><span class="label">Evidence links:</span> ${diagnosis.evidenceLinks.length}</div>
     ${diagnosis.limitations.map((l) => `<div class="warn">⚠️ ${escape(l)}</div>`).join('\n    ')}
   </div>

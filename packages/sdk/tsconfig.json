@@ -7,6 +7,7 @@
   "include": ["src"],
   "references": [
     { "path": "../contracts" },
+    { "path": "../otel" },
     { "path": "../breaker-store" },
     { "path": "../../services/control-plane" }
   ]

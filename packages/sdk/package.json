@@ -1,30 +1,101 @@
 {
   "name": "@fuse/sdk",
   "version": "0.1.0",
-  "private": true,
+  "description": "Provider-neutral pre-call circuit-breaker SDK for Fuse",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vedant817/Fuse.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/Vedant817/Fuse#readme",
+  "bugs": "https://github.com/Vedant817/Fuse/issues",
+  "keywords": [
+    "ai",
+    "circuit-breaker",
+    "llm",
+    "opentelemetry",
+    "signoz"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist/errors.d.ts",
+    "dist/errors.d.ts.map",
+    "dist/errors.js",
+    "dist/errors.js.map",
+    "dist/guard.d.ts",
+    "dist/guard.d.ts.map",
+    "dist/guard.js",
+    "dist/guard.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/otel-runtime.d.ts",
+    "dist/otel-runtime.d.ts.map",
+    "dist/otel-runtime.js",
+    "dist/otel-runtime.js.map",
+    "dist/preflight-reporter.d.ts",
+    "dist/preflight-reporter.d.ts.map",
+    "dist/preflight-reporter.js",
+    "dist/preflight-reporter.js.map",
+    "dist/providers/groq.d.ts",
+    "dist/providers/groq.d.ts.map",
+    "dist/providers/groq.js",
+    "dist/providers/groq.js.map",
+    "dist/providers/index.d.ts",
+    "dist/providers/index.d.ts.map",
+    "dist/providers/index.js",
+    "dist/providers/index.js.map",
+    "dist/providers/nvidia-build.d.ts",
+    "dist/providers/nvidia-build.d.ts.map",
+    "dist/providers/nvidia-build.js",
+    "dist/providers/nvidia-build.js.map",
+    "dist/providers/openai-compatible.d.ts",
+    "dist/providers/openai-compatible.d.ts.map",
+    "dist/providers/openai-compatible.js",
+    "dist/providers/openai-compatible.js.map",
+    "dist/step-observation-reporter.d.ts",
+    "dist/step-observation-reporter.d.ts.map",
+    "dist/step-observation-reporter.js",
+    "dist/step-observation-reporter.js.map",
+    "dist/step-shape-canonicalizer.d.ts",
+    "dist/step-shape-canonicalizer.d.ts.map",
+    "dist/step-shape-canonicalizer.js",
+    "dist/step-shape-canonicalizer.js.map",
+    "LICENSE",
+    "README.md",
+    "API.md"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./testing": {
-      "types": "./dist/testing.d.ts",
-      "default": "./dist/testing.js"
-    },
-    "./demo": {
-      "types": "./dist/demo-threshold-trigger.d.ts",
-      "default": "./dist/demo-threshold-trigger.js"
     },
     "./providers": {
       "types": "./dist/providers/index.d.ts",
+      "import": "./dist/providers/index.js",
       "default": "./dist/providers/index.js"
+    },
+    "./otel": {
+      "types": "./dist/otel-runtime.d.ts",
+      "import": "./dist/otel-runtime.js",
+      "default": "./dist/otel-runtime.js"
     }
   },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('tsconfig.tsbuildinfo',{force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit --tsBuildInfoFile .typecheck.tsbuildinfo",
     "test": "vitest run --exclude '**/*.integration.test.ts' --exclude '**/*.live.test.ts'",
     "test:integration": "vitest run integration",
@@ -33,11 +104,13 @@
   },
   "dependencies": {
     "@fuse/contracts": "workspace:*",
+    "@fuse/otel": "workspace:*",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@fuse/breaker-store": "workspace:*",
     "@fuse/control-plane": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
     "@testcontainers/postgresql": "^10.16.0",
     "@types/pg": "^8.11.10",
     "fastify": "^5.2.1",

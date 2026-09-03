@@ -1,8 +1,11 @@
 import {
   MAX_STEP_OBSERVATIONS_PER_REQUEST,
+  ObserveStepsResponseSchema,
+  StepObservationSchema,
+  type DetectorProtectionStatus,
   type OutageMode,
   type Scope,
-  type StepObservationWire,
+  type StepObservationInputWire,
 } from '@fuse/contracts';
 
 export interface StepObservationReporterOptions {
@@ -10,44 +13,48 @@ export interface StepObservationReporterOptions {
   controlPlaneUrl: string;
   apiToken: string;
   fetchImpl?: typeof fetch;
-  /** How often the background timer flushes a non-empty buffer. */
   flushIntervalMs?: number;
-  /** Flush immediately (not just on the timer) once the buffer reaches
-   * this size, so a bursty agent doesn't wait a full interval to report. */
+  timeoutMs?: number;
   maxBatchSize?: number;
-  /** Hard cap on buffered-but-unflushed steps. Oldest steps are dropped
-   * first on overflow — same rationale as `PreflightReporter`: under a
-   * sustained control-plane outage, the freshest evidence matters more
-   * than complete history. */
+  /** Per-execution trailing-window cap. */
   maxBufferSize?: number;
-  /** Detector telemetry is enforcement-critical. The production default is
-   * fail-closed: if Fuse cannot durably evaluate this completed call, the
-   * caller receives an error and cannot silently begin its next call. */
+  /** Total execution histories retained by one reporter. */
+  maxExecutions?: number;
+  /** Inactive execution histories older than this are evicted. */
+  executionIdleTtlMs?: number;
   outageMode?: OutageMode;
   onFlushError?: ((err: unknown) => void) | undefined;
 }
 
+interface HistoryEntry {
+  sequence: number;
+  step: StepObservationInputWire;
+}
+
+interface ExecutionHistory {
+  entries: HistoryEntry[];
+  sequence: number;
+  lastSentSequence: number;
+  lastTouchedAtMs: number;
+  reportingUnavailable: boolean;
+  flushChain: Promise<void>;
+}
+
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
+const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_BATCH_SIZE = 200;
-// Must remain equal to ObserveStepsRequestSchema's max(200). Keeping more
-// observations would make the SDK emit a request that the control plane
-// rejects, after which every subsequent fail-closed report would also fail.
-const MAX_WIRE_STEPS = MAX_STEP_OBSERVATIONS_PER_REQUEST;
-const DEFAULT_MAX_BUFFER_SIZE = MAX_WIRE_STEPS;
+const DEFAULT_MAX_BUFFER_SIZE = MAX_STEP_OBSERVATIONS_PER_REQUEST;
+const DEFAULT_MAX_EXECUTIONS = 100;
+const DEFAULT_EXECUTION_IDLE_TTL_MS = 60 * 60_000;
 
 /**
- * Carries a bounded trailing window to `POST /v1/detectors/observe`. Sending
- * the complete window makes detector evaluation independent of which
- * control-plane replica receives a request. `recordAndFlush` is the
- * enforcement-critical API and defaults fail-closed; the older buffered
- * `record`/timer API remains for explicitly asynchronous integrations.
+ * Carries one bounded trailing window per execution to
+ * `POST /v1/detectors/observe`. Windows are never merged across execution IDs,
+ * even when calls from multiple sessions complete concurrently.
  */
 export class StepObservationReporter {
-  private history: StepObservationWire[] = [];
+  private readonly histories = new Map<string, ExecutionHistory>();
   private timer: ReturnType<typeof setInterval> | undefined;
-  private sequence = 0;
-  private lastSentSequence = 0;
-  private flushChain: Promise<void> = Promise.resolve();
   private readonly options: Required<
     Omit<StepObservationReporterOptions, 'onFlushError'>
   > & {
@@ -56,14 +63,27 @@ export class StepObservationReporter {
 
   constructor(options: StepObservationReporterOptions) {
     const maxBufferSize = options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE;
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const maxExecutions = options.maxExecutions ?? DEFAULT_MAX_EXECUTIONS;
+    const executionIdleTtlMs =
+      options.executionIdleTtlMs ?? DEFAULT_EXECUTION_IDLE_TTL_MS;
     if (
       !Number.isInteger(maxBufferSize) ||
       maxBufferSize <= 0 ||
-      maxBufferSize > MAX_WIRE_STEPS
+      maxBufferSize > MAX_STEP_OBSERVATIONS_PER_REQUEST
     ) {
       throw new RangeError(
-        `maxBufferSize must be an integer from 1 to ${MAX_WIRE_STEPS}`,
+        `maxBufferSize must be an integer from 1 to ${MAX_STEP_OBSERVATIONS_PER_REQUEST}`,
       );
+    }
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError('timeoutMs must be a positive integer');
+    }
+    if (!Number.isInteger(maxExecutions) || maxExecutions <= 0) {
+      throw new RangeError('maxExecutions must be a positive integer');
+    }
+    if (!Number.isInteger(executionIdleTtlMs) || executionIdleTtlMs <= 0) {
+      throw new RangeError('executionIdleTtlMs must be a positive integer');
     }
     this.options = {
       scope: options.scope,
@@ -71,92 +91,260 @@ export class StepObservationReporter {
       apiToken: options.apiToken,
       fetchImpl: options.fetchImpl ?? fetch,
       flushIntervalMs: options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
+      timeoutMs,
       maxBatchSize: options.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
       maxBufferSize,
+      maxExecutions,
+      executionIdleTtlMs,
       outageMode: options.outageMode ?? 'fail-closed',
       onFlushError: options.onFlushError,
     };
   }
 
-  record(step: StepObservationWire): void {
-    this.history.push(step);
-    this.sequence += 1;
-    if (this.history.length > this.options.maxBufferSize) {
-      this.history.splice(0, this.history.length - this.options.maxBufferSize);
-    }
-    if (this.sequence - this.lastSentSequence >= this.options.maxBatchSize) {
-      // `record` is the explicitly asynchronous compatibility API, so it
-      // cannot propagate a fail-closed rejection to its caller. Consume the
-      // rejection after `sendWindow` reports it through `onFlushError`;
-      // `recordAndFlush` separately awaits its own serialized flush.
-      void this.flush().catch(() => undefined);
+  record(step: StepObservationInputWire): void {
+    const history = this.append(step);
+    if (history.sequence - history.lastSentSequence >= this.options.maxBatchSize) {
+      void this.flush(step.executionId).catch(() => undefined);
     }
   }
 
-  /** Records and synchronously evaluates a completed call before control is
-   * returned to the agent. A sequential agent that awaits this method can
-   * therefore not dispatch its next guarded call before a detector-triggered
-   * trip has committed. */
-  async recordAndFlush(step: StepObservationWire): Promise<void> {
-    this.record(step);
-    await this.flush();
+  private append(input: StepObservationInputWire): ExecutionHistory {
+    const step = StepObservationSchema.parse(input);
+    const history = this.historyFor(step.executionId);
+    history.sequence += 1;
+    history.lastTouchedAtMs = Date.now();
+    history.entries.push({ sequence: history.sequence, step });
+    if (history.entries.length > this.options.maxBufferSize) {
+      history.entries.splice(0, history.entries.length - this.options.maxBufferSize);
+    }
+    return history;
   }
 
-  /** Starts the background flush timer. Idempotent. Unref'd so holding a
-   * reporter never keeps a Node process alive by itself. */
+  async recordAndFlush(step: StepObservationInputWire): Promise<void> {
+    this.append(step);
+    await this.flush(step.executionId);
+  }
+
+  /** Resets one execution, or every execution when omitted. */
+  clearHistory(executionId?: string): void {
+    if (executionId !== undefined) {
+      const history = this.histories.get(executionId);
+      if (!history) return;
+      history.entries = [];
+      history.lastSentSequence = history.sequence;
+      history.reportingUnavailable = false;
+      history.lastTouchedAtMs = Date.now();
+      return;
+    }
+    this.histories.clear();
+  }
+
+  /** Ends an execution and releases all retained detector context. */
+  endExecution(executionId: string): void {
+    this.histories.delete(executionId);
+  }
+
+  getDetectorProtection(executionId: string): DetectorProtectionStatus[] {
+    const history = this.histories.get(executionId);
+    if (!history || history.entries.length === 0) {
+      return protectionStatuses('degraded', 'no-observations');
+    }
+    if (history.reportingUnavailable) {
+      return protectionStatuses('degraded', 'reporting-unavailable');
+    }
+    const pricingUnavailable = history.entries.some(
+      ({ step }) => step.pricingStatus === 'unavailable',
+    );
+    return [
+      protectedStatus('loop-signature'),
+      protectedStatus('context-bloat'),
+      pricingUnavailable
+        ? {
+            detector: 'cost-velocity',
+            status: 'degraded',
+            reasonCode: 'pricing-unavailable',
+            reason:
+              'one or more calls have no defensible price; cost velocity is unavailable for this execution',
+          }
+        : protectedStatus('cost-velocity'),
+    ];
+  }
+
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.flush();
+      void this.flush().catch(() => undefined);
     }, this.options.flushIntervalMs);
     this.timer.unref?.();
   }
 
   stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
+    if (!this.timer) return;
+    clearInterval(this.timer);
+    this.timer = undefined;
   }
 
-  async flush(): Promise<void> {
-    const requestedSequence = this.sequence;
-    if (requestedSequence <= this.lastSentSequence) return;
-    const run = this.flushChain.then(async () => {
-      if (requestedSequence <= this.lastSentSequence) return;
-      await this.sendWindow(requestedSequence);
+  /** Flushes one execution, or all active executions when omitted. */
+  async flush(executionId?: string): Promise<void> {
+    this.evictIdleHistories();
+    if (executionId !== undefined) {
+      const history = this.histories.get(executionId);
+      if (history) await this.flushHistory(executionId, history);
+      return;
+    }
+    await Promise.all(
+      [...this.histories.entries()].map(([id, history]) =>
+        this.flushHistory(id, history),
+      ),
+    );
+  }
+
+  private async flushHistory(
+    executionId: string,
+    history: ExecutionHistory,
+  ): Promise<void> {
+    const requestedSequence = history.sequence;
+    if (requestedSequence <= history.lastSentSequence) return;
+    const run = history.flushChain.then(async () => {
+      if (requestedSequence <= history.lastSentSequence) return;
+      await this.sendWindow(executionId, history, requestedSequence);
     });
-    // Keep the internal chain usable after a fail-closed rejection while
-    // returning the original rejection to the caller that must stop.
-    this.flushChain = run.catch(() => undefined);
+    history.flushChain = run.catch(() => undefined);
     return run;
   }
 
-  private async sendWindow(requestedSequence: number): Promise<void> {
-    const window = [...this.history];
+  private async sendWindow(
+    executionId: string,
+    history: ExecutionHistory,
+    requestedSequence: number,
+  ): Promise<void> {
+    const window = history.entries
+      .filter((entry) => entry.sequence <= requestedSequence)
+      .map((entry) => entry.step);
+    if (window.length === 0) {
+      history.lastSentSequence = Math.max(history.lastSentSequence, requestedSequence);
+      return;
+    }
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const res = await this.options.fetchImpl(
-        `${this.options.controlPlaneUrl}/v1/detectors/observe`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${this.options.apiToken}`,
+      const request = (async () => {
+        const res = await this.options.fetchImpl(
+          `${this.options.controlPlaneUrl}/v1/detectors/observe`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${this.options.apiToken}`,
+            },
+            body: JSON.stringify({ scope: this.options.scope, steps: window }),
+            signal: controller.signal,
           },
-          body: JSON.stringify({ scope: this.options.scope, steps: window }),
-        },
-      );
-      if (!res.ok) {
-        throw new Error(`step observation report rejected with HTTP ${res.status}`);
+        );
+        if (!res.ok) {
+          throw new Error(`step observation report rejected with HTTP ${res.status}`);
+        }
+        const parsed = ObserveStepsResponseSchema.safeParse(await res.json());
+        if (!parsed.success) {
+          throw new Error('control plane returned a malformed detector response');
+        }
+        return parsed.data;
+      })();
+      const response = await Promise.race([
+        request,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort();
+            reject(
+              new Error(
+                `step observation report timed out after ${this.options.timeoutMs}ms`,
+              ),
+            );
+          }, this.options.timeoutMs);
+        }),
+      ]);
+      history.lastSentSequence = Math.max(history.lastSentSequence, requestedSequence);
+      history.reportingUnavailable = false;
+      history.lastTouchedAtMs = Date.now();
+      if (
+        response.enforcement.some(
+          ({ outcome }) => outcome === 'tripped' || outcome === 'already-tripped',
+        )
+      ) {
+        history.entries = history.entries.filter(
+          (entry) => entry.sequence > requestedSequence,
+        );
       }
-      this.lastSentSequence = Math.max(this.lastSentSequence, requestedSequence);
     } catch (err) {
-      this.options.onFlushError?.(err);
+      history.reportingUnavailable = true;
+      try {
+        this.options.onFlushError?.(err);
+      } catch {
+        // Error observers never replace the original reporting outcome.
+      }
       if (this.options.outageMode === 'fail-closed') throw err;
-      // In fail-open mode this observation is intentionally allowed to be
-      // skipped. A later observation still carries the complete retained
-      // window, so the detector can catch up when service recovers.
-      this.lastSentSequence = Math.max(this.lastSentSequence, requestedSequence);
+      history.lastSentSequence = Math.max(history.lastSentSequence, requestedSequence);
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
+
+  private historyFor(executionId: string): ExecutionHistory {
+    this.evictIdleHistories();
+    const existing = this.histories.get(executionId);
+    if (existing) return existing;
+    while (this.histories.size >= this.options.maxExecutions) {
+      let oldestId: string | undefined;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [id, history] of this.histories) {
+        if (history.lastTouchedAtMs < oldestAt) {
+          oldestId = id;
+          oldestAt = history.lastTouchedAtMs;
+        }
+      }
+      if (oldestId === undefined) break;
+      this.histories.delete(oldestId);
+    }
+    const history: ExecutionHistory = {
+      entries: [],
+      sequence: 0,
+      lastSentSequence: 0,
+      lastTouchedAtMs: Date.now(),
+      reportingUnavailable: false,
+      flushChain: Promise.resolve(),
+    };
+    this.histories.set(executionId, history);
+    return history;
+  }
+
+  private evictIdleHistories(): void {
+    const cutoff = Date.now() - this.options.executionIdleTtlMs;
+    for (const [executionId, history] of this.histories) {
+      if (history.lastTouchedAtMs < cutoff) this.histories.delete(executionId);
+    }
+  }
+}
+
+function protectedStatus(
+  detector: DetectorProtectionStatus['detector'],
+): DetectorProtectionStatus {
+  return {
+    detector,
+    status: 'protected',
+    reasonCode: 'healthy',
+    reason: 'required direct-detector evidence is available for this execution',
+  };
+}
+
+function protectionStatuses(
+  status: 'degraded',
+  reasonCode: 'no-observations' | 'reporting-unavailable',
+): DetectorProtectionStatus[] {
+  const reason =
+    reasonCode === 'no-observations'
+      ? 'no completed step observations are retained for this execution'
+      : 'direct detector reporting is unavailable for this execution';
+  return (['loop-signature', 'context-bloat', 'cost-velocity'] as const).map(
+    (detector) => ({ detector, status, reasonCode, reason }),
+  );
 }

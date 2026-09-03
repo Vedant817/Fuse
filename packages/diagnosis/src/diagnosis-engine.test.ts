@@ -78,12 +78,23 @@ describe('buildDiagnosis', () => {
     expect(diagnosis.supportingEvidence.join(' ')).toContain('No matching spans');
   });
 
-  it('never throws and always states the breaker is already contained, regardless of evidence', () => {
+  it('states only the guarded post-trip guarantee and its limitations', () => {
     const diagnosis = buildDiagnosis(
       loopResult(),
       buildUnavailableEvidenceBundle('timeout'),
     );
-    expect(diagnosis.immediateContainment).toContain('already tripped');
+    expect(diagnosis.immediateContainment).toContain(
+      'subsequent guarded permit checks are denied',
+    );
+    expect(diagnosis.immediateContainment).toContain(
+      'Calls already past their permit check may still complete',
+    );
+    expect(diagnosis.immediateContainment).toContain(
+      'unguarded calls are outside Fuse enforcement',
+    );
+    expect(diagnosis.immediateContainment).not.toContain(
+      'no further model calls will be dispatched',
+    );
   });
 
   it('maps context-bloat and cost-velocity to their own distinct hypotheses/fixes', () => {

@@ -42,15 +42,94 @@ export function isFreshSlackTimestamp(
   return Math.abs(ageMs) <= maxSkewMs;
 }
 
+const MAX_PRIVATE_METADATA_LENGTH = 2_000;
+const MAX_REASON_LENGTH = 2_000;
+const MAX_SLACK_ID_LENGTH = 64;
+const MAX_VIEW_ID_LENGTH = 187;
+const MAX_CORRELATION_ID_LENGTH = 200;
+
+interface ResumePrivateMetadata {
+  version: 1;
+  scope: Scope;
+  expectedEpoch: number;
+  correlationId: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  );
+}
+
+function isBoundedString(value: unknown, min: number, max: number): value is string {
+  return typeof value === 'string' && value.length >= min && value.length <= max;
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseResumePrivateMetadata(value: unknown): ResumePrivateMetadata | undefined {
+  if (!isBoundedString(value, 1, MAX_PRIVATE_METADATA_LENGTH)) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isRecord(parsed) ||
+    !hasExactKeys(parsed, ['version', 'scope', 'expectedEpoch', 'correlationId']) ||
+    parsed['version'] !== 1 ||
+    !isNonnegativeSafeInteger(parsed['expectedEpoch']) ||
+    !isBoundedString(parsed['correlationId'], 1, MAX_CORRELATION_ID_LENGTH)
+  ) {
+    return undefined;
+  }
+
+  const scope = parsed['scope'];
+  if (
+    !isRecord(scope) ||
+    !hasExactKeys(scope, ['tenant', 'environment', 'agentId']) ||
+    !isBoundedString(scope['tenant'], 1, 128) ||
+    !isBoundedString(scope['environment'], 1, 64) ||
+    !isBoundedString(scope['agentId'], 1, 128)
+  ) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    scope: {
+      tenant: scope['tenant'],
+      environment: scope['environment'],
+      agentId: scope['agentId'],
+    },
+    expectedEpoch: parsed['expectedEpoch'],
+    correlationId: parsed['correlationId'],
+  };
+}
+
 /** The modal Slack opens when an operator clicks "Resume" on an incident
- * card — collects the required reason as free text rather than letting a
- * bare button click resume anything (task.md: "require a resume reason").
- * `scopeValue` round-trips through Slack's own `private_metadata`. */
-export function buildResumeReasonModalView(scopeValue: string): Record<string, unknown> {
+ * card. The action value arrived in a Slack-signed request and is copied to
+ * `private_metadata`, which Slack signs again on modal submission. Rejecting
+ * it here prevents malformed metadata from entering that round trip. */
+export function buildResumeReasonModalView(
+  privateMetadata: string,
+): Record<string, unknown> | undefined {
+  if (!parseResumePrivateMetadata(privateMetadata)) return undefined;
   return {
     type: 'modal',
     callback_id: 'fuse_resume_submit',
-    private_metadata: scopeValue,
+    private_metadata: privateMetadata,
     title: { type: 'plain_text', text: 'Resume scope' },
     submit: { type: 'plain_text', text: 'Resume' },
     close: { type: 'plain_text', text: 'Cancel' },
@@ -64,6 +143,7 @@ export function buildResumeReasonModalView(scopeValue: string): Record<string, u
           action_id: 'reason_input',
           multiline: true,
           min_length: 1,
+          max_length: MAX_REASON_LENGTH,
         },
       },
     ],
@@ -72,24 +152,15 @@ export function buildResumeReasonModalView(scopeValue: string): Record<string, u
 
 export interface ParsedResumeSubmission {
   scope: Scope;
+  expectedEpoch: number;
+  correlationId: string;
   reason: string;
   slackUserId: string;
+  slackTeamId?: string | undefined;
   /** Slack's own view id — stable per modal instance, used as the
    * idempotency key so a duplicate `view_submission` delivery (Slack
    * retries on slow acks) resumes at most once. */
   viewId: string;
-}
-
-interface SlackViewSubmissionPayload {
-  type: string;
-  user?: { id?: string };
-  view?: {
-    id?: string;
-    private_metadata?: string;
-    state?: {
-      values?: Record<string, Record<string, { value?: string }>>;
-    };
-  };
 }
 
 /** Parses a verified `view_submission` interactive payload into the data
@@ -97,24 +168,45 @@ interface SlackViewSubmissionPayload {
  * (never throws) for a payload missing required fields — the caller
  * should treat that as a malformed/rejected action, not crash. */
 export function parseResumeSubmission(
-  payload: SlackViewSubmissionPayload,
+  payload: unknown,
 ): ParsedResumeSubmission | undefined {
-  if (payload.type !== 'view_submission') return undefined;
-  const slackUserId = payload.user?.id;
-  const viewId = payload.view?.id;
-  const scopeValue = payload.view?.private_metadata;
-  const reason = payload.view?.state?.values?.['reason_block']?.['reason_input']?.value;
-  if (!slackUserId || !viewId || !scopeValue || !reason || reason.trim().length === 0) {
+  if (!isRecord(payload) || payload['type'] !== 'view_submission') return undefined;
+  const user = payload['user'];
+  const team = payload['team'];
+  const view = payload['view'];
+  if (!isRecord(user) || !isRecord(view)) return undefined;
+
+  const slackUserId = user['id'];
+  const slackTeamId = isRecord(team) ? team['id'] : undefined;
+  const viewId = view['id'];
+  const metadata = parseResumePrivateMetadata(view['private_metadata']);
+  const state = view['state'];
+  const values = isRecord(state) ? state['values'] : undefined;
+  const reasonBlock = isRecord(values) ? values['reason_block'] : undefined;
+  const reasonInput = isRecord(reasonBlock) ? reasonBlock['reason_input'] : undefined;
+  const reason = isRecord(reasonInput) ? reasonInput['value'] : undefined;
+
+  if (
+    !isBoundedString(slackUserId, 1, MAX_SLACK_ID_LENGTH) ||
+    (slackTeamId !== undefined &&
+      !isBoundedString(slackTeamId, 1, MAX_SLACK_ID_LENGTH)) ||
+    !isBoundedString(viewId, 1, MAX_VIEW_ID_LENGTH) ||
+    !metadata ||
+    !isBoundedString(reason, 1, MAX_REASON_LENGTH) ||
+    reason.trim().length === 0
+  ) {
     return undefined;
   }
-  let scope: Scope;
-  try {
-    scope = JSON.parse(scopeValue) as Scope;
-  } catch {
-    return undefined;
-  }
-  if (!scope.tenant || !scope.environment || !scope.agentId) return undefined;
-  return { scope, reason, slackUserId, viewId };
+
+  return {
+    scope: metadata.scope,
+    expectedEpoch: metadata.expectedEpoch,
+    correlationId: metadata.correlationId,
+    reason,
+    slackUserId,
+    ...(typeof slackTeamId === 'string' ? { slackTeamId } : {}),
+    viewId,
+  };
 }
 
 export interface ResumeExecutionResult {
@@ -148,9 +240,10 @@ export async function executeAuthorizedResume(
         },
         body: JSON.stringify({
           scope: submission.scope,
+          expectedEpoch: submission.expectedEpoch,
           reason: submission.reason,
           actor: { type: 'manual', id: `slack:${submission.slackUserId}` },
-          correlationId: `slack-resume-${submission.viewId}`,
+          correlationId: submission.correlationId,
           idempotencyKey: `slack-resume-${submission.viewId}`,
         }),
       },

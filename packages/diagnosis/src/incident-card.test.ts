@@ -24,8 +24,11 @@ const DIAGNOSIS: DiagnosisResult = {
 };
 
 describe('buildIncidentCardBlocks', () => {
-  it('includes state/scope/reason/evidence/confidence/fix', () => {
-    const card = buildIncidentCardBlocks(DIAGNOSIS, { correlationId: 'corr-1' });
+  it('includes tripped state/scope/reason/evidence/confidence/fix', () => {
+    const card = buildIncidentCardBlocks(DIAGNOSIS, {
+      correlationId: 'corr-1',
+      preflightState: 'protected',
+    });
     const json = JSON.stringify(card.blocks);
     expect(json).toContain('loop-signature');
     expect(json).toContain('t1/prod/agent-1');
@@ -38,25 +41,50 @@ describe('buildIncidentCardBlocks', () => {
   it('includes a Resume action only when a resumeActionValue is provided', () => {
     const withResume = buildIncidentCardBlocks(DIAGNOSIS, {
       correlationId: 'corr-1',
+      preflightState: 'protected',
       resumeActionValue: 'scope-payload',
     });
-    const withoutResume = buildIncidentCardBlocks(DIAGNOSIS, { correlationId: 'corr-1' });
+    const withoutResume = buildIncidentCardBlocks(DIAGNOSIS, {
+      correlationId: 'corr-1',
+      preflightState: 'protected',
+    });
     expect(JSON.stringify(withResume.blocks)).toContain('fuse_resume');
     expect(JSON.stringify(withoutResume.blocks)).not.toContain('fuse_resume');
   });
 
   it('never leaks raw evidence link URLs without the trace id label', () => {
-    const card = buildIncidentCardBlocks(DIAGNOSIS, { correlationId: 'corr-1' });
+    const card = buildIncidentCardBlocks(DIAGNOSIS, {
+      correlationId: 'corr-1',
+      preflightState: 'protected',
+    });
     expect(JSON.stringify(card.blocks)).toContain('abcdef123456');
   });
+
+  it.each(['degraded', 'blind', 'unknown'] as const)(
+    'renders the tripped breaker with Preflight %s without implying protection',
+    (preflightState) => {
+      const card = buildIncidentCardBlocks(DIAGNOSIS, {
+        correlationId: 'corr-1',
+        preflightState,
+      });
+      const json = JSON.stringify(card.blocks);
+      expect(card.text).toContain('Fuse tripped');
+      expect(json).toContain(`*Preflight*\\n${preflightState}`);
+      if (preflightState !== 'degraded') expect(json).not.toContain('protected');
+    },
+  );
 });
 
 describe('renderLocalIncidentCardHtml', () => {
   it('renders a self-contained HTML snapshot with no network calls', () => {
-    const html = renderLocalIncidentCardHtml(DIAGNOSIS, { correlationId: 'corr-1' });
+    const html = renderLocalIncidentCardHtml(DIAGNOSIS, {
+      correlationId: 'corr-1',
+      preflightState: 'blind',
+    });
     expect(html).toContain('<!doctype html>');
     expect(html).toContain('repeating step-shape cycle');
     expect(html).toContain('cumulative cost ceiling');
+    expect(html).toContain('Preflight:</span> blind');
     expect(html).not.toContain('slack.com');
     expect(html).not.toMatch(/https?:\/\/hooks\.slack/);
   });
@@ -66,7 +94,10 @@ describe('renderLocalIncidentCardHtml', () => {
       ...DIAGNOSIS,
       hypothesis: '<script>alert(1)</script>',
     };
-    const html = renderLocalIncidentCardHtml(withHtml, { correlationId: 'corr-1' });
+    const html = renderLocalIncidentCardHtml(withHtml, {
+      correlationId: 'corr-1',
+      preflightState: 'unknown',
+    });
     expect(html).not.toContain('<script>alert(1)</script>');
     expect(html).toContain('&lt;script&gt;');
   });

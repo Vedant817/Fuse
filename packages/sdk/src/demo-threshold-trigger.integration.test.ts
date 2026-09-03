@@ -71,6 +71,7 @@ describe('DemoThresholdTrigger end-to-end: threshold -> trip -> next call denied
         storeOutageMode: 'fail-closed',
         apiTokens: [API_TOKEN],
         agentApiTokens: [],
+        exporterEvidenceTokens: [],
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,

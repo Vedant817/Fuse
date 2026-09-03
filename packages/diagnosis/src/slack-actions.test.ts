@@ -96,28 +96,41 @@ describe('isFreshSlackTimestamp', () => {
 });
 
 describe('buildResumeReasonModalView', () => {
-  it('requires a reason input and round-trips the scope via private_metadata', () => {
-    const scopeValue = JSON.stringify({
-      tenant: 't1',
-      environment: 'prod',
-      agentId: 'a1',
+  it('requires a reason input and round-trips bounded incident metadata', () => {
+    const privateMetadata = JSON.stringify({
+      version: 1,
+      scope: { tenant: 't1', environment: 'prod', agentId: 'a1' },
+      expectedEpoch: 7,
+      correlationId: 'incident-1',
     });
-    const view = buildResumeReasonModalView(scopeValue);
-    expect(view['private_metadata']).toBe(scopeValue);
+    const view = buildResumeReasonModalView(privateMetadata);
+    expect(view?.['private_metadata']).toBe(privateMetadata);
     expect(JSON.stringify(view)).toContain('reason_input');
+  });
+
+  it('rejects malformed or oversized private metadata', () => {
+    expect(buildResumeReasonModalView('{not-json')).toBeUndefined();
+    expect(buildResumeReasonModalView('x'.repeat(2_001))).toBeUndefined();
   });
 });
 
 describe('parseResumeSubmission', () => {
   const scope = { tenant: 't1', environment: 'prod', agentId: 'a1' };
+  const metadata = {
+    version: 1,
+    scope,
+    expectedEpoch: 7,
+    correlationId: 'incident-1',
+  };
 
   function payload(overrides: Record<string, unknown> = {}) {
     return {
       type: 'view_submission',
       user: { id: 'U123' },
+      team: { id: 'T123' },
       view: {
         id: 'V456',
-        private_metadata: JSON.stringify(scope),
+        private_metadata: JSON.stringify(metadata),
         state: {
           values: {
             reason_block: { reason_input: { value: 'investigated, safe to resume' } },
@@ -132,8 +145,11 @@ describe('parseResumeSubmission', () => {
     const parsed = parseResumeSubmission(payload());
     expect(parsed).toEqual({
       scope,
+      expectedEpoch: 7,
+      correlationId: 'incident-1',
       reason: 'investigated, safe to resume',
       slackUserId: 'U123',
+      slackTeamId: 'T123',
       viewId: 'V456',
     });
   });
@@ -155,11 +171,40 @@ describe('parseResumeSubmission', () => {
       ),
     ).toBeUndefined();
   });
+
+  it('strictly rejects metadata with unknown fields, invalid epochs, or oversized values', () => {
+    const withMetadata = (value: unknown) =>
+      payload({
+        view: {
+          id: 'V1',
+          private_metadata: JSON.stringify(value),
+          state: {
+            values: {
+              reason_block: { reason_input: { value: 'safe to resume' } },
+            },
+          },
+        },
+      });
+
+    expect(
+      parseResumeSubmission(withMetadata({ ...metadata, admin: true })),
+    ).toBeUndefined();
+    expect(
+      parseResumeSubmission(withMetadata({ ...metadata, expectedEpoch: -1 })),
+    ).toBeUndefined();
+    expect(
+      parseResumeSubmission(
+        withMetadata({ ...metadata, correlationId: 'x'.repeat(201) }),
+      ),
+    ).toBeUndefined();
+  });
 });
 
 describe('executeAuthorizedResume', () => {
   const submission = {
     scope: { tenant: 't1', environment: 'prod', agentId: 'a1' },
+    expectedEpoch: 7,
+    correlationId: 'incident-1',
     reason: 'safe to resume',
     slackUserId: 'U123',
     viewId: 'V456',
@@ -183,13 +228,15 @@ describe('executeAuthorizedResume', () => {
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body.actor).toEqual({ type: 'manual', id: 'slack:U123' });
     expect(body.idempotencyKey).toBe('slack-resume-V456');
+    expect(body.expectedEpoch).toBe(7);
+    expect(body.correlationId).toBe('incident-1');
     expect(body.reason).toBe('safe to resume');
   });
 
   it('reports a stale-epoch/conflict style error without throwing', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(
       new Response(
-        JSON.stringify({ error: 'cooldown_active', message: 'cooldown still active' }),
+        JSON.stringify({ error: 'stale_epoch', message: 'expected epoch is stale' }),
         {
           status: 409,
           headers: { 'content-type': 'application/json' },
@@ -202,7 +249,7 @@ describe('executeAuthorizedResume', () => {
       fetchImpl,
     });
     expect(result.resumed).toBe(false);
-    expect(result.reason).toContain('cooldown');
+    expect(result.reason).toContain('stale');
   });
 
   it('degrades to resumed:false (never throws) on a network error', async () => {

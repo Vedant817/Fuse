@@ -33,17 +33,23 @@ const DEFAULT_MAX_RETRIES = 1;
 export class SignozMcpClient {
   private client: Client | undefined;
   private connecting: Promise<Client> | undefined;
+  private connectingClient: Client | undefined;
+  private connectionGeneration = 0;
 
   constructor(private readonly options: SignozMcpClientOptions) {}
 
   private async ensureConnected(): Promise<Client> {
     if (this.client) return this.client;
     if (!this.connecting) {
-      this.connecting = (async () => {
+      const generation = this.connectionGeneration;
+      let attemptClient: Client | undefined;
+      const connection = async () => {
         const transport = new StreamableHTTPClientTransport(
           new URL(this.options.serverUrl),
         );
         const client = new Client({ name: 'fuse-diagnosis', version: '0.1.0' });
+        attemptClient = client;
+        this.connectingClient = client;
         // @modelcontextprotocol/sdk@1.29.0's own `Transport` interface
         // declares `sessionId: string`, but `StreamableHTTPClientTransport`
         // (the same package) actually types it `string | undefined` —
@@ -51,11 +57,18 @@ export class SignozMcpClient {
         // strictness, not a real runtime mismatch. Narrow cast, not a
         // structural workaround.
         await client.connect(transport as unknown as Parameters<Client['connect']>[0]);
+        if (generation !== this.connectionGeneration) {
+          await client.close().catch(() => {});
+          throw new Error('MCP connection attempt was abandoned');
+        }
         this.client = client;
         return client;
-      })().finally(() => {
-        this.connecting = undefined;
+      };
+      const tracked = connection().finally(() => {
+        if (this.connectingClient === attemptClient) this.connectingClient = undefined;
+        if (this.connecting === tracked) this.connecting = undefined;
       });
+      this.connecting = tracked;
     }
     return this.connecting;
   }
@@ -69,10 +82,12 @@ export class SignozMcpClient {
     let lastErr: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const client = await this.ensureConnected();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
-          client.callTool({ name, arguments: args }),
+          (async () => {
+            const client = await this.ensureConnected();
+            return client.callTool({ name, arguments: args });
+          })(),
           new Promise<never>((_, reject) => {
             timer = setTimeout(
               () =>
@@ -88,15 +103,24 @@ export class SignozMcpClient {
         lastErr = err;
         // Force a fresh connection on the next attempt — a broken
         // transport shouldn't be retried against itself.
-        await this.client?.close().catch(() => {});
-        this.client = undefined;
+        await this.resetConnection();
       }
     }
     throw lastErr;
   }
 
   async close(): Promise<void> {
-    await this.client?.close().catch(() => {});
+    await this.resetConnection();
+  }
+
+  private async resetConnection(): Promise<void> {
+    this.connectionGeneration += 1;
+    const clients = new Set([this.client, this.connectingClient].filter(Boolean));
     this.client = undefined;
+    this.connectingClient = undefined;
+    this.connecting = undefined;
+    await Promise.all(
+      [...clients].map((client) => (client as Client).close().catch(() => {})),
+    );
   }
 }

@@ -14,10 +14,27 @@ import {
   getBreakerDecisionCounter,
   getDetectorFiredGauge,
   getDetectorScoreGauge,
+  getDiagnosisDeliveryAttemptCounter,
+  getDiagnosisDeliveryLatencyHistogram,
+  getDiagnosisQueueDepthGauge,
+  getDiagnosisLeaseRenewalFailureCounter,
+  getDetectorObservationLatencyHistogram,
+  getDetectorObservationRequestCounter,
   getEstimatedCostCounter,
   getOperationDurationHistogram,
   getPreflightStateGauge,
+  getPreflightSelfAlertActiveGauge,
+  getPreflightSelfAlertTransitionCounter,
+  getPreflightEvaluationCounter,
+  getPreflightSweepCounter,
+  getPreflightSweepHealthGauge,
+  getPermitLatencyHistogram,
+  getPermitRequestCounter,
+  getRedisReadinessCheckCounter,
+  getRedisReadinessGauge,
   getTokenUsageHistogram,
+  getWebhookLatencyHistogram,
+  getWebhookRequestCounter,
 } from './metrics.js';
 
 describe('metrics instruments', () => {
@@ -166,5 +183,157 @@ describe('metrics instruments', () => {
     }>;
     expect(dataPoints[0]?.value).toBe(1);
     expect(dataPoints[0]?.attributes['fuse.preflight.state']).toBe('protected');
+  });
+
+  it('records self-alert open/recovery on one active series plus transition events', async () => {
+    const scopeAttributes = {
+      'fuse.tenant': 't1',
+      'fuse.environment': 'prod',
+      'fuse.agent_id': 'agent-1',
+    };
+    getPreflightSelfAlertActiveGauge().record(1, scopeAttributes);
+    getPreflightSelfAlertTransitionCounter().add(1, {
+      ...scopeAttributes,
+      'fuse.preflight.transition': 'opened',
+      'fuse.preflight.state': 'blind',
+      'fuse.preflight.reason_code': 'exporter-delivery-failed',
+    });
+    getPreflightSelfAlertActiveGauge().record(0, scopeAttributes);
+    getPreflightSelfAlertTransitionCounter().add(1, {
+      ...scopeAttributes,
+      'fuse.preflight.transition': 'recovered',
+      'fuse.preflight.state': 'protected',
+      'fuse.preflight.reason_code': 'healthy',
+    });
+    await provider.forceFlush();
+
+    const [resourceMetrics] = exporter.getMetrics();
+    const active = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (metric) => metric.descriptor.name === 'fuse.preflight.self_alert.active',
+    );
+    expect(active?.dataPoints).toHaveLength(1);
+    expect((active!.dataPoints[0] as { value: number }).value).toBe(0);
+
+    const transitions = resourceMetrics!.scopeMetrics[0]!.metrics.find(
+      (metric) => metric.descriptor.name === 'fuse.preflight.self_alert.transitions',
+    );
+    expect(transitions?.dataPoints).toHaveLength(2);
+  });
+
+  it('records low-cardinality diagnosis queue, attempt, and delivery latency metrics', async () => {
+    getDiagnosisQueueDepthGauge().record(7, { 'fuse.diagnosis.status': 'pending' });
+    getDiagnosisQueueDepthGauge().record(2, { 'fuse.diagnosis.status': 'running' });
+    getDiagnosisQueueDepthGauge().record(1, {
+      'fuse.diagnosis.status': 'dead-letter',
+    });
+    getDiagnosisDeliveryAttemptCounter().add(1, {
+      'fuse.diagnosis.outcome': 'succeeded',
+    });
+    getDiagnosisDeliveryLatencyHistogram().record(0.125, {
+      'fuse.diagnosis.outcome': 'succeeded',
+    });
+    await provider.forceFlush();
+
+    const [resourceMetrics] = exporter.getMetrics();
+    const byName = new Map(
+      resourceMetrics!.scopeMetrics[0]!.metrics.map((metric) => [
+        metric.descriptor.name,
+        metric,
+      ]),
+    );
+    const queue = byName.get('fuse.diagnosis.queue.jobs');
+    expect(queue?.dataPoints).toHaveLength(3);
+    expect(
+      queue?.dataPoints.every((point) =>
+        Object.keys(point.attributes).every((key) => key === 'fuse.diagnosis.status'),
+      ),
+    ).toBe(true);
+    expect(byName.get('fuse.diagnosis.delivery.attempts')).toBeDefined();
+    expect(byName.get('fuse.diagnosis.delivery.latency')).toBeDefined();
+  });
+
+  it('records the operational SLO surface with bounded infrastructure-wide labels', async () => {
+    const version = { 'fuse.slo.version': 'v1-provisional' };
+    getPermitRequestCounter().add(1, { ...version, 'fuse.outcome': 'denied' });
+    getPermitLatencyHistogram().record(0.012, {
+      ...version,
+      'fuse.outcome': 'denied',
+    });
+    getDetectorObservationRequestCounter().add(1, {
+      ...version,
+      'fuse.outcome': 'server_error',
+    });
+    getDetectorObservationLatencyHistogram().record(0.04, {
+      ...version,
+      'fuse.outcome': 'server_error',
+    });
+    getWebhookRequestCounter().add(1, {
+      ...version,
+      'fuse.outcome': 'auth_failure',
+    });
+    getWebhookLatencyHistogram().record(0.003, {
+      ...version,
+      'fuse.outcome': 'auth_failure',
+    });
+    getDiagnosisLeaseRenewalFailureCounter().add(1, {
+      ...version,
+      'fuse.reason': 'rejected',
+    });
+    getRedisReadinessGauge().record(0, version);
+    getRedisReadinessCheckCounter().add(1, {
+      ...version,
+      'fuse.outcome': 'failure',
+    });
+    getPreflightEvaluationCounter().add(1, {
+      ...version,
+      'fuse.preflight.health_class': 'stale',
+      'fuse.preflight.source': 'sweep',
+    });
+    getPreflightSweepCounter().add(1, {
+      ...version,
+      'fuse.outcome': 'success',
+    });
+    getPreflightSweepHealthGauge().record(1, version);
+    await provider.forceFlush();
+
+    const [resourceMetrics] = exporter.getMetrics();
+    const operational = resourceMetrics!.scopeMetrics[0]!.metrics.filter((metric) =>
+      metric.descriptor.name.startsWith('fuse.control_plane.') ||
+      metric.descriptor.name.startsWith('fuse.rate_limit.') ||
+      metric.descriptor.name === 'fuse.preflight.evaluations' ||
+      metric.descriptor.name.startsWith('fuse.preflight.sweep.') ||
+      metric.descriptor.name === 'fuse.diagnosis.lease_renewal.failures'
+        ? true
+        : false,
+    );
+    expect(operational.map((metric) => metric.descriptor.name).sort()).toEqual(
+      [
+        'fuse.control_plane.detector_observation.duration',
+        'fuse.control_plane.detector_observation.requests',
+        'fuse.control_plane.permit.duration',
+        'fuse.control_plane.permit.requests',
+        'fuse.control_plane.webhook.duration',
+        'fuse.control_plane.webhook.requests',
+        'fuse.diagnosis.lease_renewal.failures',
+        'fuse.preflight.evaluations',
+        'fuse.preflight.sweep.runs',
+        'fuse.preflight.sweep.healthy',
+        'fuse.rate_limit.redis.readiness_checks',
+        'fuse.rate_limit.redis.ready',
+      ].sort(),
+    );
+    for (const metric of operational) {
+      for (const point of metric.dataPoints) {
+        expect(point.attributes['fuse.slo.version']).toBe('v1-provisional');
+        expect(Object.keys(point.attributes)).not.toEqual(
+          expect.arrayContaining([
+            'fuse.tenant',
+            'fuse.environment',
+            'fuse.agent_id',
+            'fuse.source_epoch',
+          ]),
+        );
+      }
+    }
   });
 });

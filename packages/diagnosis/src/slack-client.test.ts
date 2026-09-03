@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { openResumeModal, postIncidentCard } from './slack-client.js';
+import {
+  deriveSlackClientMessageId,
+  openResumeModal,
+  postIncidentCard,
+} from './slack-client.js';
 
 const CARD = { blocks: [{ type: 'header' }], text: 'Fuse tripped: loop-signature' };
 
@@ -16,6 +20,7 @@ describe('postIncidentCard', () => {
     const result = await postIncidentCard(CARD, {
       botToken: undefined,
       channel: '#incidents',
+      messageIdentity: 'audit-1:corr-1',
       fetchImpl,
     });
     expect(result).toEqual({
@@ -32,6 +37,7 @@ describe('postIncidentCard', () => {
     const result = await postIncidentCard(CARD, {
       botToken: 'xoxb-fake',
       channel: '#incidents',
+      messageIdentity: 'audit-1:corr-1',
       fetchImpl,
     });
     expect(result).toEqual({ posted: true, ts: '169.001' });
@@ -44,7 +50,12 @@ describe('postIncidentCard', () => {
       authorization: 'Bearer xoxb-fake',
     });
     const body = JSON.parse((init as RequestInit).body as string);
-    expect(body).toEqual({ channel: '#incidents', text: CARD.text, blocks: CARD.blocks });
+    expect(body).toEqual({
+      channel: '#incidents',
+      client_msg_id: deriveSlackClientMessageId('audit-1:corr-1'),
+      text: CARD.text,
+      blocks: CARD.blocks,
+    });
   });
 
   it('degrades to posted:false (never throws) on a Slack API-level error', async () => {
@@ -54,6 +65,7 @@ describe('postIncidentCard', () => {
     const result = await postIncidentCard(CARD, {
       botToken: 'xoxb-fake',
       channel: '#nope',
+      messageIdentity: 'audit-1:corr-1',
       fetchImpl,
     });
     expect(result.posted).toBe(false);
@@ -65,6 +77,7 @@ describe('postIncidentCard', () => {
     const result = await postIncidentCard(CARD, {
       botToken: 'xoxb-fake',
       channel: '#incidents',
+      messageIdentity: 'audit-1:corr-1',
       fetchImpl,
     });
     expect(result.posted).toBe(false);
@@ -74,8 +87,26 @@ describe('postIncidentCard', () => {
   it('degrades to posted:false (never throws) on a network error', async () => {
     const fetchImpl = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
     await expect(
-      postIncidentCard(CARD, { botToken: 'xoxb-fake', channel: '#incidents', fetchImpl }),
+      postIncidentCard(CARD, {
+        botToken: 'xoxb-fake',
+        channel: '#incidents',
+        messageIdentity: 'audit-1:corr-1',
+        fetchImpl,
+      }),
     ).resolves.toEqual({ posted: false, reason: 'Slack post failed: ECONNREFUSED' });
+  });
+
+  it('derives the same bounded provider id for retries and a different id for another audit', () => {
+    const first = deriveSlackClientMessageId('audit-1:corr-1');
+    expect(deriveSlackClientMessageId('audit-1:corr-1')).toBe(first);
+    expect(deriveSlackClientMessageId('audit-2:corr-1')).not.toBe(first);
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(first).toHaveLength(36);
+    expect(() => deriveSlackClientMessageId('x'.repeat(501))).toThrow(
+      /between 1 and 500/,
+    );
   });
 });
 

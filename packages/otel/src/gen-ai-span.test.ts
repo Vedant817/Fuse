@@ -259,12 +259,73 @@ describe('withGenAiSpan', () => {
     );
     expect(steps).toHaveLength(1);
     expect(steps[0]).toMatchObject({
+      executionId: 'session-1',
       canonicalShape: 'analyzer:abc123',
       inputTokens: 200,
       outputTokens: 50,
+      pricingStatus: 'available',
     });
     expect(typeof steps[0]?.timestampMs).toBe('number');
     expect(typeof steps[0]?.estimatedCostUsd).toBe('number');
+  });
+
+  it('reports unknown model pricing as unavailable without a semantic zero', async () => {
+    const steps: StepObservation[] = [];
+    await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        requestModel: 'unknown-model',
+        stepIndex: 0,
+        onStepObserved: (step) => {
+          steps.push(step);
+        },
+      },
+      async () => ({
+        result: 'ok',
+        outcome: {
+          inputTokens: 200,
+          outputTokens: 50,
+          outcome: 'success',
+          canonicalShape: 'analyzer:abc123',
+        },
+      }),
+    );
+
+    expect(steps).toEqual([
+      expect.objectContaining({
+        executionId: 'session-1',
+        pricingStatus: 'unavailable',
+        estimatedCostUsd: null,
+      }),
+    ]);
+  });
+
+  it('returns an already-paid successful result when post-call detector reporting fails', async () => {
+    const result = await withGenAiSpan(
+      {
+        ...BASE_CTX,
+        stepIndex: 0,
+        onStepObserved: async () => {
+          throw new Error('detector endpoint unavailable');
+        },
+      },
+      async () => ({
+        result: 'paid-provider-result',
+        outcome: {
+          inputTokens: 200,
+          outputTokens: 50,
+          outcome: 'success',
+          canonicalShape: 'analyzer:abc123',
+        },
+      }),
+    );
+    await provider.forceFlush();
+
+    expect(result).toBe('paid-provider-result');
+    expect(exporter.getFinishedSpans()[0]!.status.code).toBe(0);
+    expect(
+      exporter.getFinishedSpans()[0]!.events.some((event) => event.name === 'exception'),
+    ).toBe(false);
   });
 
   it('never fires onStepObserved when outcome.canonicalShape is not set', async () => {

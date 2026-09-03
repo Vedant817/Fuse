@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   PostgreSqlContainer,
   type StartedPostgreSqlContainer,
@@ -14,7 +16,21 @@ import { BreakerTrippedError } from './errors.js';
 import { callFakeProvider, startFakeProvider, type FakeProvider } from './testing.js';
 
 const API_TOKEN = 'sdk-integration-test-token-0123456789';
+const EXPORTER_TOKEN = 'sdk-exporter-test-token-0123456789';
 const POLICY_VERSION = 'demo-hardcoded-threshold-v1';
+const execFileAsync = promisify(execFile);
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function setContainerPaused(containerId: string, paused: boolean): Promise<void> {
+  await execFileAsync('docker', [paused ? 'pause' : 'unpause', containerId]);
+}
 
 /**
  * This is the load-bearing proof for Fuse's central product claim: once a
@@ -70,6 +86,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
         storeOutageMode: 'fail-closed',
         apiTokens: [API_TOKEN],
         agentApiTokens: [],
+        exporterEvidenceTokens: [EXPORTER_TOKEN],
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,
@@ -118,6 +135,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
       scope,
       controlPlaneUrl,
       apiToken: API_TOKEN,
+      exporterEvidenceToken: EXPORTER_TOKEN,
       timeoutMs: 2000,
     });
   }
@@ -125,7 +143,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
   async function tripViaHardcodedThreshold(
     scope: Scope,
     cooldownSeconds = 60,
-  ): Promise<void> {
+  ): Promise<number> {
     const res = await fetch(`${controlPlaneUrl}/v1/breaker/trip`, {
       method: 'POST',
       headers: {
@@ -143,8 +161,9 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
       }),
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { record: { state: string } };
+    const body = (await res.json()) as { record: { state: string; epoch: number } };
     expect(body.record.state).toBe('tripped');
+    return body.record.epoch;
   }
 
   it('while armed, guarded calls reach the real provider endpoint', async () => {
@@ -160,6 +179,98 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     expect(fakeProvider.requestCount() - before).toBe(3);
   });
 
+  it('retains firing evidence across a real Postgres outage, recovery barrier, and committed trip', async () => {
+    const scope = scopeFor('detector-postgres-outage-recovery');
+    const guard = new FuseGuard({
+      scope,
+      controlPlaneUrl,
+      apiToken: API_TOKEN,
+      timeoutMs: 2_000,
+      stepObservationTimeoutMs: 500,
+    });
+    const before = fakeProvider.requestCount();
+
+    const paidResult = await guard.guard(() => callFakeProvider(fakeProvider.url));
+    expect(paidResult).toMatchObject({ ok: true });
+    expect(fakeProvider.requestCount() - before).toBe(1);
+
+    let paused = false;
+    try {
+      await setContainerPaused(pgContainer.getId(), true);
+      paused = true;
+      await expect(
+        guard.recordStepObservation({
+          executionId: 'postgres-outage-execution',
+          timestampMs: Date.now(),
+          canonicalShape: 'context-at-ceiling-after-paid-call',
+          inputTokens: 100_000,
+          outputTokens: 1,
+          pricingStatus: 'available',
+          estimatedCostUsd: 0.0001,
+        }),
+      ).resolves.toBeUndefined();
+
+      await expect(
+        guard.guard(
+          () => callFakeProvider(fakeProvider.url),
+          'denied-during-postgres-outage',
+        ),
+      ).rejects.toMatchObject({ code: 'detector_reporting_unavailable' });
+      expect(fakeProvider.requestCount() - before).toBe(1);
+
+      await setContainerPaused(pgContainer.getId(), false);
+      paused = false;
+      await expect
+        .poll(async () => (await fetch(`${controlPlaneUrl}/readyz`)).status, {
+          timeout: 10_000,
+          interval: 100,
+        })
+        .toBe(200);
+
+      await expect(
+        guard.guard(() => callFakeProvider(fakeProvider.url), 'recovery-barrier'),
+      ).rejects.toMatchObject({
+        code: 'detector_reporting_unavailable',
+        reason: expect.stringContaining('reporting recovered'),
+      });
+    } finally {
+      if (paused) await setContainerPaused(pgContainer.getId(), false);
+    }
+
+    const committed = await pool.query<{
+      state: string;
+      actor_id: string;
+      detector: string;
+      detector_version: string;
+      score: number;
+      threshold: number;
+    }>(
+      `SELECT b.state, a.actor_id, j.detector, j.detector_version,
+              j.score, j.threshold
+         FROM breaker_state b
+         JOIN breaker_audit_log a
+           ON a.tenant=b.tenant AND a.environment=b.environment
+          AND a.agent_id=b.agent_id AND a.to_state='tripped' AND NOT a.noop
+         JOIN diagnosis_jobs j ON j.audit_event_id=a.id
+        WHERE b.tenant=$1 AND b.environment=$2 AND b.agent_id=$3`,
+      [scope.tenant, scope.environment, scope.agentId],
+    );
+    expect(committed.rows).toEqual([
+      expect.objectContaining({
+        state: 'tripped',
+        actor_id: 'system:detector:context-bloat',
+        detector: 'context-bloat',
+        detector_version: 'context-bloat-v1',
+        score: 100_000,
+        threshold: 100_000,
+      }),
+    ]);
+    await expect(
+      guard.guard(() => callFakeProvider(fakeProvider.url), 'denied-after-recovery'),
+    ).rejects.toMatchObject({ code: 'breaker_denied', state: 'tripped' });
+    expect(fakeProvider.requestCount() - before).toBe(1);
+  }, 30_000);
+
   it('a real detector observation commits a trip before the next provider call', async () => {
     const scope = scopeFor('detector-trip-next-call-zero');
     const guard = guardFor(scope);
@@ -172,11 +283,13 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     // recordStepObservation awaits the control-plane evaluation and the
     // atomic breaker trip before returning to the sequential agent.
     await guard.recordStepObservation({
+      executionId: 'context-execution',
       timestampMs: Date.now(),
       canonicalShape: 'context-at-ceiling',
       inputTokens: 100_000,
       outputTokens: 1,
-      estimatedCostUsd: 0,
+      pricingStatus: 'available',
+      estimatedCostUsd: 0.0001,
     });
 
     const status = await fetch(
@@ -184,14 +297,56 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
       { headers: { authorization: `Bearer ${API_TOKEN}` } },
     );
     expect(status.status).toBe(200);
-    expect(((await status.json()) as { record: { state: string } }).record.state).toBe(
-      'tripped',
-    );
+    const trippedRecord = (
+      (await status.json()) as { record: { state: string; epoch: number } }
+    ).record;
+    expect(trippedRecord.state).toBe('tripped');
 
     await expect(guard.guard(() => callFakeProvider(fakeProvider.url))).rejects.toThrow(
       BreakerTrippedError,
     );
     expect(fakeProvider.requestCount() - before).toBe(1);
+
+    const resumeRes = await fetch(`${controlPlaneUrl}/v1/breaker/resume`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${API_TOKEN}`,
+      },
+      body: JSON.stringify({
+        scope,
+        reason: 'operator cleared the detector incident',
+        actor: { type: 'manual', id: 'user:oncall' },
+        correlationId: `resume-${randomUUID()}`,
+        idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: trippedRecord.epoch,
+      }),
+    });
+    expect(resumeRes.status).toBe(200);
+
+    // The pre-trip absolute-ceiling observation must not survive resume.
+    // A fresh low-token observation stays armed instead of immediately
+    // re-tripping on the stale 100k-token history.
+    await guard.recordStepObservation({
+      executionId: 'context-execution',
+      timestampMs: Date.now(),
+      canonicalShape: 'fresh-after-resume',
+      inputTokens: 100,
+      outputTokens: 1,
+      pricingStatus: 'available',
+      estimatedCostUsd: 0.0001,
+    });
+    const afterResumeStatus = await fetch(
+      `${controlPlaneUrl}/v1/breaker/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
+      { headers: { authorization: `Bearer ${API_TOKEN}` } },
+    );
+    expect(
+      ((await afterResumeStatus.json()) as { record: { state: string } }).record.state,
+    ).toBe('armed');
+    await expect(
+      guard.guard(() => callFakeProvider(fakeProvider.url)),
+    ).resolves.toMatchObject({ ok: true });
+    expect(fakeProvider.requestCount() - before).toBe(2);
     guard.stopStepObservationReporting();
   });
 
@@ -246,39 +401,88 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     expect(fakeProvider.requestCount()).toBe(afterTripCount); // still zero new requests
   });
 
-  it('measures in-flight exposure: calls already past their permit check when the trip commits may still complete', async () => {
-    // This documents the honest limitation (task.md §2.3): Fuse cannot
-    // cancel a provider request that already started before the trip
-    // committed. We simulate "already past permit, mid-dispatch" by
-    // invoking the fake provider directly (bypassing guard()), timed
-    // around the trip call, and confirm the count of such pre-existing
-    // in-flight calls is exactly and only the ones started beforehand —
-    // no additional guarded call after the trip response returns is ever
-    // counted alongside them.
-    const scope = scopeFor('in-flight-exposure');
-    const guard = guardFor(scope);
-    await guard.guard(() => callFakeProvider(fakeProvider.url));
+  it('permit-to-dispatch race allows only calls whose real permit completed before the trip commit', async () => {
+    const scope = scopeFor('permit-commit-dispatch-race');
+    const preCommitPermitGate = deferred();
+    const postCommitPermitGate = deferred();
+    const providerGate = deferred();
+    const fetchImpl = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (url.endsWith('/v1/permit')) {
+        const body = JSON.parse(String(init?.body)) as { correlationId: string };
+        if (body.correlationId.startsWith('permit-before-commit-')) {
+          await preCommitPermitGate.promise;
+        } else if (body.correlationId.startsWith('permit-after-commit-')) {
+          await postCommitPermitGate.promise;
+        }
+      }
+      return fetch(input, init);
+    }) as typeof fetch;
+    const guard = new FuseGuard({
+      scope,
+      controlPlaneUrl,
+      apiToken: API_TOKEN,
+      timeoutMs: 5_000,
+      fetchImpl,
+    });
     const before = fakeProvider.requestCount();
+    const providerCallbacks: string[] = [];
+    const dispatch = (label: string) => async () => {
+      providerCallbacks.push(label);
+      await providerGate.promise;
+      return callFakeProvider(fakeProvider.url, { label });
+    };
 
-    const inFlightBeforeTrip = [
-      callFakeProvider(fakeProvider.url),
-      callFakeProvider(fakeProvider.url),
-    ];
-    await tripViaHardcodedThreshold(scope);
-    await Promise.all(inFlightBeforeTrip);
-
-    expect(fakeProvider.requestCount() - before).toBe(2); // the 2 in-flight calls, and only those
-
-    await expect(guard.guard(() => callFakeProvider(fakeProvider.url))).rejects.toThrow(
-      BreakerTrippedError,
+    const beforeCommitCalls = Array.from({ length: 3 }, (_, index) =>
+      guard.guard(dispatch(`before-${index}`), `permit-before-commit-${index}`),
     );
-    expect(fakeProvider.requestCount() - before).toBe(2); // no further growth
-  });
+    const afterCommitCalls = Array.from({ length: 5 }, (_, index) =>
+      guard.guard(dispatch(`after-${index}`), `permit-after-commit-${index}`),
+    );
+
+    preCommitPermitGate.resolve();
+    await expect
+      .poll(() => providerCallbacks.length, { timeout: 5_000, interval: 10 })
+      .toBe(3);
+    expect([...providerCallbacks].sort()).toEqual(['before-0', 'before-1', 'before-2']);
+    expect(fakeProvider.requestCount()).toBe(before);
+
+    await tripViaHardcodedThreshold(scope);
+    postCommitPermitGate.resolve();
+    const denied = await Promise.allSettled(afterCommitCalls);
+    expect(
+      denied.every(
+        (result) =>
+          result.status === 'rejected' && result.reason instanceof BreakerTrippedError,
+      ),
+    ).toBe(true);
+    expect([...providerCallbacks].sort()).toEqual(['before-0', 'before-1', 'before-2']);
+
+    // These three requests cross the real provider's network boundary only
+    // after the commit, but only because their permits completed beforehand.
+    providerGate.resolve();
+    await expect(Promise.all(beforeCommitCalls)).resolves.toHaveLength(3);
+    expect(fakeProvider.requestCount() - before).toBe(3);
+
+    await expect(
+      guard.guard(dispatch('strictly-after-commit'), 'permit-strictly-after-commit'),
+    ).rejects.toThrow(BreakerTrippedError);
+    expect([...providerCallbacks].sort()).toEqual(['before-0', 'before-1', 'before-2']);
+    expect(fakeProvider.requestCount() - before).toBe(3);
+  }, 30_000);
 
   it('a manual resume restores provider access', async () => {
     const scope = scopeFor('resume-restores');
     const guard = guardFor(scope);
-    await tripViaHardcodedThreshold(scope);
+    const tripEpoch = await tripViaHardcodedThreshold(scope);
     await expect(guard.guard(() => callFakeProvider(fakeProvider.url))).rejects.toThrow(
       BreakerTrippedError,
     );
@@ -295,6 +499,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
         actor: { type: 'manual', id: 'user:oncall' },
         correlationId: `resume-${randomUUID()}`,
         idempotencyKey: `idem-${randomUUID()}`,
+        expectedEpoch: tripEpoch,
       }),
     });
     expect(resumeRes.status).toBe(200);
@@ -303,7 +508,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     expect(result).toMatchObject({ ok: true });
   });
 
-  it('recordSpanTelemetry + flush makes this scope visible as protected via the real Preflight API', async () => {
+  it('a matching real-export callback makes this scope protected via the real Preflight API', async () => {
     const scope = scopeFor('preflight-live-wiring');
     const guard = guardFor(scope);
 
@@ -313,17 +518,28 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     );
     expect(statusBefore.status).toBe(404); // never reported yet
 
-    guard.recordSpanTelemetry({
-      timestampMs: Date.now(),
-      hasRequestModel: true,
-      hasInputTokens: true,
-      hasOutputTokens: true,
-      hasScopedIdentity: true,
-      hasValidTimestamps: true,
-      isRootSpan: true,
-      hasParent: false,
+    const observedAtMs = Date.now();
+    await guard.recordTraceExportResult({
+      scope,
+      exporterDelivery: {
+        status: 'success',
+        observedAtMs,
+        sourceInstanceId: 'integration-process-1',
+        sequence: 1,
+      },
+      spans: [
+        {
+          timestampMs: observedAtMs,
+          hasRequestModel: true,
+          hasInputTokens: true,
+          hasOutputTokens: true,
+          hasScopedIdentity: true,
+          hasValidTimestamps: true,
+          isRootSpan: true,
+          hasParent: false,
+        },
+      ],
     });
-    await guard.flushPreflightTelemetry();
 
     const statusAfter = await fetch(
       `${controlPlaneUrl}/v1/preflight/status?tenant=${scope.tenant}&environment=${scope.environment}&agentId=${scope.agentId}`,
@@ -331,7 +547,7 @@ describe('FuseGuard end-to-end: dispatch-counter proof against a real HTTP contr
     );
     expect(statusAfter.status).toBe(200);
     const body = (await statusAfter.json()) as { result: { state: string } };
-    expect(body.result.state).toBe('protected');
+    expect(body.result).toMatchObject({ state: 'protected', reasonCode: 'healthy' });
     guard.stopPreflightReporting();
   });
 });

@@ -73,6 +73,7 @@ describe('OpenAiCompatibleProvider through FuseGuard: dispatch-counter proof', (
         storeOutageMode: 'fail-closed',
         apiTokens: [API_TOKEN],
         agentApiTokens: [],
+        exporterEvidenceTokens: [],
         webhookTokens: [],
         webhookDefaultPolicyVersion: 'signoz-webhook-v1',
         webhookDefaultCooldownSeconds: 300,

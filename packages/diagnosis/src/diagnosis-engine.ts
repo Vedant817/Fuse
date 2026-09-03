@@ -98,7 +98,7 @@ export function buildDiagnosis(
     confidence: evidence.available && evidence.spans.length > 0 ? 'high' : 'medium',
     supportingEvidence,
     limitations,
-    immediateContainment: `The breaker for ${detectorResult.scope.tenant}/${detectorResult.scope.environment}/${detectorResult.scope.agentId} has already tripped — no further model calls will be dispatched for this scope until an authorized resume.`,
+    immediateContainment: `The breaker for ${detectorResult.scope.tenant}/${detectorResult.scope.environment}/${detectorResult.scope.agentId} is tripped; subsequent guarded permit checks are denied until an authorized resume. Calls already past their permit check may still complete, and unguarded calls are outside Fuse enforcement.`,
     recommendedFix: knowledge.recommendedFix,
     evidenceLinks: evidence.spans
       .slice(0, 10)
