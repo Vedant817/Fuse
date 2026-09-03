@@ -217,7 +217,7 @@ jobs:
         shell: bash
         run: |
           configured_user="$(docker image inspect fuse-control-plane:ci --format '{{.Config.User}}')"
-          test "$configured_user" = "node"
+          test "$configured_user" = "1000:1000"
           test -n "$(docker image inspect fuse-control-plane:ci --format '{{json .Config.Healthcheck}}')"
 
       - name: Apply migrations with the runtime image
